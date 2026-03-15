@@ -723,6 +723,20 @@ fn extract_message_body(
     }
 }
 
+/// Resolve a user's display name from room membership, falling back to user ID.
+async fn resolve_display_name(
+    room: &matrix_sdk::room::Room,
+    user_id: &matrix_sdk::ruma::UserId,
+) -> String {
+    room.get_member_no_sync(user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.display_name().map(|s| s.to_string()))
+        .unwrap_or_else(|| user_id.to_string())
+}
+
+
 /// Fetch the timestamp of the most recent message for rooms where we
 /// don't have one yet. Runs up to 20 requests in parallel.
 async fn backfill_timestamps(client: &Client, rooms: &mut [RoomInfo]) {
@@ -1147,14 +1161,7 @@ async fn start_sync(
                     .as_secs()
                     .into();
 
-                let sender_id = event.sender.to_string();
-                let display_name = room
-                    .get_member_no_sync(&event.sender)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.display_name().map(|s| s.to_string()))
-                    .unwrap_or_else(|| sender_id.clone());
+                let display_name = resolve_display_name(&room, &event.sender).await;
 
                 // Check if this message mentions the current user.
                 let is_mention = if let Some(user_id) = client.user_id() {
@@ -1196,14 +1203,7 @@ async fn start_sync(
               room: matrix_sdk::room::Room| {
             let tx = enc_tx.clone();
             async move {
-                let sender_id = event.sender.to_string();
-                let display_name = room
-                    .get_member_no_sync(&event.sender)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.display_name().map(|s| s.to_string()))
-                    .unwrap_or_else(|| sender_id.clone());
+                let display_name = resolve_display_name(&room, &event.sender).await;
 
                 let room_name = room
                     .display_name()
@@ -1424,14 +1424,7 @@ async fn extract_messages(
                 let Some(body) = extract_message_body(&msg_event.content.msgtype) else {
                     continue;
                 };
-                let sender_id = msg_event.sender.to_string();
-                let display_name = room
-                    .get_member_no_sync(&msg_event.sender)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.display_name().map(|s| s.to_string()))
-                    .unwrap_or_else(|| sender_id.clone());
+                let display_name = resolve_display_name(room, &msg_event.sender).await;
                 messages.push(MessageInfo {
                     sender: display_name,
                     body,
@@ -1621,13 +1614,7 @@ async fn handle_select_room(
                                 let Some(body) = extract_message_body(&msg.content.msgtype) else {
                                     continue;
                                 };
-                                let sender = room
-                                    .get_member_no_sync(&msg.sender)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|m| m.display_name().map(|s| s.to_string()))
-                                    .unwrap_or_else(|| msg.sender.to_string());
+                                let sender = resolve_display_name(&room, &msg.sender).await;
                                 entries.push((sender, body));
                             }
                         }

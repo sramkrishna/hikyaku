@@ -122,6 +122,16 @@ use async_channel::{Receiver, Sender};
 use crate::config::AppearanceSettings;
 use crate::matrix::{MatrixCommand, MatrixEvent};
 
+/// Show a simple toast message.
+fn toast(overlay: &adw::ToastOverlay, msg: &str) {
+    overlay.add_toast(adw::Toast::new(msg));
+}
+
+/// Show a toast with a formatted error message.
+fn toast_error(overlay: &adw::ToastOverlay, prefix: &str, error: &str) {
+    overlay.add_toast(adw::Toast::new(&format!("{prefix}: {error}")));
+}
+
 /// Apply font settings via a CSS provider on the default display.
 fn apply_font_css(settings: &AppearanceSettings) {
     let css = if settings.font_family.is_empty() {
@@ -286,7 +296,7 @@ impl MxWindow {
                     }
                     MatrixEvent::LoginSuccess { display_name, user_id } => {
                         let msg = format!("Logged in as {display_name}");
-                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        toast(&toast_overlay, &msg);
                         login_page.stop_spinner();
                         tracing::info!("{msg}");
                         // Highlight the user's display name, localpart, and
@@ -304,7 +314,7 @@ impl MxWindow {
                         window.show_main_view();
                     }
                     MatrixEvent::LoginFailed { error } => {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("Login failed: {error}")));
+                        toast_error(&toast_overlay, "Login failed", &error);
                         login_page.stop_spinner();
                         login_page.set_sensitive(true);
                         window.show_login();
@@ -314,7 +324,7 @@ impl MxWindow {
                     }
                     MatrixEvent::SyncError { error } => {
                         tracing::error!("Sync error: {error}");
-                        toast_overlay.add_toast(adw::Toast::new(&format!("Sync error: {error}")));
+                        toast_error(&toast_overlay, "Sync error", &error);
                     }
                     MatrixEvent::RoomListUpdated { rooms } => {
                         room_list_view.update_rooms(&rooms);
@@ -408,32 +418,22 @@ impl MxWindow {
                         }
                         // Re-show the banner so user can try again.
                         window.imp().verify_banner.set_revealed(true);
-                        toast_overlay.add_toast(adw::Toast::new(
-                            &format!("Verification cancelled: {reason}"),
-                        ));
+                        toast_error(&toast_overlay, "Verification cancelled", &reason);
                     }
                     MatrixEvent::DeviceUnverified => {
                         window.imp().verify_banner.set_revealed(true);
                     }
                     MatrixEvent::RecoveryComplete => {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            "Encryption keys recovered! Re-select a room to decrypt messages.",
-                        ));
+                        toast(&toast_overlay, "Encryption keys recovered! Re-select a room to decrypt messages.");
                     }
                     MatrixEvent::RecoveryFailed { error } => {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            &format!("Key recovery failed: {error}"),
-                        ));
+                        toast_error(&toast_overlay, "Key recovery failed", &error);
                     }
                     MatrixEvent::RoomJoined { room_id: _, room_name } => {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            &format!("Joined {room_name}"),
-                        ));
+                        toast(&toast_overlay, &format!("Joined {room_name}"));
                     }
                     MatrixEvent::JoinFailed { error } => {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            &format!("Failed to join: {error}"),
-                        ));
+                        toast_error(&toast_overlay, "Failed to join", &error);
                     }
                     MatrixEvent::PublicRoomDirectory { rooms } => {
                         window.show_space_directory(&rooms);
@@ -445,9 +445,7 @@ impl MxWindow {
                         // Room list will refresh on next sync.
                     }
                     MatrixEvent::LeaveFailed { error } => {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            &format!("Failed to leave: {error}"),
-                        ));
+                        toast_error(&toast_overlay, "Failed to leave", &error);
                     }
                 }
             }

@@ -13,6 +13,23 @@ mod imp {
     use crate::models::RoomObject;
     use crate::widgets::room_row::RoomRow;
 
+    /// Create a banner-style button with icon + label (reusable for join banners etc.).
+    fn create_banner_button(icon_name: &str, label: &str, css_class: &str) -> gtk::Button {
+        let button = gtk::Button::new();
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::Center)
+            .margin_top(10)
+            .margin_bottom(10)
+            .build();
+        content.append(&gtk::Image::from_icon_name(icon_name));
+        content.append(&gtk::Label::new(Some(label)));
+        button.set_child(Some(&content));
+        button.add_css_class(css_class);
+        button
+    }
+
     /// Build a (ListStore, SingleSelection, ListView) triple for one tab.
     fn make_room_list() -> (gio::ListStore, gtk::SingleSelection, gtk::ListView) {
         let store = gio::ListStore::new::<RoomObject>();
@@ -112,18 +129,7 @@ mod imp {
                 .child(&room_list_view)
                 .build();
             // Rooms tab: scroll + pinned join banner at bottom.
-            let room_join_banner = gtk::Button::new();
-            let room_join_content = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(8)
-                .halign(gtk::Align::Center)
-                .margin_top(10)
-                .margin_bottom(10)
-                .build();
-            room_join_content.append(&gtk::Image::from_icon_name("list-add-symbolic"));
-            room_join_content.append(&gtk::Label::new(Some("Join a Room")));
-            room_join_banner.set_child(Some(&room_join_content));
-            room_join_banner.add_css_class("join-banner");
+            let room_join_banner = create_banner_button("list-add-symbolic", "Join a Room", "join-banner");
             let room_tab_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .build();
@@ -149,19 +155,7 @@ mod imp {
                 .build();
 
             // "Join Room" banner at the bottom of the space child list.
-            let join_banner = gtk::Button::builder()
-                .build();
-            let join_banner_content = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(8)
-                .halign(gtk::Align::Center)
-                .margin_top(10)
-                .margin_bottom(10)
-                .build();
-            join_banner_content.append(&gtk::Image::from_icon_name("list-add-symbolic"));
-            join_banner_content.append(&gtk::Label::new(Some("Join a Room")));
-            join_banner.set_child(Some(&join_banner_content));
-            join_banner.add_css_class("join-banner");
+            let join_banner = create_banner_button("list-add-symbolic", "Join a Room", "join-banner");
 
             let space_child_view = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
