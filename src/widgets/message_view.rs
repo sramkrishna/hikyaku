@@ -518,10 +518,32 @@ impl MessageView {
                 } else {
                     reactions.push((emoji.to_string(), 1));
                 }
-                // Update the object in place and notify the list.
-                msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
-                // Splice to force rebind without scroll jump.
-                imp.list_store.splice(i, 1, &[msg.clone().upcast::<glib::Object>()]);
+                // Update the GObject properties directly — the factory's
+                // bind already has a reference to this object, so changing
+                // the property triggers the UI update via GObject notify.
+                // No remove/insert needed.
+                msg.set_reactions_json(
+                    serde_json::to_string(&reactions).unwrap_or_default(),
+                );
+
+                // Find the row widget for this position and rebind it
+                // directly, bypassing the ListStore entirely.
+                let list_view = &imp.list_view;
+                // Walk the ListView's children to find the row at position i.
+                let mut child = list_view.first_child();
+                let mut idx = 0u32;
+                while let Some(ref widget) = child {
+                    if idx == i {
+                        // Found the ListItem widget — find our MessageRow inside.
+                        if let Some(row) = Self::find_message_row(widget) {
+                            let names = imp.highlight_names.borrow().clone();
+                            row.bind_message_object(&msg, &names);
+                        }
+                        break;
+                    }
+                    child = widget.next_sibling();
+                    idx += 1;
+                }
                 return;
             }
         }
@@ -557,6 +579,22 @@ impl MessageView {
         }
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+    }
+
+    /// Walk a widget tree to find a MessageRow child.
+    fn find_message_row(widget: &gtk::Widget) -> Option<crate::widgets::message_row::MessageRow> {
+        use crate::widgets::message_row::MessageRow;
+        if let Some(row) = widget.downcast_ref::<MessageRow>() {
+            return Some(row.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(ref w) = child {
+            if let Some(row) = Self::find_message_row(w) {
+                return Some(row);
+            }
+            child = w.next_sibling();
+        }
+        None
     }
 
     fn info_to_obj(m: &crate::matrix::MessageInfo) -> MessageObject {

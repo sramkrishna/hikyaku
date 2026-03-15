@@ -242,14 +242,16 @@ impl MessageRow {
                         .label(&label)
                         .css_classes(["reaction-pill", "flat"])
                         .build();
-                    // Click to toggle (add/remove) this reaction.
-                    let emoji_clone = emoji.clone();
-                    let on_react = imp.on_react.clone();
-                    let event_id = imp.event_id.clone();
+                    // Click to toggle — use the same on_react callback as
+                    // the emoji picker MenuButton.
+                    let emoji_str = emoji.clone();
+                    let event_id_rc = imp.event_id.clone();
+                    let on_react_rc = imp.on_react.clone();
                     pill.connect_clicked(move |_| {
-                        let eid = event_id.borrow().clone();
-                        if let Some(ref cb) = *on_react.borrow() {
-                            cb(eid, emoji_clone.clone());
+                        let eid = event_id_rc.borrow().clone();
+                        tracing::warn!("Pill clicked: emoji={emoji_str} eid={eid}");
+                        if let Some(ref cb) = *on_react_rc.borrow() {
+                            cb(eid, emoji_str.clone());
                         }
                     });
                     imp.reactions_box.append(&pill);
