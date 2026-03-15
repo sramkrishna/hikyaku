@@ -85,10 +85,20 @@ impl RoomRow {
             imp.name_label.remove_css_class("heading");
             imp.kind_icon.set_visible(true);
 
-            let icon_name = match room.kind().as_str() {
-                "dm" => "avatar-default-symbolic",
-                _ => "system-users-symbolic",
-            };
+            use std::sync::LazyLock;
+            static KIND_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
+                LazyLock::new(|| {
+                    [
+                        ("dm", "avatar-default-symbolic"),
+                        ("room", "system-users-symbolic"),
+                        ("space", "view-grid-symbolic"),
+                    ]
+                    .into_iter()
+                    .collect()
+                });
+            let icon_name = KIND_ICONS
+                .get(room.kind().as_str())
+                .unwrap_or(&"system-users-symbolic");
             imp.kind_icon.set_icon_name(Some(icon_name));
 
             imp.lock_icon.set_visible(room.is_encrypted());

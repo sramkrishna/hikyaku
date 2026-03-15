@@ -237,31 +237,44 @@ mod imp {
             let view_for_tab = obj.clone();
             let key_controller = gtk::EventControllerKey::new();
             key_controller.connect_key_pressed(move |_, key, _, _| {
-                let is_tab = key == gtk::gdk::Key::Tab;
-                let is_down = key == gtk::gdk::Key::Down;
-                let is_up = key == gtk::gdk::Key::Up;
-                let is_escape = key == gtk::gdk::Key::Escape;
-
+                use gtk::gdk::Key as K;
                 let imp = view_for_tab.imp();
 
-                // Escape closes the popover.
-                if is_escape && imp.nick_popover.is_visible() {
-                    imp.nick_popover.popdown();
-                    imp.nick_completion_state.replace(None);
-                    return glib::Propagation::Stop;
-                }
+                // Classify key into an action. Using match avoids serial
+                // if-else and gives O(1) dispatch via compiler jump table.
+                enum NickAction { Escape, Navigate(bool), Tab, Other }
+                let action = match key {
+                    K::Escape => NickAction::Escape,
+                    K::Down => NickAction::Navigate(false),
+                    K::Up => NickAction::Navigate(true),
+                    K::Tab => NickAction::Tab,
+                    _ => NickAction::Other,
+                };
 
-                if !is_tab && !is_down && !is_up {
-                    // Any other key while popover is open — close it.
-                    if imp.nick_popover.is_visible() && key != gtk::gdk::Key::Shift_L && key != gtk::gdk::Key::Shift_R {
+                match action {
+                    NickAction::Escape if imp.nick_popover.is_visible() => {
                         imp.nick_popover.popdown();
                         imp.nick_completion_state.replace(None);
+                        return glib::Propagation::Stop;
                     }
-                    return glib::Propagation::Proceed;
+                    NickAction::Other | NickAction::Escape => {
+                        // Any non-completion key — close popover if open.
+                        if imp.nick_popover.is_visible()
+                            && key != K::Shift_L && key != K::Shift_R
+                        {
+                            imp.nick_popover.popdown();
+                            imp.nick_completion_state.replace(None);
+                        }
+                        return glib::Propagation::Proceed;
+                    }
+                    _ => {} // Navigate/Tab — handled below.
                 }
 
-                // If popover is visible, Tab/Down moves down, Up moves up.
-                if imp.nick_popover.is_visible() {
+                // Navigate or Tab with popover visible — cycle through matches.
+                let is_up = matches!(action, NickAction::Navigate(true));
+                if imp.nick_popover.is_visible()
+                    && matches!(action, NickAction::Navigate(_) | NickAction::Tab)
+                {
                     let state = imp.nick_completion_state.borrow();
                     let Some((at_pos, _, ref text_after)) = *state else {
                         return glib::Propagation::Proceed;
@@ -273,7 +286,6 @@ mod imp {
                     let current_idx = current.as_ref().map(|r| r.index()).unwrap_or(-1);
                     let next_idx = if is_up {
                         if current_idx <= 0 {
-                            // Find last row.
                             let mut i = 0;
                             while imp.nick_list.row_at_index(i + 1).is_some() { i += 1; }
                             i
@@ -281,7 +293,6 @@ mod imp {
                             current_idx - 1
                         }
                     } else {
-                        // Tab or Down
                         current_idx + 1
                     };
 
@@ -302,7 +313,7 @@ mod imp {
                 }
 
                 // Not visible — only Tab triggers completion.
-                if !is_tab {
+                if !matches!(action, NickAction::Tab) {
                     return glib::Propagation::Proceed;
                 }
 

@@ -56,24 +56,20 @@ pub(crate) fn format_timestamp(ts: u64) -> String {
         return dt.format("%H:%M").map(|s: glib::GString| s.to_string()).unwrap_or_default();
     };
 
+    let secs_ago = now.duration_since(event_time).unwrap_or_default().as_secs();
     let same_day = dt.year() == today.year()
         && dt.day_of_year() == today.day_of_year();
 
-    if same_day {
-        dt.format("%H:%M")
-    } else {
-        let secs_ago = now.duration_since(event_time).unwrap_or_default().as_secs();
-        if secs_ago < 86400 * 2 {
-            dt.format("Yesterday %H:%M")
-        } else if dt.year() == today.year() {
-            dt.format("%b %e %H:%M")
-        } else {
-            // Different year — show full date.
-            dt.format("%b %e, %Y %H:%M")
-        }
-    }
-    .map(|s: glib::GString| s.to_string())
-    .unwrap_or_default()
+    // Select format string via computed time range — no if-else chain.
+    let fmt = match () {
+        _ if same_day => "%H:%M",
+        _ if secs_ago < 86400 * 2 => "Yesterday %H:%M",
+        _ if dt.year() == today.year() => "%b %e %H:%M",
+        _ => "%b %e, %Y %H:%M",
+    };
+    dt.format(fmt)
+        .map(|s: glib::GString| s.to_string())
+        .unwrap_or_default()
 }
 
 glib::wrapper! {

@@ -694,16 +694,33 @@ fn save_timestamp_cache(
 ///               alias changes, avatar changes — these are automated
 ///               churn that doesn't reflect real interaction.
 fn is_room_activity(v: &serde_json::Value) -> bool {
-    matches!(
-        v.get("type").and_then(|t| t.as_str()),
-        Some(
-            "m.room.message"
-                | "m.room.encrypted"
-                | "m.room.topic"
-                | "m.room.name"
-                | "m.room.pinned_events"
-        )
-    )
+    use std::sync::LazyLock;
+    static ACTIVITY_TYPES: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        [
+            "m.room.message",
+            "m.room.encrypted",
+            "m.room.topic",
+            "m.room.name",
+            "m.room.pinned_events",
+        ]
+        .into_iter()
+        .collect()
+    });
+    v.get("type")
+        .and_then(|t| t.as_str())
+        .map_or(false, |t| ACTIVITY_TYPES.contains(t))
+}
+
+/// Extract the text body from a MessageType, returning None for non-text types.
+fn extract_message_body(
+    msgtype: &matrix_sdk::ruma::events::room::message::MessageType,
+) -> Option<String> {
+    use matrix_sdk::ruma::events::room::message::MessageType;
+    match msgtype {
+        MessageType::Text(text) => Some(text.body.clone()),
+        MessageType::Notice(notice) => Some(notice.body.clone()),
+        _ => None,
+    }
 }
 
 /// Fetch the timestamp of the most recent message for rooms where we
@@ -1122,10 +1139,8 @@ async fn start_sync(
             let tx = msg_tx.clone();
             let client = msg_client.clone();
             async move {
-                let body = match &event.content.msgtype {
-                    MessageType::Text(text) => text.body.clone(),
-                    MessageType::Notice(notice) => notice.body.clone(),
-                    _ => return,
+                let Some(body) = extract_message_body(&event.content.msgtype) else {
+                    return;
                 };
                 let timestamp = event
                     .origin_server_ts
@@ -1406,10 +1421,8 @@ async fn extract_messages(
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
                     _ => continue,
                 };
-                let body = match &msg_event.content.msgtype {
-                    MessageType::Text(text) => text.body.clone(),
-                    MessageType::Notice(notice) => notice.body.clone(),
-                    _ => continue,
+                let Some(body) = extract_message_body(&msg_event.content.msgtype) else {
+                    continue;
                 };
                 let sender_id = msg_event.sender.to_string();
                 let display_name = room
@@ -1605,11 +1618,8 @@ async fn handle_select_room(
                                 ),
                             ) = timeline_ev
                             {
-                                use matrix_sdk::ruma::events::room::message::MessageType;
-                                let body = match &msg.content.msgtype {
-                                    MessageType::Text(t) => t.body.clone(),
-                                    MessageType::Notice(n) => n.body.clone(),
-                                    _ => continue,
+                                let Some(body) = extract_message_body(&msg.content.msgtype) else {
+                                    continue;
                                 };
                                 let sender = room
                                     .get_member_no_sync(&msg.sender)
