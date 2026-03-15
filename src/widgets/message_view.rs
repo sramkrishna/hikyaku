@@ -85,7 +85,7 @@ mod imp {
                     .and_downcast::<MessageRow>()
                     .expect("MessageRow expected");
 
-                row.set_message(&msg_obj.sender(), &msg_obj.body());
+                row.set_message(&msg_obj.sender(), &msg_obj.body(), msg_obj.timestamp());
             });
 
             let no_selection = gtk::NoSelection::new(Some(self.list_store.clone()));

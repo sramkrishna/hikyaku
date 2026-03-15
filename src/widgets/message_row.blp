@@ -13,9 +13,20 @@ template $MxMessageRow : Gtk.Box {
     spacing: 2;
     hexpand: true;
 
-    Gtk.Label sender_label {
-      halign: start;
-      styles ["caption-heading"]
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 8;
+
+      Gtk.Label sender_label {
+        halign: start;
+        styles ["caption-heading"]
+      }
+
+      Gtk.Label timestamp_label {
+        halign: end;
+        hexpand: true;
+        styles ["dim-label", "caption"]
+      }
     }
 
     Gtk.Label body_label {

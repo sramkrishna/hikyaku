@@ -11,6 +11,8 @@ mod imp {
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub timestamp_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub body_label: TemplateChild<gtk::Label>,
     }
 
@@ -34,8 +36,42 @@ mod imp {
     impl BoxImpl for MessageRow {}
 }
 
+use adw::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::*;
+
+/// Format a Unix timestamp (seconds) into a human-readable string.
+/// Shows "HH:MM" for today, "Yesterday HH:MM", or "Mon DD HH:MM" for older.
+fn format_timestamp(ts: u64) -> String {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let event_time = UNIX_EPOCH + Duration::from_secs(ts);
+    let now = SystemTime::now();
+
+    let Ok(dt) = glib::DateTime::from_unix_local(ts as i64) else {
+        return String::new();
+    };
+
+    let Ok(today) = glib::DateTime::now_local() else {
+        return dt.format("%H:%M").map(|s: glib::GString| s.to_string()).unwrap_or_default();
+    };
+
+    let same_day = dt.year() == today.year()
+        && dt.day_of_year() == today.day_of_year();
+
+    if same_day {
+        dt.format("%H:%M")
+    } else {
+        let secs_ago = now.duration_since(event_time).unwrap_or_default().as_secs();
+        if secs_ago < 86400 * 2 {
+            dt.format("Yesterday %H:%M")
+        } else {
+            dt.format("%b %e %H:%M")
+        }
+    }
+    .map(|s: glib::GString| s.to_string())
+    .unwrap_or_default()
+}
 
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
@@ -48,9 +84,16 @@ impl MessageRow {
         glib::Object::builder().build()
     }
 
-    pub fn set_message(&self, sender: &str, body: &str) {
+    pub fn set_message(&self, sender: &str, body: &str, timestamp: u64) {
         let imp = self.imp();
         imp.sender_label.set_label(sender);
         imp.body_label.set_label(body);
+
+        if timestamp > 0 {
+            imp.timestamp_label.set_label(&format_timestamp(timestamp));
+            imp.timestamp_label.set_visible(true);
+        } else {
+            imp.timestamp_label.set_visible(false);
+        }
     }
 }

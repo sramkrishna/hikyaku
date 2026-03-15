@@ -29,6 +29,8 @@ mod imp {
         /// Track which room is currently selected so we know where to
         /// route incoming messages and where to send outgoing ones.
         pub current_room_id: RefCell<Option<String>>,
+        /// The content navigation page — title is updated to the selected room name.
+        pub content_page: OnceCell<adw::NavigationPage>,
     }
 
     impl Default for MxWindow {
@@ -50,6 +52,7 @@ mod imp {
                 loading_spinner: gtk::Spinner::new(),
                 verify_banner,
                 current_room_id: RefCell::new(None),
+                content_page: OnceCell::new(),
             }
         }
     }
@@ -133,9 +136,13 @@ impl MxWindow {
         // Wire up room selection → send SelectRoom command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
-        imp.room_list_view.connect_room_selected(move |room_id| {
+        imp.room_list_view.connect_room_selected(move |room_id, room_name| {
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
+                // Update the content header to show the room name.
+                if let Some(page) = window.imp().content_page.get() {
+                    page.set_title(&room_name);
+                }
             }
             let tx = cmd_tx.clone();
             let rid = room_id.clone();
@@ -303,6 +310,7 @@ impl MxWindow {
             .title("Matx")
             .child(&content_toolbar)
             .build();
+        let _ = imp.content_page.set(content_page.clone());
 
         let split_view = adw::NavigationSplitView::new();
         split_view.set_sidebar(Some(&sidebar_page));

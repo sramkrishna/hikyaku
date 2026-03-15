@@ -17,7 +17,7 @@ mod imp {
         pub list_store: gio::ListStore,
         pub selection: gtk::SingleSelection,
         pub list_view: gtk::ListView,
-        pub on_room_selected: RefCell<Option<Box<dyn Fn(String)>>>,
+        pub on_room_selected: RefCell<Option<Box<dyn Fn(String, String)>>>,
     }
 
     impl Default for RoomListView {
@@ -100,7 +100,7 @@ mod imp {
                         // Ignore header clicks.
                         if !room_obj.is_header() {
                             if let Some(ref cb) = *imp.on_room_selected.borrow() {
-                                cb(room_obj.room_id());
+                                cb(room_obj.room_id(), room_obj.name());
                             }
                         }
                     }
@@ -131,7 +131,7 @@ impl RoomListView {
         glib::Object::builder().build()
     }
 
-    pub fn connect_room_selected<F: Fn(String) + 'static>(&self, f: F) {
+    pub fn connect_room_selected<F: Fn(String, String) + 'static>(&self, f: F) {
         self.imp().on_room_selected.replace(Some(Box::new(f)));
     }
 

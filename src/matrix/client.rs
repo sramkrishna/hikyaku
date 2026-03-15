@@ -641,17 +641,26 @@ async fn start_sync(
                     MessageType::Text(text) => text.body.clone(),
                     _ => return,
                 };
-                let sender = event.sender.to_string();
                 let timestamp = event
                     .origin_server_ts
                     .as_secs()
                     .into();
 
+                // Resolve display name from room member profile.
+                let sender_id = event.sender.to_string();
+                let display_name = room
+                    .get_member_no_sync(&event.sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.display_name().map(|s| s.to_string()))
+                    .unwrap_or_else(|| sender_id.clone());
+
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
                         message: MessageInfo {
-                            sender,
+                            sender: display_name,
                             body,
                             timestamp,
                         },
@@ -795,8 +804,17 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
                             MessageType::Text(text) => text.body.clone(),
                             _ => continue,
                         };
+                        // Resolve display name from room member profile.
+                        let sender_id = msg_event.sender.to_string();
+                        let display_name = room
+                            .get_member_no_sync(&msg_event.sender)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|m| m.display_name().map(|s| s.to_string()))
+                            .unwrap_or_else(|| sender_id.clone());
                         messages.push(MessageInfo {
-                            sender: msg_event.sender.to_string(),
+                            sender: display_name,
                             body,
                             timestamp: msg_event.origin_server_ts.as_secs().into(),
                         });
