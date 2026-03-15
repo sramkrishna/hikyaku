@@ -252,3 +252,108 @@ pub async fn cancel_verification(state: &SharedVerificationState, flow_id: &str)
     vs.requests.remove(flow_id);
     vs.sas_sessions.remove(flow_id);
 }
+
+/// Initiate verification of our own device. This sends a verification
+/// request to all our other sessions (e.g. Element on another device).
+pub async fn request_self_verification(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    state: &SharedVerificationState,
+) {
+    let enc = client.encryption();
+
+    // Get our own user identity to request verification against.
+    let user_id = client.user_id().expect("must be logged in");
+    let own_identity = match enc.get_user_identity(user_id).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            tracing::warn!("No identity found for self, cannot verify");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Failed to get own identity: {e}");
+            return;
+        }
+    };
+
+    match own_identity.request_verification().await {
+        Ok(request) => {
+            let flow_id = request.flow_id().to_string();
+            tracing::info!("Self-verification request sent, flow_id: {flow_id}");
+
+            state
+                .lock()
+                .await
+                .requests
+                .insert(flow_id.clone(), request.clone());
+
+            // Spawn a task to watch for the other side accepting and
+            // transitioning to SAS, so we can show emojis automatically.
+            let tx = event_tx.clone();
+            let vs = state.clone();
+            let fid = flow_id.clone();
+            tokio::spawn(async move {
+                watch_request_state(request, &tx, &vs, &fid).await;
+            });
+        }
+        Err(e) => {
+            tracing::error!("Failed to request self-verification: {e}");
+        }
+    }
+}
+
+/// Watch a verification request for state transitions.
+/// When the other side accepts and starts SAS, we automatically
+/// accept the SAS and watch for emojis.
+async fn watch_request_state(
+    request: VerificationRequest,
+    event_tx: &Sender<MatrixEvent>,
+    state: &SharedVerificationState,
+    flow_id: &str,
+) {
+    use futures_util::StreamExt;
+
+    tracing::info!("Watching verification request {flow_id} for state changes");
+
+    let mut stream = request.changes();
+    while let Some(new_state) = stream.next().await {
+        match new_state {
+            VerificationRequestState::Ready { .. } => {
+                tracing::info!("Verification {flow_id} ready, starting SAS");
+                // Start SAS from our side.
+                match request.start_sas().await {
+                    Ok(Some(sas)) => {
+                        tracing::info!("SAS started for {flow_id}");
+                        if let Err(e) = sas.accept().await {
+                            tracing::error!("Failed to accept SAS: {e}");
+                            return;
+                        }
+                        watch_sas_state(sas, event_tx, state, flow_id).await;
+                        return;
+                    }
+                    Ok(None) => {
+                        tracing::warn!("SAS not available for {flow_id}");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to start SAS for {flow_id}: {e}");
+                    }
+                }
+            }
+            VerificationRequestState::Done => {
+                tracing::info!("Verification request {flow_id} done");
+                return;
+            }
+            VerificationRequestState::Cancelled(_) => {
+                tracing::info!("Verification request {flow_id} cancelled");
+                let _ = event_tx
+                    .send(MatrixEvent::VerificationCancelled {
+                        flow_id: flow_id.to_string(),
+                        reason: "Request cancelled by other device".to_string(),
+                    })
+                    .await;
+                return;
+            }
+            _ => {}
+        }
+    }
+}

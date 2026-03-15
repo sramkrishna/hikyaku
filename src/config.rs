@@ -99,3 +99,15 @@ static SETTINGS: OnceLock<Settings> = OnceLock::new();
 pub fn settings() -> &'static Settings {
     SETTINGS.get_or_init(load_settings)
 }
+
+/// Save settings to the config file. Changes take effect on next launch.
+pub fn save_settings(settings: &Settings) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml_str = toml::to_string_pretty(settings)?;
+    std::fs::write(&path, toml_str)?;
+    tracing::info!("Settings saved to {}", path.display());
+    Ok(())
+}

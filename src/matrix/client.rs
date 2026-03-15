@@ -90,6 +90,8 @@ pub enum MatrixEvent {
     },
     /// Verification completed successfully.
     VerificationDone { flow_id: String },
+    /// Our device is not verified — user should verify to decrypt messages.
+    DeviceUnverified,
     /// Verification was cancelled.
     VerificationCancelled { flow_id: String, reason: String },
 }
@@ -115,6 +117,8 @@ pub enum MatrixCommand {
     ConfirmVerification { flow_id: String },
     /// Cancel a verification.
     CancelVerification { flow_id: String },
+    /// Request verification of our own device from another session.
+    RequestSelfVerification,
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -260,7 +264,7 @@ async fn matrix_task(
     );
 
     // Set up E2E encryption: bootstrap cross-signing and enable key backup.
-    setup_encryption(&client).await;
+    setup_encryption(&client, &event_tx).await;
 
     // Spawn sync in a separate task so we can keep processing commands.
     let sync_event_tx = event_tx.clone();
@@ -295,6 +299,11 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::CancelVerification { flow_id }) => {
                         super::verification::cancel_verification(&vs, &flow_id).await;
+                    }
+                    Ok(MatrixCommand::RequestSelfVerification) => {
+                        super::verification::request_self_verification(
+                            &client, &event_tx, &vs,
+                        ).await;
                     }
                     Err(_) => break,
                 }
@@ -400,8 +409,8 @@ async fn try_restore_session(
 
 
 /// Bootstrap cross-signing and enable key backup so we can decrypt
-/// messages in encrypted rooms.
-async fn setup_encryption(client: &Client) {
+/// messages in encrypted rooms. Returns true if the device is verified.
+async fn setup_encryption(client: &Client, event_tx: &Sender<MatrixEvent>) {
     let enc = client.encryption();
 
     // Bootstrap cross-signing if not already set up.
@@ -429,6 +438,27 @@ async fn setup_encryption(client: &Client) {
         }
     } else {
         tracing::info!("Key backup already enabled");
+    }
+
+    // Check if our device is verified. If not, prompt the user.
+    let user_id = client.user_id().expect("must be logged in");
+    let device_id = client.device_id().expect("must be logged in");
+    match enc.get_device(user_id, device_id).await {
+        Ok(Some(device)) => {
+            if device.is_verified() {
+                tracing::info!("This device is verified");
+            } else {
+                tracing::info!("This device is NOT verified — prompting user");
+                let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;
+            }
+        }
+        Ok(None) => {
+            tracing::warn!("Could not find own device");
+            let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check device verification: {e}");
+        }
     }
 }
 

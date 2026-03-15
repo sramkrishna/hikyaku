@@ -25,6 +25,7 @@ mod imp {
         pub toast_overlay: adw::ToastOverlay,
         pub toolbar: adw::ToolbarView,
         pub loading_spinner: gtk::Spinner,
+        pub verify_banner: adw::Banner,
         /// Track which room is currently selected so we know where to
         /// route incoming messages and where to send outgoing ones.
         pub current_room_id: RefCell<Option<String>>,
@@ -32,6 +33,12 @@ mod imp {
 
     impl Default for MxWindow {
         fn default() -> Self {
+            let verify_banner = adw::Banner::builder()
+                .title("This device is not verified. Verify to decrypt messages in encrypted rooms.")
+                .button_label("Verify")
+                .revealed(false)
+                .build();
+
             Self {
                 event_rx: OnceCell::new(),
                 command_tx: OnceCell::new(),
@@ -41,6 +48,7 @@ mod imp {
                 toast_overlay: adw::ToastOverlay::new(),
                 toolbar: adw::ToolbarView::new(),
                 loading_spinner: gtk::Spinner::new(),
+                verify_banner,
                 current_room_id: RefCell::new(None),
             }
         }
@@ -232,12 +240,16 @@ impl MxWindow {
                         );
                     }
                     MatrixEvent::VerificationDone { .. } => {
+                        window.imp().verify_banner.set_revealed(false);
                         toast_overlay.add_toast(adw::Toast::new("Device verified successfully!"));
                     }
                     MatrixEvent::VerificationCancelled { reason, .. } => {
                         toast_overlay.add_toast(adw::Toast::new(
                             &format!("Verification cancelled: {reason}"),
                         ));
+                    }
+                    MatrixEvent::DeviceUnverified => {
+                        window.imp().verify_banner.set_revealed(true);
                     }
                 }
             }
@@ -260,8 +272,13 @@ impl MxWindow {
         // Sidebar header with hamburger menu.
         let sidebar_header = adw::HeaderBar::new();
         let menu = gio::Menu::new();
-        menu.append(Some("_Preferences"), Some("win.preferences"));
-        menu.append(Some("_About Matx"), Some("win.about"));
+        let main_section = gio::Menu::new();
+        main_section.append(Some("_Verify Device"), Some("win.verify"));
+        main_section.append(Some("_Preferences"), Some("win.preferences"));
+        menu.append_section(None, &main_section);
+        let about_section = gio::Menu::new();
+        about_section.append(Some("_About Matx"), Some("win.about"));
+        menu.append_section(None, &about_section);
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
@@ -291,7 +308,25 @@ impl MxWindow {
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));
 
-        imp.toast_overlay.set_child(Some(&split_view));
+        // Banner + split view in a vertical box.
+        let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        main_box.append(&imp.verify_banner);
+        main_box.append(&split_view);
+
+        // Wire up the banner's Verify button.
+        let tx = imp.command_tx.get().unwrap().clone();
+        let banner = imp.verify_banner.clone();
+        imp.verify_banner.connect_button_clicked(move |_| {
+            banner.set_revealed(false);
+            let tx = tx.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx
+                    .send(MatrixCommand::RequestSelfVerification)
+                    .await;
+            });
+        });
+
+        imp.toast_overlay.set_child(Some(&main_box));
     }
 
     fn setup_actions(&self) {
@@ -309,7 +344,18 @@ impl MxWindow {
             })
             .build();
 
-        self.add_action_entries([about_action, preferences_action]);
+        let verify_action = ActionEntryBuilder::new("verify")
+            .activate(|window: &Self, _, _| {
+                let tx = window.imp().command_tx.get().unwrap().clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx
+                        .send(MatrixCommand::RequestSelfVerification)
+                        .await;
+                });
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action, verify_action]);
     }
 
     fn show_about_dialog(&self) {
@@ -327,56 +373,106 @@ impl MxWindow {
     }
 
     fn show_preferences(&self) {
-        let dialog = adw::PreferencesDialog::new();
+        use crate::config;
 
-        // Sync settings group.
-        let sync_group = adw::PreferencesGroup::builder()
-            .title("Sync")
-            .description("Matrix sync settings")
+        let dialog = adw::PreferencesDialog::new();
+        let cfg = config::settings().clone();
+
+        // --- Rooms group ---
+        let rooms_group = adw::PreferencesGroup::builder()
+            .title("Rooms")
+            .description("How many rooms to show in the sidebar")
             .build();
 
-        let cfg = crate::config::settings();
+        let max_dms_row = adw::SpinRow::builder()
+            .title("Max DMs")
+            .subtitle("Maximum direct messages shown")
+            .adjustment(&gtk::Adjustment::new(
+                cfg.rooms.max_dms as f64, 5.0, 500.0, 5.0, 25.0, 0.0,
+            ))
+            .build();
+        rooms_group.add(&max_dms_row);
 
-        let timeline_row = adw::ActionRow::builder()
+        let max_rooms_row = adw::SpinRow::builder()
+            .title("Max Rooms")
+            .subtitle("Maximum rooms shown")
+            .adjustment(&gtk::Adjustment::new(
+                cfg.rooms.max_rooms as f64, 5.0, 1000.0, 10.0, 50.0, 0.0,
+            ))
+            .build();
+        rooms_group.add(&max_rooms_row);
+
+        // --- Sync group ---
+        let sync_group = adw::PreferencesGroup::builder()
+            .title("Sync")
+            .description("Matrix sync settings (changes apply on restart)")
+            .build();
+
+        let timeline_row = adw::SpinRow::builder()
             .title("Timeline Limit")
-            .subtitle(format!("{} events per room", cfg.sync.timeline_limit))
+            .subtitle("Events fetched per room during sync")
+            .adjustment(&gtk::Adjustment::new(
+                cfg.sync.timeline_limit as f64, 1.0, 50.0, 1.0, 5.0, 0.0,
+            ))
             .build();
         sync_group.add(&timeline_row);
 
-        let timeout_row = adw::ActionRow::builder()
+        let timeout_row = adw::SpinRow::builder()
             .title("Sync Timeout")
-            .subtitle(format!("{} seconds", cfg.sync.timeout_secs))
+            .subtitle("Seconds to wait for sync response")
+            .adjustment(&gtk::Adjustment::new(
+                cfg.sync.timeout_secs as f64, 10.0, 300.0, 10.0, 30.0, 0.0,
+            ))
             .build();
         sync_group.add(&timeout_row);
 
-        // Room settings group.
-        let rooms_group = adw::PreferencesGroup::builder()
-            .title("Rooms")
-            .description("Room display settings")
+        // --- Info group ---
+        let info_group = adw::PreferencesGroup::builder()
+            .title("Storage")
             .build();
 
-        let dm_row = adw::ActionRow::builder()
-            .title("Max DMs")
-            .subtitle(format!("{}", cfg.rooms.max_dms))
-            .build();
-        rooms_group.add(&dm_row);
-
-        let rooms_row = adw::ActionRow::builder()
-            .title("Max Rooms")
-            .subtitle(format!("{}", cfg.rooms.max_rooms))
-            .build();
-        rooms_group.add(&rooms_row);
-
-        let info_row = adw::ActionRow::builder()
+        let config_path_row = adw::ActionRow::builder()
             .title("Config File")
             .subtitle("~/.config/matx/config.toml")
             .build();
-        rooms_group.add(&info_row);
+        info_group.add(&config_path_row);
 
-        let page = adw::PreferencesPage::new();
-        page.add(&sync_group);
+        let page = adw::PreferencesPage::builder()
+            .icon_name("preferences-system-symbolic")
+            .title("General")
+            .build();
         page.add(&rooms_group);
+        page.add(&sync_group);
+        page.add(&info_group);
         dialog.add(&page);
+
+        // Save when values change.
+        let save = {
+            let max_dms_row = max_dms_row.clone();
+            let max_rooms_row = max_rooms_row.clone();
+            let timeline_row = timeline_row.clone();
+            let timeout_row = timeout_row.clone();
+            let cfg = cfg.clone();
+            move || {
+                let mut new_cfg = cfg.clone();
+                new_cfg.rooms.max_dms = max_dms_row.value() as usize;
+                new_cfg.rooms.max_rooms = max_rooms_row.value() as usize;
+                new_cfg.sync.timeline_limit = timeline_row.value() as u32;
+                new_cfg.sync.timeout_secs = timeout_row.value() as u64;
+                if let Err(e) = config::save_settings(&new_cfg) {
+                    tracing::error!("Failed to save settings: {e}");
+                }
+            }
+        };
+
+        let s = save.clone();
+        max_dms_row.connect_value_notify(move |_| s());
+        let s = save.clone();
+        max_rooms_row.connect_value_notify(move |_| s());
+        let s = save.clone();
+        timeline_row.connect_value_notify(move |_| s());
+        let s = save.clone();
+        timeout_row.connect_value_notify(move |_| s());
 
         dialog.present(Some(self));
     }
