@@ -14,9 +14,14 @@ mod widgets;
 use gtk::prelude::*;
 
 fn main() {
-    // Initialize structured logging. RUST_LOG=matx=debug cargo run
-    // will show our debug output.
-    tracing_subscriber::fmt::init();
+    // Initialize structured logging. Override with RUST_LOG env var, e.g.
+    // RUST_LOG=matx=debug cargo run
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("matx=warn")),
+        )
+        .init();
 
     // Create and run the GTK application. `run()` blocks until the
     // user closes the window. It handles argc/argv for us.

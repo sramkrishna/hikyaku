@@ -11,7 +11,7 @@ template $MxMessageView : Gtk.Box {
     Gtk.StackPage {
       name: "placeholder";
       child: Adw.StatusPage placeholder_page {
-        icon-name: "chat-symbolic";
+        icon-name: "chat-message-new-symbolic";
         title: "Select a Room";
         description: "Choose a room from the sidebar to start chatting.";
         vexpand: true;
@@ -22,6 +22,65 @@ template $MxMessageView : Gtk.Box {
       name: "messages";
       child: Gtk.Box {
         orientation: vertical;
+
+        // Room info banner — topic, tombstone, pinned messages.
+        Gtk.Box info_banner {
+          orientation: vertical;
+          spacing: 2;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 6;
+          margin-bottom: 6;
+          visible: false;
+
+          Gtk.Label topic_label {
+            halign: start;
+            wrap: true;
+            wrap-mode: word_char;
+            max-width-chars: 80;
+            visible: false;
+            styles ["dim-label", "caption"]
+          }
+
+          Gtk.Box tombstone_banner {
+            orientation: horizontal;
+            spacing: 10;
+            visible: false;
+            margin-top: 4;
+            margin-bottom: 4;
+            margin-start: 4;
+            margin-end: 4;
+            styles ["tombstone-info"]
+
+            Gtk.Image {
+              icon-name: "tombstone-symbolic";
+              pixel-size: 32;
+            }
+
+            Gtk.Label tombstone_label {
+              halign: start;
+              wrap: true;
+              hexpand: true;
+            }
+          }
+
+          Gtk.Box pinned_box {
+            orientation: vertical;
+            spacing: 2;
+            visible: false;
+
+            Gtk.Label pinned_header {
+              label: "Pinned Messages";
+              halign: start;
+              styles ["caption", "heading"]
+            }
+          }
+        }
+
+        Gtk.Separator info_separator {
+          orientation: horizontal;
+          visible: false;
+        }
 
         Gtk.ScrolledWindow scrolled_window {
           hscrollbar-policy: never;
@@ -46,6 +105,14 @@ template $MxMessageView : Gtk.Box {
           Gtk.Entry input_entry {
             placeholder-text: "Send a message…";
             hexpand: true;
+          }
+
+          Gtk.MenuButton emoji_button {
+            icon-name: "face-smile-symbolic";
+            tooltip-text: "Insert emoji";
+            styles ["circular", "flat"]
+
+            popover: Gtk.EmojiChooser emoji_chooser {};
           }
 
           Gtk.Button send_button {

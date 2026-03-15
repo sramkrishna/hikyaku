@@ -1,7 +1,8 @@
 // RoomRow — a single row in the room list sidebar.
 //
 // Shows a kind icon (person for DMs, hash for rooms), room name,
-// and a lock icon for encrypted rooms.
+// badges (unread count, admin star, tombstone), and a lock icon
+// for encrypted rooms.
 
 mod imp {
     use gtk::glib;
@@ -15,6 +16,14 @@ mod imp {
         pub kind_icon: TemplateChild<gtk::Image>,
         #[template_child]
         pub name_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub mention_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub unread_badge: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub admin_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub tombstone_icon: TemplateChild<gtk::Image>,
         #[template_child]
         pub lock_icon: TemplateChild<gtk::Image>,
     }
@@ -61,11 +70,15 @@ impl RoomRow {
         let imp = self.imp();
 
         if room.is_header() {
-            // Section header: show bold label, hide icons.
+            // Section header: show bold label, hide everything else.
             imp.name_label.set_label(&room.name());
             imp.name_label.add_css_class("heading");
             imp.kind_icon.set_visible(false);
             imp.lock_icon.set_visible(false);
+            imp.mention_icon.set_visible(false);
+            imp.unread_badge.set_visible(false);
+            imp.admin_icon.set_visible(false);
+            imp.tombstone_icon.set_visible(false);
         } else {
             // Normal room row.
             imp.name_label.set_label(&room.name());
@@ -79,6 +92,41 @@ impl RoomRow {
             imp.kind_icon.set_icon_name(Some(icon_name));
 
             imp.lock_icon.set_visible(room.is_encrypted());
+
+            // Mention icon — show @ when you've been mentioned.
+            let highlights = room.highlight_count();
+            imp.mention_icon.set_visible(highlights > 0);
+
+            // Unread badge — show count.
+            let unread = room.unread_count();
+            if unread > 0 || highlights > 0 {
+                let count = if highlights > 0 { highlights } else { unread };
+                let label = if count > 99 { "99+".to_string() } else { count.to_string() };
+                imp.unread_badge.set_label(&label);
+                imp.unread_badge.set_visible(true);
+                if highlights > 0 {
+                    imp.unread_badge.add_css_class("highlight-badge");
+                    imp.unread_badge.remove_css_class("unread-badge");
+                } else {
+                    imp.unread_badge.add_css_class("unread-badge");
+                    imp.unread_badge.remove_css_class("highlight-badge");
+                }
+            } else {
+                imp.unread_badge.set_visible(false);
+            }
+
+            // Admin star.
+            imp.admin_icon.set_visible(room.is_admin());
+
+            // Tombstone indicator.
+            imp.tombstone_icon.set_visible(room.is_tombstoned());
+
+            // Dim tombstoned room names.
+            if room.is_tombstoned() {
+                imp.name_label.add_css_class("dim-label");
+            } else {
+                imp.name_label.remove_css_class("dim-label");
+            }
         }
     }
 }

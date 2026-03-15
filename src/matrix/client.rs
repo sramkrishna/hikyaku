@@ -42,6 +42,14 @@ pub struct RoomInfo {
     pub parent_space: Option<String>,
     /// Whether the user has pinned this room (e.g. friend DMs).
     pub is_pinned: bool,
+    /// Number of unread notifications (messages since last read receipt).
+    pub unread_count: u64,
+    /// Number of highlights (mentions of you, keyword matches).
+    pub highlight_count: u64,
+    /// Whether the current user has admin power level in this room.
+    pub is_admin: bool,
+    /// Whether this room has been tombstoned (upgraded to a new room).
+    pub is_tombstoned: bool,
 }
 
 /// A single message sent to the UI.
@@ -50,6 +58,38 @@ pub struct MessageInfo {
     pub sender: String,
     pub body: String,
     pub timestamp: u64,
+}
+
+/// Room metadata sent alongside messages for display in the content header.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct RoomMeta {
+    /// Room topic (m.room.topic).
+    pub topic: String,
+    /// Whether the room has been tombstoned.
+    pub is_tombstoned: bool,
+    /// Replacement room ID if tombstoned.
+    pub replacement_room: Option<String>,
+    /// Human-readable name of the replacement room (if we can resolve it).
+    pub replacement_room_name: Option<String>,
+    /// Pinned messages: (sender, body) pairs.
+    pub pinned_messages: Vec<(String, String)>,
+    /// Whether the room is encrypted.
+    pub is_encrypted: bool,
+    /// Number of joined members.
+    pub member_count: u64,
+    /// Room member display names (for nick completion).
+    pub members: Vec<(String, String)>, // (user_id, display_name)
+}
+
+/// A room entry from a space directory listing.
+#[derive(Debug, Clone)]
+pub struct SpaceDirectoryRoom {
+    pub room_id: String,
+    pub name: String,
+    pub topic: String,
+    pub member_count: u64,
+    pub already_joined: bool,
 }
 
 /// A single emoji from SAS verification.
@@ -64,7 +104,7 @@ pub struct VerificationEmoji {
 pub enum MatrixEvent {
     /// No saved session found — show the login page.
     LoginRequired,
-    LoginSuccess { display_name: String },
+    LoginSuccess { display_name: String, user_id: String },
     LoginFailed { error: String },
     SyncStarted,
     SyncError { error: String },
@@ -74,6 +114,8 @@ pub enum MatrixEvent {
         messages: Vec<MessageInfo>,
         /// Pagination token — pass to FetchOlderMessages to get the next batch.
         prev_batch_token: Option<String>,
+        /// Room metadata for the content header.
+        room_meta: RoomMeta,
     },
     /// Older messages prepended at the top (pagination result).
     OlderMessages {
@@ -83,7 +125,9 @@ pub enum MatrixEvent {
     },
     NewMessage {
         room_id: String,
+        room_name: String,
         message: MessageInfo,
+        is_mention: bool,
     },
     /// An incoming verification request — show UI to accept.
     VerificationRequest {
@@ -106,6 +150,23 @@ pub enum MatrixEvent {
     RecoveryComplete,
     /// Recovery key import failed.
     RecoveryFailed { error: String },
+    /// Public room directory from the homeserver.
+    PublicRoomDirectory {
+        rooms: Vec<SpaceDirectoryRoom>,
+    },
+    /// Space directory rooms for the "Join Room" browser.
+    SpaceDirectory {
+        space_id: String,
+        rooms: Vec<SpaceDirectoryRoom>,
+    },
+    /// Successfully joined a room.
+    RoomJoined { room_id: String, room_name: String },
+    /// Failed to join a room.
+    JoinFailed { error: String },
+    /// Successfully left a room.
+    RoomLeft { room_id: String },
+    /// Failed to leave a room.
+    LeaveFailed { error: String },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.
@@ -138,6 +199,14 @@ pub enum MatrixCommand {
     },
     /// Import secrets using a recovery key or passphrase.
     RecoverKeys { recovery_key: String },
+    /// Fetch public room directory on the user's homeserver.
+    BrowsePublicRooms { search_term: Option<String> },
+    /// Fetch the room directory for a space.
+    BrowseSpaceRooms { space_id: String },
+    /// Join a room by ID or alias.
+    JoinRoom { room_id_or_alias: String },
+    /// Leave a room.
+    LeaveRoom { room_id: String },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -252,7 +321,8 @@ async fn matrix_task(
                     match do_login(&homeserver, &username, &password).await {
                         Ok(client) => {
                             let display_name = username.clone();
-                            let _ = event_tx.send(MatrixEvent::LoginSuccess { display_name }).await;
+                            let user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+                            let _ = event_tx.send(MatrixEvent::LoginSuccess { display_name, user_id }).await;
                             break client;
                         }
                         Err(e) => {
@@ -293,6 +363,21 @@ async fn matrix_task(
         start_sync(sync_client, &sync_event_tx, sync_shutdown).await;
     });
 
+    // Track rooms we've already downloaded encryption keys for to avoid
+    // re-downloading on every room select. Persisted to disk so keys
+    // aren't re-fetched across restarts (the SDK's crypto store already
+    // has the actual keys; this just tracks which rooms we've fetched for).
+    let key_cache_path = {
+        let mut p = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+        p.push("matx");
+        p.push("key_fetched_rooms.json");
+        p
+    };
+    let mut rooms_with_keys: std::collections::HashSet<String> = std::fs::read_to_string(&key_cache_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
     // Process commands while sync runs in the background.
     let mut shutdown_rx = shutdown_rx;
     loop {
@@ -303,7 +388,7 @@ async fn matrix_task(
                         tracing::warn!("Already logged in, ignoring duplicate login command");
                     }
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
-                        handle_select_room(&client, &event_tx, &room_id).await;
+                        handle_select_room(&client, &event_tx, &room_id, &mut rooms_with_keys).await;
                     }
                     Ok(MatrixCommand::SendMessage { room_id, body }) => {
                         handle_send_message(&client, &room_id, &body).await;
@@ -329,6 +414,18 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::RecoverKeys { recovery_key }) => {
                         handle_recover_keys(&client, &event_tx, &recovery_key).await;
+                    }
+                    Ok(MatrixCommand::BrowsePublicRooms { search_term }) => {
+                        handle_browse_public_rooms(&client, &event_tx, search_term.as_deref()).await;
+                    }
+                    Ok(MatrixCommand::BrowseSpaceRooms { space_id }) => {
+                        handle_browse_space(&client, &event_tx, &space_id).await;
+                    }
+                    Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
+                        handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    }
+                    Ok(MatrixCommand::LeaveRoom { room_id }) => {
+                        handle_leave_room(&client, &event_tx, &room_id).await;
                     }
                     Err(_) => break,
                 }
@@ -421,8 +518,9 @@ async fn try_restore_session(
             .flatten()
             .unwrap_or_else(|| "User".to_string());
 
+        let user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
         let _ = event_tx
-            .send(MatrixEvent::LoginSuccess { display_name })
+            .send(MatrixEvent::LoginSuccess { display_name, user_id })
             .await;
         Some(client)
     } else {
@@ -516,13 +614,191 @@ async fn setup_encryption(client: &Client, event_tx: &Sender<MatrixEvent>) {
     }
 }
 
+/// Cache format version. Bump this whenever the definition of "activity"
+/// changes (e.g. adding/removing event types from is_room_activity) so
+/// stale caches are automatically invalidated.
+const TIMESTAMP_CACHE_VERSION: u32 = 2;
+
+/// On-disk timestamp cache with versioning.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TimestampCache {
+    version: u32,
+    timestamps: std::collections::HashMap<String, u64>,
+}
+
+/// Path to the on-disk timestamp cache.
+fn timestamp_cache_path() -> PathBuf {
+    let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("matx");
+    path.push("room_timestamps.json");
+    path
+}
+
+/// Load cached room timestamps from disk. Returns empty if the cache
+/// is missing, corrupt, or from an older version.
+fn load_timestamp_cache() -> std::collections::HashMap<String, u64> {
+    let path = timestamp_cache_path();
+    let cache: Option<TimestampCache> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    match cache {
+        Some(c) if c.version == TIMESTAMP_CACHE_VERSION => c.timestamps,
+        Some(c) => {
+            tracing::info!(
+                "Timestamp cache version {} != {}, rebuilding",
+                c.version, TIMESTAMP_CACHE_VERSION
+            );
+            // Delete stale cache file.
+            let _ = std::fs::remove_file(&path);
+            std::collections::HashMap::new()
+        }
+        None => std::collections::HashMap::new(),
+    }
+}
+
+/// Save room timestamps to disk with version tag. Prunes entries for
+/// rooms not in `joined_room_ids` (rooms we've left).
+fn save_timestamp_cache(
+    map: &std::collections::HashMap<String, u64>,
+    joined_room_ids: Option<&[String]>,
+) {
+    let timestamps = if let Some(ids) = joined_room_ids {
+        let joined: std::collections::HashSet<&str> =
+            ids.iter().map(|s| s.as_str()).collect();
+        map.iter()
+            .filter(|(k, _)| joined.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    } else {
+        map.clone()
+    };
+    let cache = TimestampCache {
+        version: TIMESTAMP_CACHE_VERSION,
+        timestamps,
+    };
+    let path = timestamp_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Check whether a raw event JSON object represents meaningful room
+/// activity — something a human initiated that's worth sorting by.
+///
+/// Relevant: messages (all types incl. notices), encrypted events,
+///           topic/name changes, pin updates.
+/// Not relevant: member joins/leaves, server ACLs, power level changes,
+///               alias changes, avatar changes — these are automated
+///               churn that doesn't reflect real interaction.
+fn is_room_activity(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("type").and_then(|t| t.as_str()),
+        Some(
+            "m.room.message"
+                | "m.room.encrypted"
+                | "m.room.topic"
+                | "m.room.name"
+                | "m.room.pinned_events"
+        )
+    )
+}
+
+/// Fetch the timestamp of the most recent message for rooms where we
+/// don't have one yet. Runs up to 20 requests in parallel.
+async fn backfill_timestamps(client: &Client, rooms: &mut [RoomInfo]) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let missing: Vec<usize> = rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.last_activity_ts == 0
+                && r.kind != RoomKind::Space
+                && !r.name.to_lowercase().starts_with("empty room")
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    tracing::info!("Backfilling timestamps for {} rooms", missing.len());
+    let start = std::time::Instant::now();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
+
+    let mut futures = FuturesUnordered::new();
+    for &idx in &missing {
+        let room_id_str = rooms[idx].room_id.clone();
+        let client = client.clone();
+        let sem = sem.clone();
+        futures.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let room_id = match RoomId::parse(&room_id_str) {
+                Ok(id) => id,
+                Err(_) => return (idx, 0u64),
+            };
+            let Some(room) = client.get_room(&room_id) else {
+                return (idx, 0u64);
+            };
+            // Filter server-side to only return message/encrypted events,
+            // avoiding pagination through membership churn.
+            let mut filter = matrix_sdk::ruma::api::client::filter::RoomEventFilter::default();
+            filter.types = Some(vec![
+                "m.room.message".to_string(),
+                "m.room.encrypted".to_string(),
+            ]);
+            let mut opts = matrix_sdk::room::MessagesOptions::backward();
+            opts.limit = matrix_sdk::ruma::UInt::from(1u32);
+            opts.filter = filter;
+            let ts = match room.messages(opts).await {
+                Ok(resp) => {
+                    resp.chunk.first()
+                        .and_then(|ev| {
+                            let raw = ev.raw().json().get();
+                            let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+                            v.get("origin_server_ts")?.as_u64()
+                        })
+                        .map(|ms| ms / 1000)
+                        .unwrap_or(0)
+                }
+                Err(_) => 0,
+            };
+            (idx, ts)
+        }));
+    }
+
+    let mut filled = 0u32;
+    while let Some(result) = futures.next().await {
+        if let Ok((idx, ts)) = result {
+            if ts > 0 {
+                rooms[idx].last_activity_ts = ts;
+                filled += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        "Backfilled {}/{} room timestamps in {:?}",
+        filled,
+        missing.len(),
+        start.elapsed()
+    );
+}
+
 /// Collect current room info from the client's joined rooms.
 ///
 /// First builds a map of space → child room IDs by iterating spaces
 /// (typically ~20) and reading their m.space.child state events. Then
 /// classifies each non-space room as DM or Room, attaching the parent
 /// space name so the UI can group them.
-async fn collect_room_info(client: &Client) -> Vec<RoomInfo> {
+async fn collect_room_info(
+    client: &Client,
+    ts_cache: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>>,
+) -> Vec<RoomInfo> {
     use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
     use std::collections::HashMap;
 
@@ -575,17 +851,14 @@ async fn collect_room_info(client: &Client) -> Vec<RoomInfo> {
         space_count, child_to_space.len()
     );
 
-    // Step 2: Classify all non-space rooms.
+    // Step 2: Classify all rooms, including spaces.
     let cfg = crate::config::settings();
     let mut with_unread = Vec::new();
     let mut direct = Vec::new();
     let mut rest = Vec::new();
+    let mut spaces = Vec::new();
 
     for room in joined.iter() {
-        if room.is_space() {
-            continue;
-        }
-
         let room_id = room.room_id().to_string();
         let name = room
             .display_name()
@@ -593,30 +866,82 @@ async fn collect_room_info(client: &Client) -> Vec<RoomInfo> {
             .ok()
             .map(|n| n.to_string())
             .unwrap_or_else(|| room_id.clone());
-        let unread = room.unread_notification_counts();
-        let is_dm = room.is_direct().await.unwrap_or(false);
         let is_encrypted = room.is_encrypted().await.unwrap_or(false);
-        let parent_space = child_to_space.get(&room_id).cloned();
-        if let Some(ref space) = parent_space {
-            tracing::info!("Room '{}' belongs to space '{}'", name, space);
+        let is_pinned = cfg.rooms.pinned_rooms.contains(&room_id);
+
+        // Get last activity timestamp. Try recency_stamp first (Sliding Sync),
+        // then latest_event filtered to real activity only. Rooms with only
+        // state events get ts=0 here — the persistent disk cache and backfill
+        // handle those separately.
+        let last_activity_ts = room
+            .recency_stamp()
+            .or_else(|| {
+                room.latest_event()
+                    .and_then(|e| {
+                        let raw = e.event().raw().json().get();
+                        let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+                        if is_room_activity(&v) {
+                            v.get("origin_server_ts")?.as_u64().map(|ms| ms / 1000)
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .unwrap_or(0u64);
+
+        tracing::debug!(
+            "Room '{}' activity_ts={} recency={:?}",
+            name, last_activity_ts, room.recency_stamp()
+        );
+
+        let unread = room.unread_notification_counts();
+
+        // Check if room is tombstoned (upgraded to a new room).
+        use matrix_sdk::ruma::events::room::tombstone::RoomTombstoneEventContent;
+        let is_tombstoned = room
+            .get_state_event_static::<RoomTombstoneEventContent>()
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        // Check if current user is admin (power level >= state_default).
+        let is_admin = if let Some(user_id) = client.user_id() {
+            room.get_member_no_sync(user_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|m| m.power_level() >= 100)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if room.is_space() {
+            spaces.push(RoomInfo {
+                room_id,
+                name,
+                last_activity_ts,
+                kind: RoomKind::Space,
+                is_encrypted,
+                parent_space: None,
+                is_pinned,
+                unread_count: unread.notification_count.into(),
+                highlight_count: unread.highlight_count.into(),
+                is_admin,
+                is_tombstoned,
+            });
+            continue;
         }
+
+        let is_dm = room.is_direct().await.unwrap_or(false);
+        let parent_space = child_to_space.get(&room_id).cloned();
 
         let kind = if is_dm {
             RoomKind::DirectMessage
         } else {
             RoomKind::Room
         };
-
-        // Get last activity timestamp from the latest event in the room.
-        let last_activity_ts = room
-            .latest_event()
-            .and_then(|e| e.event().raw().deserialize().ok())
-            .map(|e: matrix_sdk::ruma::events::AnySyncTimelineEvent| {
-                e.origin_server_ts().as_secs().into()
-            })
-            .unwrap_or(0u64);
-
-        let is_pinned = cfg.rooms.pinned_rooms.contains(&room_id);
 
         let info = RoomInfo {
             room_id,
@@ -626,6 +951,10 @@ async fn collect_room_info(client: &Client) -> Vec<RoomInfo> {
             is_encrypted,
             parent_space,
             is_pinned,
+            unread_count: unread.notification_count.into(),
+            highlight_count: unread.highlight_count.into(),
+            is_admin,
+            is_tombstoned,
         };
 
         if unread.notification_count > 0 || unread.highlight_count > 0 {
@@ -637,20 +966,64 @@ async fn collect_room_info(client: &Client) -> Vec<RoomInfo> {
         }
     }
 
+    // Space-child rooms must not be truncated — they're needed for space
+    // drill-down. Split them out, truncate only ungrouped rooms, then
+    // recombine.
+    let mut space_children = Vec::new();
+    let mut ungrouped = Vec::new();
+    for r in rest {
+        if r.parent_space.is_some() {
+            space_children.push(r);
+        } else {
+            ungrouped.push(r);
+        }
+    }
+
     tracing::info!(
-        "Room buckets: {} with unread, {} DMs, {} other rooms, {} spaces (of {} total joined)",
-        with_unread.len(), direct.len(), rest.len(), space_count, total
+        "Room buckets: {} with unread, {} DMs, {} ungrouped, {} space-children, {} spaces (of {} total joined)",
+        with_unread.len(), direct.len(), ungrouped.len(), space_children.len(), spaces.len(), total
     );
 
-    // Cap each category so DMs don't crowd out rooms.
-    direct.truncate(cfg.rooms.max_dms);
-    rest.truncate(cfg.rooms.max_rooms);
+    // Apply cached timestamps before sorting so rooms with ts=0 that have
+    // a cached value don't get wrongly truncated.
+    if let Some(ts_arc) = ts_cache {
+        let ts_map = ts_arc.lock().unwrap();
+        for room in direct.iter_mut()
+            .chain(ungrouped.iter_mut())
+            .chain(space_children.iter_mut())
+            .chain(with_unread.iter_mut())
+        {
+            if room.last_activity_ts == 0 {
+                if let Some(&cached) = ts_map.get(&room.room_id) {
+                    room.last_activity_ts = cached;
+                }
+            }
+        }
+    }
 
-    // Combine: unread first, then DMs, then rooms.
-    let mut rooms = Vec::with_capacity(with_unread.len() + direct.len() + rest.len());
+    // Sort each bucket by activity (most recent first) before truncating,
+    // so dead rooms get cut rather than active ones.
+    let sort_by_activity = |a: &RoomInfo, b: &RoomInfo| {
+        b.last_activity_ts.cmp(&a.last_activity_ts)
+    };
+    direct.sort_by(sort_by_activity);
+    ungrouped.sort_by(sort_by_activity);
+    with_unread.sort_by(sort_by_activity);
+
+    // Cap DMs and ungrouped rooms. Space children are never truncated.
+    direct.truncate(cfg.rooms.max_dms);
+    ungrouped.truncate(cfg.rooms.max_rooms);
+
+    // Combine all rooms — the UI separates them into tabs.
+    let mut rooms = Vec::with_capacity(
+        with_unread.len() + direct.len() + ungrouped.len()
+            + space_children.len() + spaces.len(),
+    );
     rooms.extend(with_unread);
     rooms.extend(direct);
-    rooms.extend(rest);
+    rooms.extend(ungrouped);
+    rooms.extend(space_children);
+    rooms.extend(spaces);
 
     let hidden = total.saturating_sub(rooms.len());
     tracing::info!(
@@ -674,25 +1047,84 @@ async fn start_sync(
 
     let _ = event_tx.send(MatrixEvent::SyncStarted).await;
 
+    // Persistent map of room_id → most recent message timestamp (seconds).
+    // Loaded from disk so rooms appear in the right order immediately on
+    // restart, without waiting for backfill.
+    let room_timestamps: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(load_timestamp_cache()));
+
     // Load rooms from the local store immediately so the UI populates
     // without waiting for the first sync response from the server.
-    let cached_rooms = collect_room_info(&client).await;
+    let mut cached_rooms = collect_room_info(&client, Some(&room_timestamps)).await;
     if !cached_rooms.is_empty() {
+        // Apply cached timestamps so rooms sort correctly from the start.
+        // Fresh data from collect_room_info wins; cache is fallback only.
+        {
+            let mut ts_map = room_timestamps.lock().unwrap();
+            for room in &mut cached_rooms {
+                if room.last_activity_ts > 0 {
+                    ts_map.insert(room.room_id.clone(), room.last_activity_ts);
+                } else if let Some(&cached) = ts_map.get(&room.room_id) {
+                    room.last_activity_ts = cached;
+                }
+            }
+        }
         tracing::info!("Loaded {} rooms from local store", cached_rooms.len());
         let _ = event_tx
-            .send(MatrixEvent::RoomListUpdated { rooms: cached_rooms })
+            .send(MatrixEvent::RoomListUpdated {
+                rooms: cached_rooms,
+            })
             .await;
+
+        // Backfill timestamps in the background for rooms with ts=0.
+        // Only sends an updated room list if new timestamps were found.
+        let backfill_client = client.clone();
+        let backfill_tx = event_tx.clone();
+        let backfill_ts = room_timestamps.clone();
+        tokio::spawn(async move {
+            let mut rooms = collect_room_info(&backfill_client, Some(&backfill_ts)).await;
+            let before_count = rooms.iter().filter(|r| r.last_activity_ts == 0).count();
+            backfill_timestamps(&backfill_client, &mut rooms).await;
+            // Merge backfilled timestamps into the persistent cache.
+            {
+                let mut ts_map = backfill_ts.lock().unwrap();
+                for room in &mut rooms {
+                    if room.last_activity_ts > 0 {
+                        // Fresh data always wins — overwrite cache.
+                        ts_map.insert(room.room_id.clone(), room.last_activity_ts);
+                    } else if let Some(&cached) = ts_map.get(&room.room_id) {
+                        // No fresh data — fall back to cache.
+                        room.last_activity_ts = cached;
+                    }
+                }
+                let room_ids: Vec<String> = rooms.iter().map(|r| r.room_id.clone()).collect();
+                save_timestamp_cache(&ts_map, Some(&room_ids));
+            }
+            let after_count = rooms.iter().filter(|r| r.last_activity_ts == 0).count();
+            // Only re-send if backfill actually discovered new timestamps.
+            if after_count < before_count {
+                let _ = backfill_tx
+                    .send(MatrixEvent::RoomListUpdated { rooms })
+                    .await;
+            }
+        });
     }
 
-    // Register a handler for new messages.
+    // Register handlers for new messages (both decrypted and encrypted).
+    // The SDK auto-decrypts when keys are available and fires the
+    // RoomMessage handler. When decryption fails, the RoomEncrypted
+    // handler fires instead.
     let msg_tx = event_tx.clone();
+    let msg_client = client.clone();
     client.add_event_handler(
         move |event: OriginalSyncRoomMessageEvent,
               room: matrix_sdk::room::Room| {
             let tx = msg_tx.clone();
+            let client = msg_client.clone();
             async move {
                 let body = match &event.content.msgtype {
                     MessageType::Text(text) => text.body.clone(),
+                    MessageType::Notice(notice) => notice.body.clone(),
                     _ => return,
                 };
                 let timestamp = event
@@ -700,7 +1132,6 @@ async fn start_sync(
                     .as_secs()
                     .into();
 
-                // Resolve display name from room member profile.
                 let sender_id = event.sender.to_string();
                 let display_name = room
                     .get_member_no_sync(&event.sender)
@@ -710,14 +1141,72 @@ async fn start_sync(
                     .and_then(|m| m.display_name().map(|s| s.to_string()))
                     .unwrap_or_else(|| sender_id.clone());
 
+                // Check if this message mentions the current user.
+                let is_mention = if let Some(user_id) = client.user_id() {
+                    let uid = user_id.as_str();
+                    let local = user_id.localpart();
+                    body.contains(uid) || body.to_lowercase().contains(&local.to_lowercase())
+                } else {
+                    false
+                };
+
+                let room_name = room
+                    .display_name()
+                    .await
+                    .ok()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
+                        room_name,
                         message: MessageInfo {
                             sender: display_name,
                             body,
                             timestamp,
                         },
+                        is_mention,
+                    })
+                    .await;
+            }
+        },
+    );
+
+    // Handler for encrypted messages that couldn't be decrypted.
+    use matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
+    let enc_tx = event_tx.clone();
+    client.add_event_handler(
+        move |event: OriginalSyncRoomEncryptedEvent,
+              room: matrix_sdk::room::Room| {
+            let tx = enc_tx.clone();
+            async move {
+                let sender_id = event.sender.to_string();
+                let display_name = room
+                    .get_member_no_sync(&event.sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.display_name().map(|s| s.to_string()))
+                    .unwrap_or_else(|| sender_id.clone());
+
+                let room_name = room
+                    .display_name()
+                    .await
+                    .ok()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+
+                let _ = tx
+                    .send(MatrixEvent::NewMessage {
+                        room_id: room.room_id().to_string(),
+                        room_name,
+                        message: MessageInfo {
+                            sender: display_name,
+                            body: "\u{1f512} Unable to decrypt message".to_string(),
+                            timestamp: event.origin_server_ts.as_secs().into(),
+                        },
+                        is_mention: false,
                     })
                     .await;
             }
@@ -762,13 +1251,45 @@ async fn start_sync(
         let settings = SyncSettings::default()
             .timeout(std::time::Duration::from_secs(cfg.sync.timeout_secs))
             .filter(Filter::FilterDefinition(filter_def));
+        let ts_ref = room_timestamps.clone();
+
         let result = client
-            .sync_with_callback(settings, move |_response| {
+            .sync_with_callback(settings, move |response| {
+                // Extract timestamps from the sync response for every room
+                // that had timeline events. Only count real user messages,
+                // not state events or bot notices.
+                for (room_id, joined_room) in &response.rooms.join {
+                    // Only extract timestamps from real activity events.
+                    let events = &joined_room.timeline.events;
+                    let activity_event = events.iter().rev().find(|ev| {
+                        let raw = ev.raw().json().get();
+                        serde_json::from_str::<serde_json::Value>(raw)
+                            .ok()
+                            .map(|v| is_room_activity(&v))
+                            .unwrap_or(false)
+                    });
+                    if let Some(ev) = activity_event {
+                        let raw_json = ev.raw().json().get();
+                        if let Some(ts_ms) = serde_json::from_str::<serde_json::Value>(raw_json)
+                            .ok()
+                            .and_then(|v| v.get("origin_server_ts")?.as_u64())
+                        {
+                            let ts_sec = ts_ms / 1000;
+                            let mut map = ts_ref.lock().unwrap();
+                            let entry = map.entry(room_id.to_string()).or_insert(0);
+                            if ts_sec > *entry {
+                                *entry = ts_sec;
+                            }
+                        }
+                    }
+                }
+
                 let tx = tx.clone();
                 let client = sync_client.clone();
                 let mut shutdown = sync_shutdown.clone();
                 let is_first = !initial_flag.swap(true, std::sync::atomic::Ordering::Relaxed);
                 let last_update = last_update_flag.clone();
+                let timestamps = ts_ref.clone();
                 async move {
                     // Refresh room list on initial sync and periodically after
                     // (throttled to at most once every 10 seconds to avoid lag).
@@ -783,7 +1304,35 @@ async fn start_sync(
                         if is_first {
                             tracing::info!("Initial sync complete, collecting room list");
                         }
-                        let rooms = collect_room_info(&client).await;
+                        let mut rooms = collect_room_info(&client, Some(&timestamps)).await;
+                        // Patch in timestamps from sync responses for rooms
+                        // where latest_event() returned None.
+                        // On initial sync, backfill any remaining rooms with ts=0.
+                        if is_first {
+                            backfill_timestamps(&client, &mut rooms).await;
+                        }
+                        // Merge: fresh sync data wins, cache is fallback only.
+                        {
+                            let mut ts_map = timestamps.lock().unwrap();
+                            let mut patched = 0u32;
+                            for room in &mut rooms {
+                                if room.last_activity_ts > 0 {
+                                    // Fresh data — update cache.
+                                    ts_map.insert(room.room_id.clone(), room.last_activity_ts);
+                                } else if let Some(&cached) = ts_map.get(&room.room_id) {
+                                    // No fresh data — fall back to cache.
+                                    room.last_activity_ts = cached;
+                                    patched += 1;
+                                }
+                            }
+                            tracing::debug!(
+                                "Timestamp patching: {} from cache, {} in map",
+                                patched, ts_map.len()
+                            );
+                            let room_ids: Vec<String> =
+                                rooms.iter().map(|r| r.room_id.clone()).collect();
+                            save_timestamp_cache(&ts_map, Some(&room_ids));
+                        } // MutexGuard dropped here, before await.
                         let _ = tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
                         last_update.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -859,6 +1408,7 @@ async fn extract_messages(
                 };
                 let body = match &msg_event.content.msgtype {
                     MessageType::Text(text) => text.body.clone(),
+                    MessageType::Notice(notice) => notice.body.clone(),
                     _ => continue,
                 };
                 let sender_id = msg_event.sender.to_string();
@@ -897,7 +1447,15 @@ async fn extract_messages(
 }
 
 /// Fetch recent messages for a room and send them to the UI.
-async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+/// `key_fetched_rooms` tracks room IDs for which we've already triggered a
+/// key download from backup this session (to avoid redundant network calls).
+/// This set contains only room ID strings, NOT encryption keys.
+async fn handle_select_room(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    key_fetched_rooms: &mut std::collections::HashSet<String>,
+) {
     use matrix_sdk::ruma::UInt;
 
     let Ok(room_id) = RoomId::parse(room_id) else {
@@ -910,27 +1468,68 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
         return;
     };
 
-    // If the room is encrypted, try to download room keys from backup
-    // so we can decrypt messages. This is a no-op if keys are already
-    // available or if backup isn't set up.
-    if room.is_encrypted().await.unwrap_or(false) {
+    // If the room is encrypted and we haven't fetched keys this session,
+    // download room keys from backup so we can decrypt messages.
+    if room.is_encrypted().await.unwrap_or(false)
+        && !key_fetched_rooms.contains(&room_id.to_string())
+    {
         let backups = client.encryption().backups();
         match backups.download_room_keys_for_room(&room_id).await {
             Ok(()) => tracing::debug!("Downloaded room keys for {room_id}"),
             Err(e) => tracing::debug!("Could not download room keys for {room_id}: {e}"),
         }
+        key_fetched_rooms.insert(room_id.to_string());
+        // Persist to disk.
+        let path = {
+            let mut p = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+            p.push("matx");
+            p.push("key_fetched_rooms.json");
+            p
+        };
+        if let Ok(json) = serde_json::to_string(key_fetched_rooms as &std::collections::HashSet<String>) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 
     tracing::debug!("Fetching messages for {room_id}");
 
+    // Filter the /messages API to only return message-like events, skipping
+    // state events (membership churn) server-side. This avoids paginating
+    // through hundreds of m.room.member events to find actual messages.
+    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
+    let mut msg_filter = RoomEventFilter::default();
+    msg_filter.types = Some(vec![
+        "m.room.message".to_string(),
+        "m.room.encrypted".to_string(),
+    ]);
+
     let mut options = matrix_sdk::room::MessagesOptions::backward();
     options.limit = UInt::from(50u32);
+    options.filter = msg_filter;
 
-    let (messages, prev_batch_token) = match room.messages(options).await {
+    let (all_messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
             tracing::debug!("Got {} events for {room_id}", response.chunk.len());
             let msgs = extract_messages(&room, &response.chunk, true).await;
             let token = response.end.map(|t| t.to_string());
+
+            // Send a read receipt for the most recent event to clear unread count.
+            if let Some(latest) = response.chunk.first() {
+                if let Ok(ev) = latest.raw().deserialize() {
+                    let event_id = ev.event_id().to_owned();
+                    if let Err(e) = room
+                        .send_single_receipt(
+                            matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
+                            matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
+                            event_id,
+                        )
+                        .await
+                    {
+                        tracing::debug!("Failed to send read receipt: {e}");
+                    }
+                }
+            }
+
             (msgs, token)
         }
         Err(e) => {
@@ -939,12 +1538,131 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
         }
     };
 
-    tracing::debug!("Sending {} messages to UI for {room_id}", messages.len());
+    // Collect room metadata for the content header.
+    let topic = room
+        .topic()
+        .unwrap_or_default();
+
+    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
+    let member_count = room.joined_members_count();
+
+    // Check tombstone status.
+    use matrix_sdk::ruma::events::room::tombstone::RoomTombstoneEventContent;
+    let tombstone = room
+        .get_state_event_static::<RoomTombstoneEventContent>()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.deserialize().ok())
+        .and_then(|ev| {
+            if let matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
+                matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
+            ) = ev
+            {
+                Some(orig.content)
+            } else {
+                None
+            }
+        });
+
+    let (is_tombstoned, replacement_room, replacement_room_name) = match tombstone {
+        Some(content) => {
+            let rid = content.replacement_room.to_string();
+            // Try to resolve the human-readable name from joined rooms.
+            let name = client
+                .get_room(&content.replacement_room)
+                .and_then(|r| {
+                    // Use cached display name (no network call).
+                    r.cached_display_name().map(|n| n.to_string())
+                });
+            (true, Some(rid), name)
+        }
+        None => (false, None, None),
+    };
+
+    // Fetch pinned messages.
+    use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
+    let pinned_messages = match room
+        .get_state_event_static::<RoomPinnedEventsEventContent>()
+        .await
+    {
+        Ok(Some(raw)) => {
+            if let Ok(ev) = raw.deserialize() {
+                let pinned_ids = match ev {
+                    matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
+                        matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
+                    ) => orig.content.pinned,
+                    _ => vec![],
+                };
+                // Fetch the actual event content for each pinned event (up to 5).
+                let mut entries = Vec::new();
+                for event_id in pinned_ids.iter().take(5) {
+                    if let Ok(ev) = room.event(event_id, None).await {
+                        if let Ok(timeline_ev) = ev.raw().deserialize() {
+                            if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(
+                                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(msg),
+                                ),
+                            ) = timeline_ev
+                            {
+                                use matrix_sdk::ruma::events::room::message::MessageType;
+                                let body = match &msg.content.msgtype {
+                                    MessageType::Text(t) => t.body.clone(),
+                                    MessageType::Notice(n) => n.body.clone(),
+                                    _ => continue,
+                                };
+                                let sender = room
+                                    .get_member_no_sync(&msg.sender)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|m| m.display_name().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| msg.sender.to_string());
+                                entries.push((sender, body));
+                            }
+                        }
+                    }
+                }
+                entries
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    };
+
+    // Fetch room members for nick completion (lazy-loaded, so this
+    // may only return members we've seen in timeline events).
+    let members: Vec<(String, String)> = room
+        .members_no_sync(matrix_sdk::RoomMemberships::ACTIVE)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let uid = m.user_id().to_string();
+            let name = m.display_name().map(|n| n.to_string()).unwrap_or_else(|| uid.clone());
+            (uid, name)
+        })
+        .collect();
+
+    let room_meta = RoomMeta {
+        topic,
+        is_tombstoned,
+        replacement_room,
+        replacement_room_name,
+        pinned_messages,
+        is_encrypted,
+        member_count,
+        members,
+    };
+
+    tracing::debug!("Sending {} messages to UI for {room_id}", all_messages.len());
     let _ = event_tx
         .send(MatrixEvent::RoomMessages {
             room_id: room_id.to_string(),
-            messages,
+            messages: all_messages,
             prev_batch_token,
+            room_meta,
         })
         .await;
 }
@@ -1025,6 +1743,173 @@ async fn handle_recover_keys(client: &Client, event_tx: &Sender<MatrixEvent>, re
             tracing::error!("Recovery failed: {e}");
             let _ = event_tx
                 .send(MatrixEvent::RecoveryFailed {
+                    error: e.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+async fn handle_browse_public_rooms(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    search_term: Option<&str>,
+) {
+    use matrix_sdk::ruma::api::client::directory::get_public_rooms_filtered;
+    use matrix_sdk::ruma::directory::Filter;
+
+    let mut request = get_public_rooms_filtered::v3::Request::new();
+    request.limit = Some(matrix_sdk::ruma::UInt::from(50u32));
+    if let Some(term) = search_term {
+        if !term.is_empty() {
+            request.filter = Filter::new();
+            request.filter.generic_search_term = Some(term.to_owned());
+        }
+    }
+
+    match client.send(request).await {
+        Ok(response) => {
+            let joined_rooms: std::collections::HashSet<String> = client
+                .joined_rooms()
+                .iter()
+                .map(|r| r.room_id().to_string())
+                .collect();
+
+            let rooms: Vec<SpaceDirectoryRoom> = response
+                .chunk
+                .into_iter()
+                .map(|r| SpaceDirectoryRoom {
+                    already_joined: joined_rooms.contains(&r.room_id.to_string()),
+                    room_id: r.room_id.to_string(),
+                    name: r.name.unwrap_or_else(|| {
+                        r.canonical_alias
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| r.room_id.to_string())
+                    }),
+                    topic: r.topic.unwrap_or_default(),
+                    member_count: r.num_joined_members.into(),
+                })
+                .collect();
+
+            let _ = event_tx
+                .send(MatrixEvent::PublicRoomDirectory { rooms })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch public rooms: {e}");
+        }
+    }
+}
+
+async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, space_id: &str) {
+    use matrix_sdk::ruma::api::client::space::get_hierarchy;
+
+    let Ok(room_id) = RoomId::parse(space_id) else {
+        return;
+    };
+
+    let request = get_hierarchy::v1::Request::new(room_id.to_owned());
+    match client.send(request).await {
+        Ok(response) => {
+            let joined_rooms: std::collections::HashSet<String> = client
+                .joined_rooms()
+                .iter()
+                .map(|r| r.room_id().to_string())
+                .collect();
+
+            let rooms: Vec<SpaceDirectoryRoom> = response
+                .rooms
+                .into_iter()
+                .filter(|r| r.room_id != room_id) // Skip the space itself
+                .map(|r| SpaceDirectoryRoom {
+                    already_joined: joined_rooms.contains(&r.room_id.to_string()),
+                    room_id: r.room_id.to_string(),
+                    name: r.name.unwrap_or_else(|| r.room_id.to_string()),
+                    topic: r.topic.unwrap_or_default(),
+                    member_count: r.num_joined_members.into(),
+                })
+                .collect();
+
+            let _ = event_tx
+                .send(MatrixEvent::SpaceDirectory {
+                    space_id: space_id.to_string(),
+                    rooms,
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch space hierarchy for {space_id}: {e}");
+        }
+    }
+}
+
+async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id_or_alias: &str) {
+    use matrix_sdk::ruma::RoomOrAliasId;
+
+    let Ok(id) = RoomOrAliasId::parse(room_id_or_alias) else {
+        let _ = event_tx
+            .send(MatrixEvent::JoinFailed {
+                error: format!("Invalid room ID or alias: {room_id_or_alias}"),
+            })
+            .await;
+        return;
+    };
+
+    match client.join_room_by_id_or_alias(&id, &[]).await {
+        Ok(room) => {
+            let room_id = room.room_id().to_string();
+            let room_name = room
+                .cached_display_name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| room_id.clone());
+            tracing::info!("Joined room: {room_name} ({room_id})");
+            let _ = event_tx
+                .send(MatrixEvent::RoomJoined { room_id, room_name })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to join {room_id_or_alias}: {e}");
+            let _ = event_tx
+                .send(MatrixEvent::JoinFailed {
+                    error: e.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+    let Ok(room_id) = RoomId::parse(room_id) else {
+        let _ = event_tx
+            .send(MatrixEvent::LeaveFailed {
+                error: format!("Invalid room ID: {room_id}"),
+            })
+            .await;
+        return;
+    };
+
+    let Some(room) = client.get_room(&room_id) else {
+        let _ = event_tx
+            .send(MatrixEvent::LeaveFailed {
+                error: "Room not found".to_string(),
+            })
+            .await;
+        return;
+    };
+
+    match room.leave().await {
+        Ok(()) => {
+            tracing::info!("Left room: {room_id}");
+            let _ = event_tx
+                .send(MatrixEvent::RoomLeft {
+                    room_id: room_id.to_string(),
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to leave {room_id}: {e}");
+            let _ = event_tx
+                .send(MatrixEvent::LeaveFailed {
                     error: e.to_string(),
                 })
                 .await;

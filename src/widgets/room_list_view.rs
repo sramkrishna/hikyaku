@@ -1,8 +1,8 @@
-// RoomListView — the sidebar listing all joined rooms.
+// RoomListView — the sidebar with tabbed views for Messages, Rooms, and Spaces.
 //
-// Rooms are grouped into sections: DMs, each space, and ungrouped rooms.
-// Section headers are inserted as pseudo-items in the ListStore with
-// is_header=true.
+// Uses AdwViewStack + AdwViewSwitcherBar to separate the three categories.
+// The Spaces tab supports drill-down: clicking a space shows its child rooms
+// in a sub-list with a back button.
 
 mod imp {
     use adw::prelude::*;
@@ -13,58 +13,207 @@ mod imp {
     use crate::models::RoomObject;
     use crate::widgets::room_row::RoomRow;
 
+    /// Build a (ListStore, SingleSelection, ListView) triple for one tab.
+    fn make_room_list() -> (gio::ListStore, gtk::SingleSelection, gtk::ListView) {
+        let store = gio::ListStore::new::<RoomObject>();
+
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_factory, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("ListItem expected");
+            list_item.set_child(Some(&RoomRow::new()));
+        });
+
+        factory.connect_bind(|_factory, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("ListItem expected");
+            let room_obj = list_item
+                .item()
+                .and_downcast::<RoomObject>()
+                .expect("RoomObject expected");
+            let row = list_item
+                .child()
+                .and_downcast::<RoomRow>()
+                .expect("RoomRow expected");
+
+            row.bind_room(&room_obj);
+            list_item.set_selectable(!room_obj.is_header());
+            list_item.set_activatable(!room_obj.is_header());
+        });
+
+        let selection = gtk::SingleSelection::new(Some(store.clone()));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+        let list_view = gtk::ListView::builder()
+            .model(&selection)
+            .factory(&factory)
+            .css_classes(["navigation-sidebar"])
+            .build();
+
+        (store, selection, list_view)
+    }
+
     pub struct RoomListView {
-        pub list_store: gio::ListStore,
-        pub selection: gtk::SingleSelection,
-        pub list_view: gtk::ListView,
+        pub dm_store: gio::ListStore,
+        pub room_store: gio::ListStore,
+        pub space_store: gio::ListStore,
+        /// Store for child rooms when drilling into a space.
+        pub space_child_store: gio::ListStore,
+        pub dm_selection: gtk::SingleSelection,
+        pub room_selection: gtk::SingleSelection,
+        pub space_selection: gtk::SingleSelection,
+        pub space_child_selection: gtk::SingleSelection,
+        pub view_stack: adw::ViewStack,
+        pub switcher_bar: adw::ViewSwitcherBar,
+        /// The spaces page uses a nested stack to switch between the space
+        /// list and the child-room list (drill-down).
+        pub space_nav_stack: gtk::Stack,
+        /// Header bar for the space child view with back button and space name.
+        pub space_child_header: adw::HeaderBar,
+        pub space_child_title: gtk::Label,
         pub on_room_selected: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        pub on_leave_room: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for "Join Room" in space drill-down. Passes space room ID.
+        pub on_browse_space: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// The room ID of the currently displayed space (for drill-down).
+        pub current_space_id: RefCell<Option<String>>,
+        /// "Join a Room" button at the bottom of the space child view.
+        pub join_space_btn: gtk::Button,
+        pub join_room_btn: gtk::Button,
+        /// Callback for "Join Room" in Rooms tab. No argument (searches homeserver).
+        pub on_browse_rooms: RefCell<Option<Box<dyn Fn()>>>,
+        /// Cached room data for filtering space children.
+        pub cached_rooms: RefCell<Vec<crate::matrix::RoomInfo>>,
     }
 
     impl Default for RoomListView {
         fn default() -> Self {
-            let list_store = gio::ListStore::new::<RoomObject>();
+            let (dm_store, dm_selection, dm_list_view) = make_room_list();
+            let (room_store, room_selection, room_list_view) = make_room_list();
+            let (space_store, space_selection, space_list_view) = make_room_list();
+            let (space_child_store, space_child_selection, space_child_list_view) = make_room_list();
 
-            let factory = gtk::SignalListItemFactory::new();
+            // Wrap each list in a ScrolledWindow.
+            let dm_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&dm_list_view)
+                .build();
+            let room_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&room_list_view)
+                .build();
+            // Rooms tab: scroll + pinned join banner at bottom.
+            let room_join_banner = gtk::Button::new();
+            let room_join_content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::Center)
+                .margin_top(10)
+                .margin_bottom(10)
+                .build();
+            room_join_content.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+            room_join_content.append(&gtk::Label::new(Some("Join a Room")));
+            room_join_banner.set_child(Some(&room_join_content));
+            room_join_banner.add_css_class("join-banner");
+            let room_tab_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            room_tab_box.append(&room_scroll);
+            room_tab_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            room_tab_box.append(&room_join_banner);
+            let space_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&space_list_view)
+                .build();
+            let space_child_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&space_child_list_view)
+                .build();
 
-            factory.connect_setup(|_factory, list_item| {
-                let list_item = list_item
-                    .downcast_ref::<gtk::ListItem>()
-                    .expect("ListItem expected");
-                list_item.set_child(Some(&RoomRow::new()));
-            });
+            // Space child view: back button + title + room list.
+            let space_child_title = gtk::Label::new(Some("Space"));
+            let space_child_header = adw::HeaderBar::builder()
+                .title_widget(&space_child_title)
+                .show_title(true)
+                .build();
 
-            factory.connect_bind(|_factory, list_item| {
-                let list_item = list_item
-                    .downcast_ref::<gtk::ListItem>()
-                    .expect("ListItem expected");
-                let room_obj = list_item
-                    .item()
-                    .and_downcast::<RoomObject>()
-                    .expect("RoomObject expected");
-                let row = list_item
-                    .child()
-                    .and_downcast::<RoomRow>()
-                    .expect("RoomRow expected");
+            // "Join Room" banner at the bottom of the space child list.
+            let join_banner = gtk::Button::builder()
+                .build();
+            let join_banner_content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::Center)
+                .margin_top(10)
+                .margin_bottom(10)
+                .build();
+            join_banner_content.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+            join_banner_content.append(&gtk::Label::new(Some("Join a Room")));
+            join_banner.set_child(Some(&join_banner_content));
+            join_banner.add_css_class("join-banner");
 
-                row.bind_room(&room_obj);
+            let space_child_view = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            space_child_view.append(&space_child_header);
+            space_child_view.append(&space_child_scroll);
+            space_child_view.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            space_child_view.append(&join_banner);
 
-                // Headers shouldn't be selectable/activatable.
-                list_item.set_selectable(!room_obj.is_header());
-                list_item.set_activatable(!room_obj.is_header());
-            });
+            // Nested stack for spaces: space list ↔ space child list.
+            let space_nav_stack = gtk::Stack::builder()
+                .transition_type(gtk::StackTransitionType::SlideLeftRight)
+                .build();
+            space_nav_stack.add_named(&space_scroll, Some("space-list"));
+            space_nav_stack.add_named(&space_child_view, Some("space-children"));
 
-            let selection = gtk::SingleSelection::new(Some(list_store.clone()));
-            let list_view = gtk::ListView::builder()
-                .model(&selection)
-                .factory(&factory)
-                .css_classes(["navigation-sidebar"])
+            let view_stack = adw::ViewStack::new();
+
+            let dm_page = view_stack.add_titled(&dm_scroll, Some("messages"), "Messages");
+            dm_page.set_icon_name(Some("chat-message-new-symbolic"));
+
+            let room_page = view_stack.add_titled(&room_tab_box, Some("rooms"), "Rooms");
+            room_page.set_icon_name(Some("system-users-symbolic"));
+
+            let space_page = view_stack.add_titled(&space_nav_stack, Some("spaces"), "Spaces");
+            space_page.set_icon_name(Some("view-grid-symbolic"));
+
+            view_stack.set_vexpand(true);
+
+            let switcher_bar = adw::ViewSwitcherBar::builder()
+                .reveal(true)
+                .stack(&view_stack)
                 .build();
 
             Self {
-                list_store,
-                selection,
-                list_view,
+                dm_store,
+                room_store,
+                space_store,
+                space_child_store,
+                dm_selection,
+                room_selection,
+                space_selection,
+                space_child_selection,
+                view_stack,
+                switcher_bar,
+                space_nav_stack,
+                space_child_header,
+                space_child_title,
                 on_room_selected: RefCell::new(None),
+                on_leave_room: RefCell::new(None),
+                on_browse_space: RefCell::new(None),
+                current_space_id: RefCell::new(None),
+                join_space_btn: join_banner,
+                join_room_btn: room_join_banner,
+                on_browse_rooms: RefCell::new(None),
+                cached_rooms: RefCell::new(Vec::new()),
             }
         }
     }
@@ -84,26 +233,80 @@ mod imp {
             obj.set_orientation(gtk::Orientation::Vertical);
             obj.set_vexpand(true);
 
-            let scrolled = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(&self.list_view)
-                .build();
+            obj.append(&self.view_stack);
+            obj.append(&self.switcher_bar);
 
-            obj.append(&scrolled);
-
-            // When the user clicks a room, fire the callback.
-            let view = obj.clone();
-            self.selection.connect_selection_changed(move |selection, _, _| {
-                let imp = view.imp();
-                if let Some(item) = selection.selected_item() {
-                    if let Some(room_obj) = item.downcast_ref::<crate::models::RoomObject>() {
-                        // Ignore header clicks.
-                        if !room_obj.is_header() {
-                            if let Some(ref cb) = *imp.on_room_selected.borrow() {
-                                cb(room_obj.room_id(), room_obj.name());
+            // Wire up room selection callbacks for DMs, rooms, and space children.
+            fn connect_room_selection(
+                selection: &gtk::SingleSelection,
+                view: &super::RoomListView,
+            ) {
+                let weak = view.downgrade();
+                selection.connect_selection_changed(move |sel, _, _| {
+                    let Some(view) = weak.upgrade() else { return };
+                    if let Some(item) = sel.selected_item() {
+                        if let Some(room_obj) = item.downcast_ref::<RoomObject>() {
+                            if !room_obj.is_header() {
+                                if let Some(ref cb) = *view.imp().on_room_selected.borrow() {
+                                    cb(room_obj.room_id(), room_obj.name());
+                                }
                             }
                         }
+                    }
+                });
+            }
+
+            connect_room_selection(&self.dm_selection, &obj);
+            connect_room_selection(&self.room_selection, &obj);
+            connect_room_selection(&self.space_child_selection, &obj);
+
+            // Space list: clicking a space drills into its child rooms.
+            let weak = obj.downgrade();
+            self.space_selection.connect_selection_changed(move |sel, _, _| {
+                let Some(view) = weak.upgrade() else { return };
+                if let Some(item) = sel.selected_item() {
+                    if let Some(room_obj) = item.downcast_ref::<RoomObject>() {
+                        if !room_obj.is_header() {
+                            view.imp().current_space_id.replace(Some(room_obj.room_id()));
+                            view.show_space_children(
+                                &room_obj.name(),
+                            );
+                        }
+                    }
+                }
+            });
+
+            // Back button in the space child header.
+            let back_btn = gtk::Button::builder()
+                .icon_name("go-previous-symbolic")
+                .build();
+            let weak = obj.downgrade();
+            back_btn.connect_clicked(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.imp().space_nav_stack.set_visible_child_name("space-list");
+                }
+            });
+            self.space_child_header.pack_start(&back_btn);
+
+            // Wire the "Join a Room" banner in Rooms tab.
+            let weak = obj.downgrade();
+            self.join_room_btn.connect_clicked(move |_| {
+                let Some(view) = weak.upgrade() else { return };
+                let has_cb = view.imp().on_browse_rooms.borrow().is_some();
+                if has_cb {
+                    let borrow = view.imp().on_browse_rooms.borrow();
+                    borrow.as_ref().unwrap()();
+                }
+            });
+
+            // Wire the "Join a Room" banner in Space drill-down.
+            let weak = obj.downgrade();
+            self.join_space_btn.connect_clicked(move |_| {
+                let Some(view) = weak.upgrade() else { return };
+                let space_id = view.imp().current_space_id.borrow().clone();
+                if let Some(id) = space_id {
+                    if let Some(ref cb) = *view.imp().on_browse_space.borrow() {
+                        cb(id);
                     }
                 }
             });
@@ -136,39 +339,121 @@ impl RoomListView {
         self.imp().on_room_selected.replace(Some(Box::new(f)));
     }
 
+    pub fn connect_leave_room<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_leave_room.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_browse_space<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_browse_space.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_browse_rooms<F: Fn() + 'static>(&self, f: F) {
+        self.imp().on_browse_rooms.replace(Some(Box::new(f)));
+    }
+
+    /// Clear unread/highlight badges for a room immediately in the UI.
+    pub fn clear_unread(&self, room_id: &str) {
+        use gtk::prelude::*;
+        let imp = self.imp();
+        let stores = [&imp.dm_store, &imp.room_store, &imp.space_store, &imp.space_child_store];
+        for store in stores {
+            let n = gio::prelude::ListModelExt::n_items(store);
+            for i in 0..n {
+                let Some(obj) = gio::prelude::ListModelExt::item(store, i) else { continue };
+                let Some(room_obj) = obj.downcast_ref::<crate::models::RoomObject>() else { continue };
+                if room_obj.room_id() == room_id {
+                    room_obj.set_unread_count(0);
+                    room_obj.set_highlight_count(0);
+                    // Notify the list that the item changed so the row re-binds.
+                    gio::prelude::ListModelExt::items_changed(store, i, 1, 1);
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
-        let store = &self.imp().list_store;
-        store.remove_all();
+        let imp = self.imp();
 
-        let (dms, by_space, ungrouped, cleanup) = group_and_sort_rooms(rooms);
+        // Cache room data for space drill-down.
+        imp.cached_rooms.replace(rooms.to_vec());
 
-        if !dms.is_empty() {
-            store.append(&RoomObject::new_header("Direct Messages"));
-            for r in &dms {
-                store.append(&Self::room_to_obj(r));
-            }
+        imp.dm_store.remove_all();
+        imp.room_store.remove_all();
+        imp.space_store.remove_all();
+
+        let (dms, _by_space, ungrouped, cleanup) = group_and_sort_rooms(rooms);
+
+        // Messages tab — DMs only, flat list.
+        for r in &dms {
+            imp.dm_store.append(&Self::room_to_obj(r));
         }
 
-        for (space_name, space_rooms) in &by_space {
-            store.append(&RoomObject::new_header(space_name));
-            for r in space_rooms {
-                store.append(&Self::room_to_obj(r));
-            }
+        // Rooms tab — only ungrouped rooms (no space-child rooms).
+        for r in &ungrouped {
+            imp.room_store.append(&Self::room_to_obj(r));
         }
-
-        if !ungrouped.is_empty() {
-            store.append(&RoomObject::new_header("Rooms"));
-            for r in &ungrouped {
-                store.append(&Self::room_to_obj(r));
-            }
-        }
-
         if !cleanup.is_empty() {
-            store.append(&RoomObject::new_header("Suggested Cleanup"));
+            imp.room_store.append(&RoomObject::new_header("Suggested Cleanup"));
             for r in &cleanup {
-                store.append(&Self::room_to_obj(r));
+                imp.room_store.append(&Self::room_to_obj(r));
             }
         }
+
+        // Spaces tab — sort by most recent child room activity so active
+        // spaces float to the top instead of dead conference spaces.
+        let mut spaces: Vec<&RoomInfo> = rooms
+            .iter()
+            .filter(|r| r.kind == RoomKind::Space)
+            .collect();
+        // Build a map of space_name → max child activity timestamp.
+        let mut space_activity: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
+        for r in rooms {
+            if let Some(ref space) = r.parent_space {
+                let entry = space_activity.entry(space.as_str()).or_insert(0);
+                if r.last_activity_ts > *entry {
+                    *entry = r.last_activity_ts;
+                }
+            }
+        }
+        spaces.sort_by(|a, b| {
+            let a_ts = space_activity.get(a.name.as_str()).copied()
+                .unwrap_or(a.last_activity_ts);
+            let b_ts = space_activity.get(b.name.as_str()).copied()
+                .unwrap_or(b.last_activity_ts);
+            b_ts.cmp(&a_ts)
+        });
+        for r in &spaces {
+            imp.space_store.append(&Self::room_to_obj(r));
+        }
+    }
+
+    /// Drill into a space: show its child rooms in the space child view.
+    fn show_space_children(&self, space_name: &str) {
+        let imp = self.imp();
+        imp.space_child_store.remove_all();
+        imp.space_child_title.set_label(space_name);
+
+        let rooms = imp.cached_rooms.borrow();
+        let mut children: Vec<&RoomInfo> = rooms
+            .iter()
+            .filter(|r| {
+                r.parent_space.as_deref() == Some(space_name)
+            })
+            .collect();
+
+        children.sort_by(|a, b| {
+            b.is_pinned
+                .cmp(&a.is_pinned)
+                .then(b.last_activity_ts.cmp(&a.last_activity_ts))
+        });
+
+        for r in &children {
+            imp.space_child_store.append(&Self::room_to_obj(r));
+        }
+
+        imp.space_nav_stack.set_visible_child_name("space-children");
     }
 
     fn room_to_obj(r: &RoomInfo) -> RoomObject {
@@ -177,14 +462,19 @@ impl RoomListView {
             RoomKind::Room => "room",
             RoomKind::Space => "space",
         };
-        RoomObject::new(
+        let obj = RoomObject::new(
             &r.room_id,
             &r.name,
             kind_str,
             r.is_encrypted,
             r.parent_space.as_deref().unwrap_or(""),
             r.is_pinned,
-        )
+            r.is_admin,
+            r.is_tombstoned,
+        );
+        obj.set_unread_count(r.unread_count as u32);
+        obj.set_highlight_count(r.highlight_count as u32);
+        obj
     }
 }
 
@@ -210,7 +500,10 @@ pub(crate) fn group_and_sort_rooms(
         }
         match r.kind {
             RoomKind::DirectMessage => dms.push(r),
-            RoomKind::Room | RoomKind::Space => {
+            RoomKind::Space => {
+                // Spaces themselves go to the Spaces tab, not grouped here.
+            }
+            RoomKind::Room => {
                 if let Some(ref space) = r.parent_space {
                     by_space.entry(space.clone()).or_default().push(r);
                 } else {
@@ -220,16 +513,24 @@ pub(crate) fn group_and_sort_rooms(
         }
     }
 
-    let sort_by_activity = |a: &&RoomInfo, b: &&RoomInfo| {
-        b.is_pinned
-            .cmp(&a.is_pinned)
+    // Sort priority: has highlights → pinned → most recent activity.
+    // Rooms where you were mentioned float to top. Pinned rooms come next.
+    // Everything else sorts by recency. Unread count is a visual indicator
+    // only — it doesn't affect sort order, otherwise stale rooms with
+    // unread messages would outrank recently active ones.
+    let sort_by_priority = |a: &&RoomInfo, b: &&RoomInfo| {
+        let a_has_hl = a.highlight_count > 0;
+        let b_has_hl = b.highlight_count > 0;
+        b_has_hl
+            .cmp(&a_has_hl)
+            .then(b.is_pinned.cmp(&a.is_pinned))
             .then(b.last_activity_ts.cmp(&a.last_activity_ts))
     };
 
-    dms.sort_by(sort_by_activity);
-    ungrouped.sort_by(sort_by_activity);
+    dms.sort_by(sort_by_priority);
+    ungrouped.sort_by(sort_by_priority);
     for rooms in by_space.values_mut() {
-        rooms.sort_by(sort_by_activity);
+        rooms.sort_by(sort_by_priority);
     }
 
     (dms, by_space, ungrouped, cleanup)
@@ -254,6 +555,32 @@ mod tests {
             is_encrypted: false,
             parent_space: parent_space.map(|s| s.to_string()),
             is_pinned,
+            unread_count: 0,
+            highlight_count: 0,
+            is_admin: false,
+            is_tombstoned: false,
+        }
+    }
+
+    fn make_room_with_unread(
+        name: &str,
+        kind: RoomKind,
+        last_activity_ts: u64,
+        unread_count: u64,
+        highlight_count: u64,
+    ) -> RoomInfo {
+        RoomInfo {
+            room_id: format!("!{}:matrix.org", name.to_lowercase().replace(' ', "_")),
+            name: name.to_string(),
+            last_activity_ts,
+            kind,
+            is_encrypted: false,
+            parent_space: None,
+            is_pinned: false,
+            unread_count,
+            highlight_count,
+            is_admin: false,
+            is_tombstoned: false,
         }
     }
 
@@ -271,16 +598,31 @@ mod tests {
     }
 
     #[test]
-    fn test_space_grouping() {
+    fn test_space_children_excluded_from_ungrouped() {
         let rooms = vec![
             make_room("Dev Chat", RoomKind::Room, Some("Work"), false, 100),
-            make_room("Random", RoomKind::Room, Some("Work"), false, 200),
             make_room("General", RoomKind::Room, None, false, 300),
         ];
         let (_, by_space, ungrouped, _) = group_and_sort_rooms(&rooms);
         assert_eq!(by_space.len(), 1);
-        assert_eq!(by_space["Work"].len(), 2);
+        assert_eq!(by_space["Work"].len(), 1);
+        // Only ungrouped rooms show in the Rooms tab.
         assert_eq!(ungrouped.len(), 1);
+        assert_eq!(ungrouped[0].name, "General");
+    }
+
+    #[test]
+    fn test_spaces_not_in_room_groups() {
+        let rooms = vec![
+            make_room("Work Space", RoomKind::Space, None, false, 100),
+            make_room("General", RoomKind::Room, None, false, 200),
+        ];
+        let (dms, by_space, ungrouped, _) = group_and_sort_rooms(&rooms);
+        assert!(dms.is_empty());
+        assert!(by_space.is_empty());
+        // Spaces are excluded from ungrouped.
+        assert_eq!(ungrouped.len(), 1);
+        assert_eq!(ungrouped[0].name, "General");
     }
 
     #[test]
@@ -328,7 +670,6 @@ mod tests {
             make_room("Pinned Active", RoomKind::DirectMessage, None, true, 500),
         ];
         let (dms, _, _, _) = group_and_sort_rooms(&rooms);
-        // Pinned rooms first, sorted by activity among themselves.
         assert_eq!(dms[0].name, "Pinned Active");
         assert_eq!(dms[1].name, "Pinned Stale");
         assert_eq!(dms[2].name, "Unpinned Active");
@@ -352,5 +693,43 @@ mod tests {
         assert!(by_space.is_empty());
         assert!(ungrouped.is_empty());
         assert!(cleanup.is_empty());
+    }
+
+    #[test]
+    fn test_highlights_sort_first() {
+        // Highlighted rooms float to top regardless of timestamp.
+        // Non-highlighted rooms sort by recency (unread doesn't matter).
+        let rooms = vec![
+            make_room_with_unread("Active", RoomKind::Room, 9999, 0, 0),
+            make_room_with_unread("Mentioned", RoomKind::Room, 100, 3, 1),
+            make_room_with_unread("Unread", RoomKind::Room, 500, 5, 0),
+        ];
+        let (_, _, ungrouped, _) = group_and_sort_rooms(&rooms);
+        assert_eq!(ungrouped[0].name, "Mentioned");
+        assert_eq!(ungrouped[1].name, "Active");
+        assert_eq!(ungrouped[2].name, "Unread");
+    }
+
+    #[test]
+    fn test_unread_does_not_affect_sort() {
+        // Unread count is visual only — recency always wins.
+        let rooms = vec![
+            make_room_with_unread("Old Unread", RoomKind::DirectMessage, 100, 50, 0),
+            make_room_with_unread("Recent Read", RoomKind::DirectMessage, 9999, 0, 0),
+        ];
+        let (dms, _, _, _) = group_and_sort_rooms(&rooms);
+        assert_eq!(dms[0].name, "Recent Read");
+        assert_eq!(dms[1].name, "Old Unread");
+    }
+
+    #[test]
+    fn test_dead_rooms_sort_last() {
+        let rooms = vec![
+            make_room("Dead", RoomKind::Room, None, false, 0),
+            make_room("Active", RoomKind::Room, None, false, 500),
+        ];
+        let (_, _, ungrouped, _) = group_and_sort_rooms(&rooms);
+        assert_eq!(ungrouped[0].name, "Active");
+        assert_eq!(ungrouped[1].name, "Dead");
     }
 }

@@ -52,6 +52,18 @@ mod imp {
         /// If true, this item is a section header, not a real room.
         #[property(get, set)]
         is_header: Cell<bool>,
+
+        /// Whether the current user has admin power level (100+).
+        #[property(get, set)]
+        is_admin: Cell<bool>,
+
+        /// Whether this room has been tombstoned (upgraded to a new room).
+        #[property(get, set)]
+        is_tombstoned: Cell<bool>,
+
+        /// Number of highlight notifications (mentions).
+        #[property(get, set)]
+        highlight_count: Cell<u32>,
     }
 
     // These trait impls register our type with GObject's type system.
@@ -77,7 +89,16 @@ glib::wrapper! {
 }
 
 impl RoomObject {
-    pub fn new(room_id: &str, name: &str, kind: &str, is_encrypted: bool, parent_space: &str, is_pinned: bool) -> Self {
+    pub fn new(
+        room_id: &str,
+        name: &str,
+        kind: &str,
+        is_encrypted: bool,
+        parent_space: &str,
+        is_pinned: bool,
+        is_admin: bool,
+        is_tombstoned: bool,
+    ) -> Self {
         Object::builder()
             .property("room-id", room_id)
             .property("name", name)
@@ -85,6 +106,8 @@ impl RoomObject {
             .property("is-encrypted", is_encrypted)
             .property("parent-space", parent_space)
             .property("is-pinned", is_pinned)
+            .property("is-admin", is_admin)
+            .property("is-tombstoned", is_tombstoned)
             .build()
     }
 

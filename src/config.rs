@@ -14,6 +14,7 @@ pub const APP_NAME: &str = "Matx";
 pub struct Settings {
     pub rooms: RoomSettings,
     pub sync: SyncSettings,
+    pub appearance: AppearanceSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +30,15 @@ pub struct RoomSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct AppearanceSettings {
+    /// Font family for message text (e.g. "Cantarell", "Monospace").
+    pub font_family: String,
+    /// Font size in points for message text.
+    pub font_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SyncSettings {
     /// Number of timeline events per room during sync.
     pub timeline_limit: u32,
@@ -36,11 +46,21 @@ pub struct SyncSettings {
     pub timeout_secs: u64,
 }
 
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            font_family: String::new(), // empty = system default
+            font_size: 11,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             rooms: RoomSettings::default(),
             sync: SyncSettings::default(),
+            appearance: AppearanceSettings::default(),
         }
     }
 }
@@ -58,7 +78,7 @@ impl Default for RoomSettings {
 impl Default for SyncSettings {
     fn default() -> Self {
         Self {
-            timeline_limit: 1,
+            timeline_limit: 10,
             timeout_secs: 60,
         }
     }
@@ -122,7 +142,7 @@ mod tests {
         assert_eq!(s.rooms.max_dms, 50);
         assert_eq!(s.rooms.max_rooms, 100);
         assert!(s.rooms.pinned_rooms.is_empty());
-        assert_eq!(s.sync.timeline_limit, 1);
+        assert_eq!(s.sync.timeline_limit, 10);
         assert_eq!(s.sync.timeout_secs, 60);
     }
 
@@ -138,6 +158,10 @@ mod tests {
                 timeline_limit: 10,
                 timeout_secs: 120,
             },
+            appearance: AppearanceSettings {
+                font_family: "Monospace".into(),
+                font_size: 14,
+            },
         };
         let toml_str = toml::to_string_pretty(&original).unwrap();
         let parsed: Settings = toml::from_str(&toml_str).unwrap();
@@ -151,7 +175,7 @@ mod tests {
         assert_eq!(s.rooms.max_dms, 10);
         // Unspecified fields should use defaults.
         assert_eq!(s.rooms.max_rooms, 100);
-        assert_eq!(s.sync.timeline_limit, 1);
+        assert_eq!(s.sync.timeline_limit, 10);
         assert_eq!(s.sync.timeout_secs, 60);
     }
 

@@ -65,8 +65,11 @@ pub(crate) fn format_timestamp(ts: u64) -> String {
         let secs_ago = now.duration_since(event_time).unwrap_or_default().as_secs();
         if secs_ago < 86400 * 2 {
             dt.format("Yesterday %H:%M")
-        } else {
+        } else if dt.year() == today.year() {
             dt.format("%b %e %H:%M")
+        } else {
+            // Different year — show full date.
+            dt.format("%b %e, %Y %H:%M")
         }
     }
     .map(|s: glib::GString| s.to_string())
@@ -85,9 +88,55 @@ impl MessageRow {
     }
 
     pub fn set_message(&self, sender: &str, body: &str, timestamp: u64) {
+        self.set_message_with_highlights(sender, body, timestamp, &[]);
+    }
+
+    pub fn set_message_with_highlights(
+        &self,
+        sender: &str,
+        body: &str,
+        timestamp: u64,
+        highlight_names: &[String],
+    ) {
         let imp = self.imp();
         imp.sender_label.set_label(sender);
-        imp.body_label.set_label(body);
+
+        // Check if any highlight name appears in the body.
+        let body_lower = body.to_lowercase();
+        let has_highlight = highlight_names
+            .iter()
+            .any(|n| !n.is_empty() && body_lower.contains(&n.to_lowercase()));
+
+        if has_highlight {
+            // Highlight the entire row with a background.
+            self.add_css_class("mention-row");
+
+            // Also bold the matched name inline.
+            let mut escaped = glib::markup_escape_text(body).to_string();
+            for name in highlight_names {
+                if name.is_empty() {
+                    continue;
+                }
+                let lower = escaped.to_lowercase();
+                let name_lower = name.to_lowercase();
+                let mut result = String::new();
+                let mut pos = 0;
+                while let Some(idx) = lower[pos..].find(&name_lower) {
+                    result.push_str(&escaped[pos..pos + idx]);
+                    let end = pos + idx + name_lower.len();
+                    result.push_str("<b>");
+                    result.push_str(&escaped[pos + idx..end]);
+                    result.push_str("</b>");
+                    pos = end;
+                }
+                result.push_str(&escaped[pos..]);
+                escaped = result;
+            }
+            imp.body_label.set_markup(&escaped);
+        } else {
+            self.remove_css_class("mention-row");
+            imp.body_label.set_label(body);
+        }
 
         if timestamp > 0 {
             imp.timestamp_label.set_label(&format_timestamp(timestamp));

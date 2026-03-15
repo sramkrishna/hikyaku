@@ -34,6 +34,13 @@ mod imp {
         /// The currently open waiting/emoji verification dialog, so we can
         /// dismiss it when the next state arrives.
         pub verify_dialog: RefCell<Option<adw::AlertDialog>>,
+        /// Current room metadata for the details panel.
+        pub current_room_meta: RefCell<Option<crate::matrix::RoomMeta>>,
+        /// Right sidebar for room details.
+        pub details_revealer: gtk::Revealer,
+        pub details_content: gtk::Box,
+        /// Info button in the content header (shown only when a room is selected).
+        pub info_button: OnceCell<gtk::Button>,
     }
 
     impl Default for MxWindow {
@@ -57,6 +64,16 @@ mod imp {
                 current_room_id: RefCell::new(None),
                 content_page: OnceCell::new(),
                 verify_dialog: RefCell::new(None),
+                current_room_meta: RefCell::new(None),
+                details_revealer: gtk::Revealer::builder()
+                    .transition_type(gtk::RevealerTransitionType::SlideLeft)
+                    .reveal_child(false)
+                    .build(),
+                details_content: gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .width_request(280)
+                    .build(),
+                info_button: OnceCell::new(),
             }
         }
     }
@@ -102,7 +119,31 @@ use gtk::subclass::prelude::*;
 
 use async_channel::{Receiver, Sender};
 
+use crate::config::AppearanceSettings;
 use crate::matrix::{MatrixCommand, MatrixEvent};
+
+/// Apply font settings via a CSS provider on the default display.
+fn apply_font_css(settings: &AppearanceSettings) {
+    let css = if settings.font_family.is_empty() {
+        format!(".mx-message-body {{ font-size: {}pt; }}", settings.font_size)
+    } else {
+        format!(
+            ".mx-message-body {{ font-family: \"{}\"; font-size: {}pt; }}",
+            settings.font_family, settings.font_size
+        )
+    };
+
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
 
 glib::wrapper! {
     pub struct MxWindow(ObjectSubclass<imp::MxWindow>)
@@ -141,19 +182,49 @@ impl MxWindow {
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
         let msg_view = imp.message_view.clone();
+        let room_list = imp.room_list_view.clone();
         imp.room_list_view.connect_room_selected(move |room_id, room_name| {
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
                 if let Some(page) = window.imp().content_page.get() {
                     page.set_title(&room_name);
                 }
+                // Show the info button now that a room is selected.
+                if let Some(btn) = window.imp().info_button.get() {
+                    btn.set_visible(true);
+                }
+                // Hide details sidebar when switching rooms.
+                window.imp().details_revealer.set_reveal_child(false);
             }
+            // Clear unread badge immediately — don't wait for server round-trip.
+            room_list.clear_unread(&room_id);
             // Clear old messages while we fetch the new room's messages.
             msg_view.clear();
             let tx = cmd_tx.clone();
             let rid = room_id.clone();
             glib::spawn_future_local(async move {
                 let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
+            });
+        });
+
+        // Leave button is wired in setup_ui.
+
+        // Wire up "Join Room" banner in space drill-down.
+        let cmd_tx_browse = command_tx.clone();
+        imp.room_list_view.connect_browse_space(move |space_id| {
+            let tx = cmd_tx_browse.clone();
+            let sid = space_id.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::BrowseSpaceRooms { space_id: sid }).await;
+            });
+        });
+
+        // Wire up "Join Room" banner in Rooms tab — fetch public rooms.
+        let cmd_tx_browse = command_tx.clone();
+        imp.room_list_view.connect_browse_rooms(move || {
+            let tx = cmd_tx_browse.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::BrowsePublicRooms { search_term: None }).await;
             });
         });
 
@@ -177,11 +248,19 @@ impl MxWindow {
         // Wire up send message → send SendMessage command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
+        let msg_view_for_send = imp.message_view.clone();
         imp.message_view.connect_send_message(move |body| {
             let room_id = window_weak
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
+                // Local echo — show the message immediately.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                msg_view_for_send.append_message("You", &body, now);
+
                 let tx = cmd_tx.clone();
                 glib::spawn_future_local(async move {
                     let _ = tx.send(MatrixCommand::SendMessage { room_id, body }).await;
@@ -205,11 +284,23 @@ impl MxWindow {
                         // No saved session — show the login page.
                         window.show_login();
                     }
-                    MatrixEvent::LoginSuccess { display_name } => {
+                    MatrixEvent::LoginSuccess { display_name, user_id } => {
                         let msg = format!("Logged in as {display_name}");
                         toast_overlay.add_toast(adw::Toast::new(&msg));
                         login_page.stop_spinner();
                         tracing::info!("{msg}");
+                        // Highlight the user's display name, localpart, and
+                        // full user ID so mentions in any form get highlighted.
+                        let localpart = user_id
+                            .strip_prefix('@')
+                            .and_then(|s| s.split(':').next())
+                            .unwrap_or("")
+                            .to_string();
+                        let mut names = vec![display_name.as_str()];
+                        if !localpart.is_empty() && localpart != display_name {
+                            names.push(&localpart);
+                        }
+                        message_view.set_highlight_names(&names);
                         window.show_main_view();
                     }
                     MatrixEvent::LoginFailed { error } => {
@@ -228,9 +319,11 @@ impl MxWindow {
                     MatrixEvent::RoomListUpdated { rooms } => {
                         room_list_view.update_rooms(&rooms);
                     }
-                    MatrixEvent::RoomMessages { room_id, messages, prev_batch_token } => {
+                    MatrixEvent::RoomMessages { room_id, messages, prev_batch_token, room_meta } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
+                            window.imp().current_room_meta.replace(Some(room_meta.clone()));
+                            message_view.set_room_meta(&room_meta);
                             let msgs: Vec<(String, String, u64)> = messages
                                 .into_iter()
                                 .map(|m| (m.sender, m.body, m.timestamp))
@@ -248,13 +341,29 @@ impl MxWindow {
                             message_view.prepend_messages(&msgs, prev_batch_token);
                         }
                     }
-                    MatrixEvent::NewMessage { room_id, message } => {
+                    MatrixEvent::NewMessage { room_id, room_name, message, is_mention } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             message_view.append_message(
                                 &message.sender,
                                 &message.body,
                                 message.timestamp,
+                            );
+                        }
+
+                        // Desktop notification for mentions.
+                        if is_mention {
+                            let app = window.application().unwrap();
+                            let notif = gio::Notification::new(&format!(
+                                "Mentioned in {}", room_name
+                            ));
+                            notif.set_body(Some(&format!(
+                                "{}: {}", message.sender, &message.body[..message.body.len().min(100)]
+                            )));
+                            notif.set_priority(gio::NotificationPriority::High);
+                            app.send_notification(
+                                Some(&format!("mention-{}", room_id)),
+                                &notif,
                             );
                         }
                     }
@@ -316,6 +425,30 @@ impl MxWindow {
                             &format!("Key recovery failed: {error}"),
                         ));
                     }
+                    MatrixEvent::RoomJoined { room_id: _, room_name } => {
+                        toast_overlay.add_toast(adw::Toast::new(
+                            &format!("Joined {room_name}"),
+                        ));
+                    }
+                    MatrixEvent::JoinFailed { error } => {
+                        toast_overlay.add_toast(adw::Toast::new(
+                            &format!("Failed to join: {error}"),
+                        ));
+                    }
+                    MatrixEvent::PublicRoomDirectory { rooms } => {
+                        window.show_space_directory(&rooms);
+                    }
+                    MatrixEvent::SpaceDirectory { space_id: _, rooms } => {
+                        window.show_space_directory(&rooms);
+                    }
+                    MatrixEvent::RoomLeft { room_id: _ } => {
+                        // Room list will refresh on next sync.
+                    }
+                    MatrixEvent::LeaveFailed { error } => {
+                        toast_overlay.add_toast(adw::Toast::new(
+                            &format!("Failed to leave: {error}"),
+                        ));
+                    }
                 }
             }
         });
@@ -360,10 +493,120 @@ impl MxWindow {
             .child(&sidebar_toolbar)
             .build();
 
-        // Content: message view.
+        // Content: message view with info and leave buttons in header.
+        let content_header = adw::HeaderBar::new();
+
+        // Info button (blue circle with "i") — hidden until a room is selected.
+        let info_button = gtk::Button::builder()
+            .icon_name("help-about-symbolic")
+            .tooltip_text("Room details")
+            .visible(false)
+            .build();
+        info_button.add_css_class("info-button");
+        info_button.add_css_class("circular");
+        content_header.pack_end(&info_button);
+
+        // Spacer between info and leave.
+        let spacer = gtk::Separator::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(4)
+            .margin_end(4)
+            .build();
+        spacer.add_css_class("spacer");
+        content_header.pack_end(&spacer);
+
+        // Leave button (flat, to the left of info).
+        let leave_button = gtk::Button::builder()
+            .icon_name("application-exit-symbolic")
+            .tooltip_text("Leave this room")
+            .build();
+        leave_button.add_css_class("flat");
+        content_header.pack_end(&leave_button);
+
+        // Store info button reference so room selection can show/hide it.
+        let _ = imp.info_button.set(info_button.clone());
+
+        // Wire up info button — toggle room details sidebar.
+        let window_weak_info = self.downgrade();
+        info_button.connect_clicked(move |_| {
+            let Some(window) = window_weak_info.upgrade() else { return };
+            let imp = window.imp();
+            let currently_visible = imp.details_revealer.reveals_child();
+            if currently_visible {
+                imp.details_revealer.set_reveal_child(false);
+            } else {
+                window.show_room_details();
+                imp.details_revealer.set_reveal_child(true);
+            }
+        });
+
+        // Wire up leave button.
+        let window_weak_leave = self.downgrade();
+        let toast_leave = imp.toast_overlay.clone();
+        leave_button.connect_clicked(move |_| {
+            let Some(window) = window_weak_leave.upgrade() else { return };
+            let imp = window.imp();
+            let Some(room_id) = imp.current_room_id.borrow().clone() else { return };
+            let room_name = imp.content_page.get()
+                .map(|p| p.title().to_string())
+                .unwrap_or_default();
+            let Some(tx) = imp.command_tx.get().cloned() else { return };
+
+            let toast = adw::Toast::builder()
+                .title(&format!("Leave {room_name}?"))
+                .button_label("Leave")
+                .timeout(5)
+                .build();
+            toast.connect_button_clicked(move |_| {
+                let tx = tx.clone();
+                let rid = room_id.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::LeaveRoom { room_id: rid }).await;
+                });
+            });
+            toast_leave.add_toast(toast);
+        });
+
+        // Details sidebar (right side, hidden by default).
+        let details_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&imp.details_content)
+            .build();
+        // Pinned close button at the bottom of the sidebar.
+        let details_close_btn = gtk::Button::builder()
+            .label("Close")
+            .css_classes(["suggested-action", "caption"])
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        let revealer_for_close = imp.details_revealer.clone();
+        details_close_btn.connect_clicked(move |_| {
+            revealer_for_close.set_reveal_child(false);
+        });
+        let details_wrapper = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        details_wrapper.append(&details_scroll);
+        details_wrapper.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        details_wrapper.append(&details_close_btn);
+        imp.details_revealer.set_child(Some(&details_wrapper));
+
+        // Content area: message view + optional details sidebar.
+        let content_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .build();
+        content_box.append(&imp.message_view);
+        content_box.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        content_box.append(&imp.details_revealer);
+        // Make message view expand, sidebar stays fixed width.
+        imp.message_view.set_hexpand(true);
+
         let content_toolbar = adw::ToolbarView::new();
-        content_toolbar.add_top_bar(&adw::HeaderBar::new());
-        content_toolbar.set_content(Some(&imp.message_view));
+        content_toolbar.add_top_bar(&content_header);
+        content_toolbar.set_content(Some(&content_box));
 
         let content_page = adw::NavigationPage::builder()
             .title("Matx")
@@ -409,6 +652,96 @@ impl MxWindow {
         main_toolbar.set_content(Some(&split_view));
 
         imp.toast_overlay.set_child(Some(&main_toolbar));
+
+        // Register custom icon theme for our symbolic icons.
+        if let Some(display) = gtk::gdk::Display::default() {
+            let theme = gtk::IconTheme::for_display(&display);
+            // Add the data/icons directory relative to the binary's location,
+            // or fall back to the source tree path for development.
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            if let Some(dir) = exe_dir {
+                let icons_dir = dir.join("../../data/icons");
+                if icons_dir.exists() {
+                    theme.add_search_path(&icons_dir);
+                }
+            }
+            // Always add the source-tree path for `cargo run`.
+            theme.add_search_path("data/icons");
+        }
+
+        // Apply font settings from config.
+        apply_font_css(&crate::config::settings().appearance);
+
+        // Badge styles for room rows.
+        let badge_css = gtk::CssProvider::new();
+        badge_css.load_from_string(
+            ".unread-badge {
+                background: alpha(@accent_bg_color, 0.8);
+                color: white;
+                border-radius: 9px;
+                padding: 1px 5px;
+                font-size: 10px;
+                font-weight: bold;
+                min-width: 16px;
+            }
+            .highlight-badge {
+                background: #e01b24;
+                color: white;
+                border-radius: 9px;
+                padding: 1px 5px;
+                font-size: 10px;
+                font-weight: bold;
+                min-width: 16px;
+            }
+            .tombstone-info {
+                background: alpha(@warning_bg_color, 0.2);
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            .tombstone-view {
+                background: alpha(@warning_bg_color, 0.08);
+            }
+            .pinned-message {
+                background: alpha(@accent_bg_color, 0.08);
+                border-radius: 6px;
+                padding: 6px 10px;
+                margin-top: 2px;
+            }
+            .info-button {
+                background: #3584e4;
+                color: white;
+            }
+            .info-button:hover {
+                background: #2a7de1;
+            }
+            .join-banner {
+                background: #3584e4;
+                color: white;
+                border-radius: 0;
+                border: none;
+                font-weight: bold;
+            }
+            .join-banner:hover {
+                background: #2a7de1;
+            }
+            .mention-row {
+                background: alpha(@accent_bg_color, 0.12);
+                border-radius: 8px;
+                border-left: 3px solid @accent_bg_color;
+                padding: 6px 10px;
+                margin: 2px 4px;
+            }
+",
+        );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &badge_css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
     }
 
     fn setup_actions(&self) {
@@ -451,13 +784,322 @@ impl MxWindow {
             })
             .build();
 
-        self.add_action_entries([about_action, preferences_action, verify_action, recover_action]);
+        let join_action = ActionEntryBuilder::new("join-room")
+            .activate(|window: &Self, _, _| {
+                window.show_join_bar();
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action, verify_action, recover_action, join_action]);
+    }
+
+    fn show_join_bar(&self) {
+        let imp = self.imp();
+        let toast_overlay = imp.toast_overlay.clone();
+        let tx = imp.command_tx.get().unwrap().clone();
+
+        // Create an inline entry bar for the room ID/alias.
+        let entry = gtk::Entry::builder()
+            .placeholder_text("#room:server or !id:server")
+            .hexpand(true)
+            .build();
+        let join_btn = gtk::Button::builder()
+            .label("Join")
+            .css_classes(["suggested-action"])
+            .build();
+        let cancel_btn = gtk::Button::builder()
+            .label("Cancel")
+            .build();
+
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        bar.append(&entry);
+        bar.append(&join_btn);
+        bar.append(&cancel_btn);
+
+        // Use a Revealer to slide in the join bar.
+        let revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .reveal_child(true)
+            .child(&bar)
+            .build();
+
+        // Insert the revealer at the top of the room list.
+        imp.room_list_view.prepend(&revealer);
+        entry.grab_focus();
+
+        // Join on Enter or button click.
+        let tx2 = tx.clone();
+        let entry2 = entry.clone();
+        let revealer2 = revealer.clone();
+        let toast2 = toast_overlay.clone();
+        let do_join = move || {
+            let text = entry2.text().to_string();
+            if text.is_empty() {
+                return;
+            }
+            let tx = tx2.clone();
+            let revealer = revealer2.clone();
+            let toast = toast2.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: text }).await;
+                revealer.set_reveal_child(false);
+                // Remove after animation.
+                glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    if let Some(parent) = revealer.parent() {
+                        if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+                            b.remove(&revealer);
+                        }
+                    }
+                });
+            });
+        };
+
+        let join_fn = do_join.clone();
+        join_btn.connect_clicked(move |_| join_fn());
+        let join_fn = do_join;
+        entry.connect_activate(move |_| join_fn());
+
+        // Cancel hides the bar.
+        let revealer3 = revealer.clone();
+        cancel_btn.connect_clicked(move |_| {
+            revealer3.set_reveal_child(false);
+            let r = revealer3.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                if let Some(parent) = r.parent() {
+                    if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+                        b.remove(&r);
+                    }
+                }
+            });
+        });
+    }
+
+    fn show_space_directory(&self, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+        let dialog = adw::Dialog::builder()
+            .title("Join a Room")
+            .content_width(400)
+            .content_height(500)
+            .build();
+
+        let toolbar = adw::ToolbarView::new();
+        let header = adw::HeaderBar::new();
+        toolbar.add_top_bar(&header);
+
+        let list_box = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(12)
+            .build();
+
+        for room in rooms {
+            let row = adw::ActionRow::builder()
+                .title(&room.name)
+                .subtitle(&if room.topic.is_empty() {
+                    format!("{} members", room.member_count)
+                } else {
+                    format!("{} — {} members", room.topic, room.member_count)
+                })
+                .activatable(true)
+                .build();
+
+            if room.already_joined {
+                let badge = gtk::Label::builder()
+                    .label("Joined")
+                    .css_classes(["dim-label", "caption"])
+                    .build();
+                row.add_suffix(&badge);
+            } else {
+                let join_btn = gtk::Button::builder()
+                    .label("Join")
+                    .css_classes(["suggested-action"])
+                    .valign(gtk::Align::Center)
+                    .build();
+                let tx = self.imp().command_tx.get().unwrap().clone();
+                let rid = room.room_id.clone();
+                let _toast_overlay = self.imp().toast_overlay.clone();
+                join_btn.connect_clicked(move |btn| {
+                    btn.set_sensitive(false);
+                    btn.set_label("Joining…");
+                    let tx = tx.clone();
+                    let rid = rid.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::JoinRoom {
+                            room_id_or_alias: rid,
+                        }).await;
+                    });
+                });
+                row.add_suffix(&join_btn);
+            }
+
+            list_box.append(&row);
+        }
+
+        if rooms.is_empty() {
+            let empty = adw::StatusPage::builder()
+                .icon_name("system-search-symbolic")
+                .title("No Rooms Found")
+                .description("This space doesn't have any discoverable rooms.")
+                .build();
+            toolbar.set_content(Some(&empty));
+        } else {
+            let scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&list_box)
+                .build();
+            toolbar.set_content(Some(&scroll));
+        }
+
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(self));
+    }
+
+    fn show_room_details(&self) {
+        let imp = self.imp();
+        let meta = imp.current_room_meta.borrow();
+        let Some(ref meta) = *meta else { return };
+        let room_name = imp.content_page.get()
+            .map(|p| p.title().to_string())
+            .unwrap_or_else(|| "Room".to_string());
+        let room_id = imp.current_room_id.borrow().clone().unwrap_or_default();
+
+        // Clear previous content.
+        let container = &imp.details_content;
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+
+        container.set_margin_start(12);
+        container.set_margin_end(12);
+        container.set_margin_top(12);
+        container.set_margin_bottom(12);
+        container.set_spacing(8);
+
+        // Room name.
+        let name_label = gtk::Label::builder()
+            .label(&room_name)
+            .css_classes(["title-3"])
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .build();
+        container.append(&name_label);
+
+        // Room ID.
+        let id_label = gtk::Label::builder()
+            .label(&room_id)
+            .css_classes(["caption", "dim-label"])
+            .halign(gtk::Align::Start)
+            .selectable(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Char)
+            .build();
+        container.append(&id_label);
+
+        // Topic.
+        if !meta.topic.is_empty() {
+            container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let topic_label = gtk::Label::builder()
+                .label(&meta.topic)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .css_classes(["body"])
+                .build();
+            container.append(&topic_label);
+        }
+
+        container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        // Info rows.
+        let info = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .build();
+
+        let add_info_row = |parent: &gtk::Box, label: &str, value: &str| {
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            row.append(&gtk::Label::builder()
+                .label(label)
+                .css_classes(["dim-label", "caption"])
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build());
+            row.append(&gtk::Label::builder()
+                .label(value)
+                .css_classes(["caption"])
+                .halign(gtk::Align::End)
+                .build());
+            parent.append(&row);
+        };
+
+        add_info_row(&info, "Members", &meta.member_count.to_string());
+        add_info_row(&info, "Encrypted", if meta.is_encrypted { "Yes" } else { "No" });
+        if meta.is_tombstoned {
+            add_info_row(&info, "Status", "Upgraded");
+            if let Some(ref name) = meta.replacement_room_name {
+                add_info_row(&info, "New room", name);
+            }
+        }
+        container.append(&info);
+
+        // Members list.
+        if !meta.members.is_empty() {
+            container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let members_header = gtk::Label::builder()
+                .label(&format!("Members ({})", meta.members.len()))
+                .css_classes(["heading", "caption"])
+                .halign(gtk::Align::Start)
+                .build();
+            container.append(&members_header);
+
+            for (uid, name) in meta.members.iter().take(50) {
+                let row = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(1)
+                    .margin_top(2)
+                    .margin_bottom(2)
+                    .build();
+                row.append(&gtk::Label::builder()
+                    .label(name)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["caption"])
+                    .build());
+                row.append(&gtk::Label::builder()
+                    .label(uid)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["caption", "dim-label"])
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build());
+                container.append(&row);
+            }
+            if meta.members.len() > 50 {
+                container.append(&gtk::Label::builder()
+                    .label(&format!("… and {} more", meta.members.len() - 50))
+                    .css_classes(["caption", "dim-label"])
+                    .halign(gtk::Align::Start)
+                    .build());
+            }
+        }
+
     }
 
     fn show_about_dialog(&self) {
         let dialog = adw::AboutDialog::builder()
             .application_name(crate::config::APP_NAME)
-            .application_icon("mail-send-receive-symbolic")
+            .application_icon(crate::config::APP_ID)
             .developer_name("Matx Contributors")
             .version("0.1.0")
             .comments("A Matrix client built with Rust and libadwaita, designed around activity awareness.")
@@ -522,6 +1164,86 @@ impl MxWindow {
             .build();
         sync_group.add(&timeout_row);
 
+        // --- Appearance group ---
+        let appearance_group = adw::PreferencesGroup::builder()
+            .title("Appearance")
+            .description("Font settings for message text")
+            .build();
+
+        // Build a label showing the current font.
+        let font_label = {
+            let family = &cfg.appearance.font_family;
+            let size = cfg.appearance.font_size;
+            if family.is_empty() {
+                format!("Default, {size}pt")
+            } else {
+                format!("{family} {size}pt")
+            }
+        };
+        let font_row = adw::ActionRow::builder()
+            .title("Message Font")
+            .subtitle(&font_label)
+            .activatable(true)
+            .build();
+        font_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        appearance_group.add(&font_row);
+
+        // Open a FontDialog when the row is activated.
+        let cfg_for_font = cfg.clone();
+        let window_ref = self.downgrade();
+        font_row.connect_activated(glib::clone!(
+            #[weak] font_row,
+            move |_| {
+                let font_dialog = gtk::FontDialog::new();
+                // Set initial font from current config.
+                let initial = {
+                    let desc_str = if cfg_for_font.appearance.font_family.is_empty() {
+                        format!("Sans {}", cfg_for_font.appearance.font_size)
+                    } else {
+                        format!("{} {}", cfg_for_font.appearance.font_family, cfg_for_font.appearance.font_size)
+                    };
+                    gtk::pango::FontDescription::from_string(&desc_str)
+                };
+                let parent = window_ref.upgrade();
+                font_dialog.choose_font(
+                    parent.as_ref(),
+                    Some(&initial),
+                    gio::Cancellable::NONE,
+                    glib::clone!(
+                        #[weak] font_row,
+                        move |result| {
+                            if let Ok(desc) = result {
+                                let family = desc
+                                    .family()
+                                    .map(|f| f.to_string())
+                                    .unwrap_or_default();
+                                let size_pt = (desc.size() as f64
+                                    / gtk::pango::SCALE as f64)
+                                    .round() as u32;
+                                let size_pt = size_pt.max(6).min(48);
+
+                                // Update config and apply.
+                                let mut new_cfg = config::settings().clone();
+                                new_cfg.appearance.font_family = family.clone();
+                                new_cfg.appearance.font_size = size_pt;
+                                apply_font_css(&new_cfg.appearance);
+                                if let Err(e) = config::save_settings(&new_cfg) {
+                                    tracing::error!("Failed to save settings: {e}");
+                                }
+
+                                // Update the subtitle.
+                                if family.is_empty() {
+                                    font_row.set_subtitle(&format!("Default, {size_pt}pt"));
+                                } else {
+                                    font_row.set_subtitle(&format!("{family} {size_pt}pt"));
+                                }
+                            }
+                        }
+                    ),
+                );
+            }
+        ));
+
         // --- Info group ---
         let info_group = adw::PreferencesGroup::builder()
             .title("Storage")
@@ -539,10 +1261,11 @@ impl MxWindow {
             .build();
         page.add(&rooms_group);
         page.add(&sync_group);
+        page.add(&appearance_group);
         page.add(&info_group);
         dialog.add(&page);
 
-        // Save when values change.
+        // Save when values change (font is saved directly from the FontDialog callback).
         let save = {
             let max_dms_row = max_dms_row.clone();
             let max_rooms_row = max_rooms_row.clone();

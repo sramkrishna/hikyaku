@@ -19,6 +19,38 @@ template $MxRoomRow : Gtk.Box {
     ellipsize: end;
   }
 
+  Gtk.Image mention_icon {
+    icon-name: "mention-symbolic";
+    pixel-size: 16;
+    visible: false;
+    tooltip-text: "You were mentioned";
+    styles ["error"]
+  }
+
+  Gtk.Label unread_badge {
+    visible: false;
+    halign: center;
+    valign: center;
+    width-chars: 2;
+    styles ["badge", "unread-badge"]
+  }
+
+  Gtk.Image admin_icon {
+    icon-name: "security-high-symbolic";
+    pixel-size: 14;
+    visible: false;
+    tooltip-text: "You are an admin in this room";
+    styles ["dim-label"]
+  }
+
+  Gtk.Image tombstone_icon {
+    icon-name: "tombstone-symbolic";
+    pixel-size: 18;
+    visible: false;
+    tooltip-text: "This room has been upgraded to a new room";
+    styles ["dim-label"]
+  }
+
   Gtk.Image lock_icon {
     icon-name: "channel-secure-symbolic";
     pixel-size: 16;
