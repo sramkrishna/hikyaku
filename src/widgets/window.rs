@@ -153,6 +153,23 @@ impl MxWindow {
             });
         });
 
+        // Wire up scroll-to-top → fetch older messages.
+        let cmd_tx = command_tx.clone();
+        let window_weak = window.downgrade();
+        let msg_view_for_scroll = imp.message_view.clone();
+        imp.message_view.connect_scroll_top(move || {
+            let room_id = window_weak
+                .upgrade()
+                .and_then(|w| w.imp().current_room_id.borrow().clone());
+            let token = msg_view_for_scroll.prev_batch_token();
+            if let (Some(room_id), Some(from_token)) = (room_id, token) {
+                let tx = cmd_tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::FetchOlderMessages { room_id, from_token }).await;
+                });
+            }
+        });
+
         // Wire up send message → send SendMessage command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
@@ -207,15 +224,24 @@ impl MxWindow {
                     MatrixEvent::RoomListUpdated { rooms } => {
                         room_list_view.update_rooms(&rooms);
                     }
-                    MatrixEvent::RoomMessages { room_id, messages } => {
-                        // Only update if this is still the selected room.
+                    MatrixEvent::RoomMessages { room_id, messages, prev_batch_token } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             let msgs: Vec<(String, String, u64)> = messages
                                 .into_iter()
                                 .map(|m| (m.sender, m.body, m.timestamp))
                                 .collect();
-                            message_view.set_messages(&msgs);
+                            message_view.set_messages(&msgs, prev_batch_token);
+                        }
+                    }
+                    MatrixEvent::OlderMessages { room_id, messages, prev_batch_token } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            let msgs: Vec<(String, String, u64)> = messages
+                                .into_iter()
+                                .map(|m| (m.sender, m.body, m.timestamp))
+                                .collect();
+                            message_view.prepend_messages(&msgs, prev_batch_token);
                         }
                     }
                     MatrixEvent::NewMessage { room_id, message } => {

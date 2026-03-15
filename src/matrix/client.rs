@@ -72,6 +72,14 @@ pub enum MatrixEvent {
     RoomMessages {
         room_id: String,
         messages: Vec<MessageInfo>,
+        /// Pagination token — pass to FetchOlderMessages to get the next batch.
+        prev_batch_token: Option<String>,
+    },
+    /// Older messages prepended at the top (pagination result).
+    OlderMessages {
+        room_id: String,
+        messages: Vec<MessageInfo>,
+        prev_batch_token: Option<String>,
     },
     NewMessage {
         room_id: String,
@@ -119,6 +127,11 @@ pub enum MatrixCommand {
     CancelVerification { flow_id: String },
     /// Request verification of our own device from another session.
     RequestSelfVerification,
+    /// Fetch older messages for a room (pagination).
+    FetchOlderMessages {
+        room_id: String,
+        from_token: String,
+    },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -304,6 +317,9 @@ async fn matrix_task(
                         super::verification::request_self_verification(
                             &client, &event_tx, &vs,
                         ).await;
+                    }
+                    Ok(MatrixCommand::FetchOlderMessages { room_id, from_token }) => {
+                        handle_fetch_older(&client, &event_tx, &room_id, &from_token).await;
                     }
                     Err(_) => break,
                 }
@@ -767,9 +783,83 @@ async fn start_sync(
     tracing::info!("Sync loop exited cleanly");
 }
 
+/// Extract messages from a chunk of timeline events.
+async fn extract_messages(
+    room: &matrix_sdk::room::Room,
+    chunk: &[matrix_sdk::deserialized_responses::TimelineEvent],
+    reverse: bool,
+) -> Vec<MessageInfo> {
+    use matrix_sdk::ruma::events::room::message::MessageType;
+
+    let mut messages = Vec::new();
+    let iter: Box<dyn Iterator<Item = &matrix_sdk::deserialized_responses::TimelineEvent>> =
+        if reverse {
+            Box::new(chunk.iter().rev())
+        } else {
+            Box::new(chunk.iter())
+        };
+
+    for timeline_event in iter {
+        let event = match timeline_event.raw().deserialize() {
+            Ok(ev) => ev,
+            Err(_) => {
+                messages.push(MessageInfo {
+                    sender: String::new(),
+                    body: "\u{1f512} Unable to decrypt message".to_string(),
+                    timestamp: 0,
+                });
+                continue;
+            }
+        };
+        match event {
+            matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg_event),
+            ) => {
+                let msg_event = match msg_event {
+                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
+                    _ => continue,
+                };
+                let body = match &msg_event.content.msgtype {
+                    MessageType::Text(text) => text.body.clone(),
+                    _ => continue,
+                };
+                let sender_id = msg_event.sender.to_string();
+                let display_name = room
+                    .get_member_no_sync(&msg_event.sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.display_name().map(|s| s.to_string()))
+                    .unwrap_or_else(|| sender_id.clone());
+                messages.push(MessageInfo {
+                    sender: display_name,
+                    body,
+                    timestamp: msg_event.origin_server_ts.as_secs().into(),
+                });
+            }
+            matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomEncrypted(enc),
+            ) => {
+                let sender = match &enc {
+                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(o) => {
+                        o.sender.to_string()
+                    }
+                    _ => String::new(),
+                };
+                messages.push(MessageInfo {
+                    sender,
+                    body: "\u{1f512} Unable to decrypt message".to_string(),
+                    timestamp: 0,
+                });
+            }
+            _ => continue,
+        }
+    }
+    messages
+}
+
 /// Fetch recent messages for a room and send them to the UI.
 async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
-    use matrix_sdk::ruma::events::room::message::MessageType;
     use matrix_sdk::ruma::UInt;
 
     let Ok(room_id) = RoomId::parse(room_id) else {
@@ -784,84 +874,69 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
 
     tracing::debug!("Fetching messages for {room_id}");
 
-    let mut messages = Vec::new();
-
-    // Fetch the last 50 messages. Use a small limit to keep it fast.
     let mut options = matrix_sdk::room::MessagesOptions::backward();
     options.limit = UInt::from(50u32);
 
-    match room.messages(options).await {
+    let (messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
             tracing::debug!("Got {} events for {room_id}", response.chunk.len());
-            for timeline_event in response.chunk.iter().rev() {
-                let event = match timeline_event.raw().deserialize() {
-                    Ok(ev) => ev,
-                    Err(_) => {
-                        // Likely an encrypted event we can't decrypt (UTD).
-                        messages.push(MessageInfo {
-                            sender: String::new(),
-                            body: "\u{1f512} Unable to decrypt message".to_string(),
-                            timestamp: 0,
-                        });
-                        continue;
-                    }
-                };
-                match event {
-                    matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
-                        matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg_event),
-                    ) => {
-                        let msg_event = match msg_event {
-                            matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
-                            _ => continue,
-                        };
-                        let body = match &msg_event.content.msgtype {
-                            MessageType::Text(text) => text.body.clone(),
-                            _ => continue,
-                        };
-                        // Resolve display name from room member profile.
-                        let sender_id = msg_event.sender.to_string();
-                        let display_name = room
-                            .get_member_no_sync(&msg_event.sender)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|m| m.display_name().map(|s| s.to_string()))
-                            .unwrap_or_else(|| sender_id.clone());
-                        messages.push(MessageInfo {
-                            sender: display_name,
-                            body,
-                            timestamp: msg_event.origin_server_ts.as_secs().into(),
-                        });
-                    }
-                    matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
-                        matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomEncrypted(enc),
-                    ) => {
-                        // Encrypted event that wasn't decrypted — missing keys.
-                        let sender = match &enc {
-                            matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(o) =>
-                                o.sender.to_string(),
-                            _ => String::new(),
-                        };
-                        messages.push(MessageInfo {
-                            sender,
-                            body: "\u{1f512} Unable to decrypt message".to_string(),
-                            timestamp: 0,
-                        });
-                    }
-                    _ => continue,
-                }
-            }
+            let msgs = extract_messages(&room, &response.chunk, true).await;
+            let token = response.end.map(|t| t.to_string());
+            (msgs, token)
         }
         Err(e) => {
             tracing::error!("Failed to fetch messages for {room_id}: {e}");
+            (Vec::new(), None)
         }
-    }
+    };
 
     tracing::debug!("Sending {} messages to UI for {room_id}", messages.len());
     let _ = event_tx
         .send(MatrixEvent::RoomMessages {
             room_id: room_id.to_string(),
             messages,
+            prev_batch_token,
+        })
+        .await;
+}
+
+/// Fetch older messages for a room (pagination).
+async fn handle_fetch_older(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    from_token: &str,
+) {
+    use matrix_sdk::ruma::UInt;
+
+    let Ok(room_id) = RoomId::parse(room_id) else {
+        return;
+    };
+    let Some(room) = client.get_room(&room_id) else {
+        return;
+    };
+
+    let mut options = matrix_sdk::room::MessagesOptions::backward();
+    options.limit = UInt::from(50u32);
+    options.from = Some(from_token.to_string());
+
+    let (messages, prev_batch_token) = match room.messages(options).await {
+        Ok(response) => {
+            let msgs = extract_messages(&room, &response.chunk, true).await;
+            let token = response.end.map(|t| t.to_string());
+            (msgs, token)
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch older messages for {room_id}: {e}");
+            (Vec::new(), None)
+        }
+    };
+
+    let _ = event_tx
+        .send(MatrixEvent::OlderMessages {
+            room_id: room_id.to_string(),
+            messages,
+            prev_batch_token,
         })
         .await;
 }

@@ -9,7 +9,7 @@ mod imp {
     use gtk::glib;
     use gtk::subclass::prelude::*;
     use gtk::CompositeTemplate;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use crate::models::MessageObject;
     use crate::widgets::message_row::MessageRow;
@@ -29,6 +29,9 @@ mod imp {
         #[template_child]
         pub send_button: TemplateChild<gtk::Button>,
         pub on_send: RefCell<Option<Box<dyn Fn(String)>>>,
+        pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
+        pub prev_batch_token: RefCell<Option<String>>,
+        pub fetching_older: Cell<bool>,
     }
 
     impl Default for MessageView {
@@ -41,6 +44,9 @@ mod imp {
                 input_entry: Default::default(),
                 send_button: Default::default(),
                 on_send: RefCell::new(None),
+                on_scroll_top: RefCell::new(None),
+                prev_batch_token: RefCell::new(None),
+                fetching_older: Cell::new(false),
             }
         }
     }
@@ -110,6 +116,23 @@ mod imp {
                 }
             });
 
+            // Detect scroll-to-top for pagination.
+            let view_for_scroll = obj.clone();
+            self.scrolled_window.vadjustment().connect_value_notify(move |adj| {
+                // Trigger when scrolled near the top (within 50px).
+                if adj.value() < 50.0 {
+                    let imp = view_for_scroll.imp();
+                    if !imp.fetching_older.get() {
+                        if imp.prev_batch_token.borrow().is_some() {
+                            imp.fetching_older.set(true);
+                            if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                                cb();
+                            }
+                        }
+                    }
+                }
+            });
+
             // Send on Enter key.
             let entry = self.input_entry.clone();
             let view = obj.clone();
@@ -152,19 +175,44 @@ impl MessageView {
     }
 
     /// Replace all messages (used when switching rooms).
-    pub fn set_messages(&self, messages: &[(String, String, u64)]) {
+    pub fn set_messages(&self, messages: &[(String, String, u64)], prev_batch: Option<String>) {
         let imp = self.imp();
         imp.list_store.remove_all();
         for (sender, body, ts) in messages {
             imp.list_store.append(&MessageObject::new(sender, body, *ts));
         }
+        imp.prev_batch_token.replace(prev_batch);
+        imp.fetching_older.set(false);
         imp.view_stack.set_visible_child_name("messages");
         self.scroll_to_bottom();
     }
 
+    /// Prepend older messages at the top (pagination).
+    pub fn prepend_messages(&self, messages: &[(String, String, u64)], prev_batch: Option<String>) {
+        let imp = self.imp();
+        for (i, (sender, body, ts)) in messages.iter().enumerate() {
+            imp.list_store.insert(i as u32, &MessageObject::new(sender, body, *ts));
+        }
+        imp.prev_batch_token.replace(prev_batch);
+        imp.fetching_older.set(false);
+    }
+
+    /// Get the current pagination token.
+    pub fn prev_batch_token(&self) -> Option<String> {
+        self.imp().prev_batch_token.borrow().clone()
+    }
+
     /// Clear messages and show placeholder (used when switching rooms before new data arrives).
     pub fn clear(&self) {
-        self.imp().list_store.remove_all();
+        let imp = self.imp();
+        imp.list_store.remove_all();
+        imp.prev_batch_token.replace(None);
+        imp.fetching_older.set(false);
+    }
+
+    /// Connect a callback for when the user scrolls to the top (load older messages).
+    pub fn connect_scroll_top<F: Fn() + 'static>(&self, f: F) {
+        self.imp().on_scroll_top.replace(Some(Box::new(f)));
     }
 
     /// Append a single new message (used for live updates).
