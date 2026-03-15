@@ -19,6 +19,22 @@ mod imp {
 
         #[property(get, set)]
         is_highlight: Cell<bool>,
+
+        /// Matrix event ID for this message.
+        #[property(get, set)]
+        event_id: RefCell<String>,
+
+        /// Event ID of the message this replies to (empty if not a reply).
+        #[property(get, set)]
+        reply_to: RefCell<String>,
+
+        /// Thread root event ID (empty if not in a thread).
+        #[property(get, set)]
+        thread_root: RefCell<String>,
+
+        /// Reactions as JSON string: [["👍", 3], ["❤️", 1]]
+        #[property(get, set)]
+        reactions_json: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -39,14 +55,24 @@ glib::wrapper! {
 }
 
 impl MessageObject {
-    pub fn new(sender: &str, body: &str, timestamp: u64) -> Self {
+    pub fn new(
+        sender: &str,
+        body: &str,
+        timestamp: u64,
+        event_id: &str,
+        reply_to: &str,
+        thread_root: &str,
+        reactions: &[(String, u64)],
+    ) -> Self {
+        let reactions_json = serde_json::to_string(reactions).unwrap_or_default();
         Object::builder()
             .property("sender", sender)
             .property("body", body)
             .property("timestamp", timestamp)
+            .property("event-id", event_id)
+            .property("reply-to", reply_to)
+            .property("thread-root", thread_root)
+            .property("reactions-json", reactions_json)
             .build()
     }
 }
-
-// GObject model tests require GTK main-thread initialization which
-// doesn't work reliably in the Rust test harness.

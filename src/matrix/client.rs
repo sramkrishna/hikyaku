@@ -58,6 +58,13 @@ pub struct MessageInfo {
     pub sender: String,
     pub body: String,
     pub timestamp: u64,
+    pub event_id: String,
+    /// If this message is a reply, the event ID it replies to.
+    pub reply_to: Option<String>,
+    /// If this message is part of a thread, the thread root event ID.
+    pub thread_root: Option<String>,
+    /// Aggregated emoji reactions: (emoji, count).
+    pub reactions: Vec<(String, u64)>,
 }
 
 /// Room metadata sent alongside messages for display in the content header.
@@ -183,6 +190,13 @@ pub enum MatrixCommand {
     SendMessage {
         room_id: String,
         body: String,
+        reply_to: Option<String>,
+    },
+    /// Send an emoji reaction to a message.
+    SendReaction {
+        room_id: String,
+        event_id: String,
+        emoji: String,
     },
     /// Accept an incoming verification request and start SAS.
     AcceptVerification { flow_id: String },
@@ -390,8 +404,11 @@ async fn matrix_task(
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
                         handle_select_room(&client, &event_tx, &room_id, &mut rooms_with_keys).await;
                     }
-                    Ok(MatrixCommand::SendMessage { room_id, body }) => {
-                        handle_send_message(&client, &room_id, &body).await;
+                    Ok(MatrixCommand::SendMessage { room_id, body, reply_to }) => {
+                        handle_send_message(&client, &room_id, &body, reply_to.as_deref()).await;
+                    }
+                    Ok(MatrixCommand::SendReaction { room_id, event_id, emoji }) => {
+                        handle_send_reaction(&client, &room_id, &event_id, &emoji).await;
                     }
                     Ok(MatrixCommand::AcceptVerification { flow_id }) => {
                         super::verification::accept_verification(
@@ -721,6 +738,18 @@ fn extract_message_body(
         MessageType::Notice(notice) => Some(notice.body.clone()),
         _ => None,
     }
+}
+
+/// Aggregate a list of emoji strings into (emoji, count) pairs using a HashMap.
+fn aggregate_reactions(emojis: Option<&Vec<String>>) -> Vec<(String, u64)> {
+    let Some(emojis) = emojis else {
+        return Vec::new();
+    };
+    let mut counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for emoji in emojis {
+        *counts.entry(emoji.as_str()).or_insert(0) += 1;
+    }
+    counts.into_iter().map(|(e, c)| (e.to_string(), c)).collect()
 }
 
 /// Resolve a user's display name from room membership, falling back to user ID.
@@ -1187,6 +1216,10 @@ async fn start_sync(
                             sender: display_name,
                             body,
                             timestamp,
+                            event_id: event.event_id.to_string(),
+                            reply_to: None,
+                            thread_root: None,
+                            reactions: Vec::new(),
                         },
                         is_mention,
                     })
@@ -1220,6 +1253,10 @@ async fn start_sync(
                             sender: display_name,
                             body: "\u{1f512} Unable to decrypt message".to_string(),
                             timestamp: event.origin_server_ts.as_secs().into(),
+                            event_id: event.event_id.to_string(),
+                            reply_to: None,
+                            thread_root: None,
+                            reactions: Vec::new(),
                         },
                         is_mention: false,
                     })
@@ -1401,6 +1438,24 @@ async fn extract_messages(
             Box::new(chunk.iter())
         };
 
+    // Collect reactions separately, then merge into messages by event_id.
+    let mut reaction_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for timeline_event in chunk {
+        if let Ok(ev) = timeline_event.raw().deserialize() {
+            if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::Reaction(
+                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(reaction),
+                ),
+            ) = ev
+            {
+                let target = reaction.content.relates_to.event_id.to_string();
+                let emoji = reaction.content.relates_to.key.clone();
+                reaction_map.entry(target).or_default().push(emoji);
+            }
+        }
+    }
+
     for timeline_event in iter {
         let event = match timeline_event.raw().deserialize() {
             Ok(ev) => ev,
@@ -1409,6 +1464,10 @@ async fn extract_messages(
                     sender: String::new(),
                     body: "\u{1f512} Unable to decrypt message".to_string(),
                     timestamp: 0,
+                    event_id: String::new(),
+                    reply_to: None,
+                    thread_root: None,
+                    reactions: Vec::new(),
                 });
                 continue;
             }
@@ -1425,25 +1484,52 @@ async fn extract_messages(
                     continue;
                 };
                 let display_name = resolve_display_name(room, &msg_event.sender).await;
+                let event_id = msg_event.event_id.to_string();
+
+                // Extract reply and thread relations.
+                use matrix_sdk::ruma::events::room::message::Relation;
+                let (reply_to, thread_root) = match &msg_event.content.relates_to {
+                    Some(Relation::Reply { in_reply_to }) => {
+                        (Some(in_reply_to.event_id.to_string()), None)
+                    }
+                    Some(Relation::Thread(thread)) => {
+                        let reply = thread.in_reply_to.as_ref()
+                            .map(|r| r.event_id.to_string());
+                        (reply, Some(thread.event_id.to_string()))
+                    }
+                    _ => (None, None),
+                };
+
+                // Aggregate reactions for this event.
+                let reactions = aggregate_reactions(reaction_map.get(&event_id));
+
                 messages.push(MessageInfo {
                     sender: display_name,
                     body,
                     timestamp: msg_event.origin_server_ts.as_secs().into(),
+                    event_id,
+                    reply_to,
+                    thread_root,
+                    reactions,
                 });
             }
             matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
                 matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomEncrypted(enc),
             ) => {
-                let sender = match &enc {
+                let (sender, event_id) = match &enc {
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(o) => {
-                        o.sender.to_string()
+                        (o.sender.to_string(), o.event_id.to_string())
                     }
-                    _ => String::new(),
+                    _ => (String::new(), String::new()),
                 };
                 messages.push(MessageInfo {
                     sender,
                     body: "\u{1f512} Unable to decrypt message".to_string(),
                     timestamp: 0,
+                    event_id,
+                    reply_to: None,
+                    thread_root: None,
+                    reactions: Vec::new(),
                 });
             }
             _ => continue,
@@ -1507,6 +1593,7 @@ async fn handle_select_room(
     msg_filter.types = Some(vec![
         "m.room.message".to_string(),
         "m.room.encrypted".to_string(),
+        "m.reaction".to_string(),
     ]);
 
     let mut options = matrix_sdk::room::MessagesOptions::backward();
@@ -1680,9 +1767,17 @@ async fn handle_fetch_older(
         return;
     };
 
+    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
+    let mut msg_filter = RoomEventFilter::default();
+    msg_filter.types = Some(vec![
+        "m.room.message".to_string(),
+        "m.room.encrypted".to_string(),
+        "m.reaction".to_string(),
+    ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
     options.limit = UInt::from(50u32);
     options.from = Some(from_token.to_string());
+    options.filter = msg_filter;
 
     let (messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
@@ -1706,7 +1801,12 @@ async fn handle_fetch_older(
 }
 
 /// Send a text message to a room.
-async fn handle_send_message(client: &Client, room_id: &str, body: &str) {
+async fn handle_send_message(
+    client: &Client,
+    room_id: &str,
+    body: &str,
+    reply_to: Option<&str>,
+) {
     use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 
     let Ok(room_id) = RoomId::parse(room_id) else {
@@ -1719,9 +1819,93 @@ async fn handle_send_message(client: &Client, room_id: &str, body: &str) {
         return;
     };
 
-    let content = RoomMessageEventContent::text_plain(body);
+    let mut content = RoomMessageEventContent::text_plain(body);
+
+    // If replying, set the in_reply_to relation.
+    if let Some(reply_event_id) = reply_to {
+        if let Ok(eid) = matrix_sdk::ruma::EventId::parse(reply_event_id) {
+            content.relates_to = Some(
+                matrix_sdk::ruma::events::room::message::Relation::Reply {
+                    in_reply_to: matrix_sdk::ruma::events::relation::InReplyTo::new(eid.to_owned()),
+                },
+            );
+        }
+    }
+
     if let Err(e) = room.send(content).await {
         tracing::error!("Failed to send message to {room_id}: {e}");
+    }
+}
+
+async fn handle_send_reaction(client: &Client, room_id: &str, event_id: &str, emoji: &str) {
+    use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+    use matrix_sdk::ruma::events::relation::Annotation;
+
+    let Ok(room_id) = RoomId::parse(room_id) else {
+        return;
+    };
+    let Ok(event_id) = matrix_sdk::ruma::EventId::parse(event_id) else {
+        return;
+    };
+    let Some(room) = client.get_room(&room_id) else {
+        return;
+    };
+
+    tracing::debug!("Sending reaction {emoji} to {event_id} in {room_id}");
+
+    // Try to send the reaction. If the server returns M_DUPLICATE_ANNOTATION,
+    // the user already reacted — find and redact to toggle off.
+    let annotation = Annotation::new(event_id.to_owned(), emoji.to_string());
+    let content = ReactionEventContent::new(annotation);
+    match room.send(content).await {
+        Ok(_) => {}
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("M_DUPLICATE_ANNOTATION") || err_str.contains("same reaction") {
+                // Already reacted — find our reaction event and redact it.
+                tracing::debug!("Duplicate reaction, searching to redact...");
+                if let Some(user_id) = client.user_id() {
+                    // Use the room relations API or search recent events.
+                    let mut opts = matrix_sdk::room::MessagesOptions::backward();
+                    opts.limit = matrix_sdk::ruma::UInt::from(200u32);
+                    let mut filter = matrix_sdk::ruma::api::client::filter::RoomEventFilter::default();
+                    filter.types = Some(vec!["m.reaction".to_string()]);
+                    filter.senders = Some(vec![user_id.to_owned()]);
+                    opts.filter = filter;
+
+                    if let Ok(resp) = room.messages(opts).await {
+                        for ev in &resp.chunk {
+                            let raw = ev.raw().json().get();
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                                let relates_to = v.get("content")
+                                    .and_then(|c| c.get("m.relates_to"));
+                                let matches = relates_to
+                                    .and_then(|r| {
+                                        let eid = r.get("event_id")?.as_str()?;
+                                        let key = r.get("key")?.as_str()?;
+                                        Some(eid == event_id.as_str() && key == emoji)
+                                    })
+                                    .unwrap_or(false);
+                                if matches {
+                                    if let Some(reaction_eid) = v.get("event_id").and_then(|e| e.as_str()) {
+                                        if let Ok(rid) = matrix_sdk::ruma::EventId::parse(reaction_eid) {
+                                            tracing::debug!("Redacting reaction {rid}");
+                                            if let Err(e) = room.redact(&rid, None, None).await {
+                                                tracing::error!("Failed to redact: {e}");
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tracing::warn!("Could not find reaction event to redact");
+                }
+            } else {
+                tracing::error!("Failed to send reaction: {e}");
+            }
+        }
     }
 }
 

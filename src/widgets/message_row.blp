@@ -13,6 +13,24 @@ template $MxMessageRow : Gtk.Box {
     spacing: 2;
     hexpand: true;
 
+    // Reply indicator — shown when this message is a reply.
+    Gtk.Box reply_box {
+      orientation: horizontal;
+      spacing: 4;
+      visible: false;
+      styles ["dim-label", "caption"]
+
+      Gtk.Image {
+        icon-name: "mail-reply-sender-symbolic";
+        pixel-size: 12;
+      }
+
+      Gtk.Label reply_label {
+        halign: start;
+        ellipsize: end;
+      }
+    }
+
     Gtk.Box {
       orientation: horizontal;
       spacing: 8;
@@ -20,6 +38,15 @@ template $MxMessageRow : Gtk.Box {
       Gtk.Label sender_label {
         halign: start;
         styles ["caption-heading"]
+      }
+
+      // Thread indicator.
+      Gtk.Image thread_icon {
+        icon-name: "view-list-symbolic";
+        pixel-size: 12;
+        visible: false;
+        tooltip-text: "Part of a thread";
+        styles ["dim-label"]
       }
 
       Gtk.Label timestamp_label {
@@ -38,5 +65,16 @@ template $MxMessageRow : Gtk.Box {
       hexpand: true;
       styles ["mx-message-body"]
     }
+
+    // Reactions row — emoji pills.
+    Gtk.Box reactions_box {
+      orientation: horizontal;
+      spacing: 4;
+      visible: false;
+      margin-top: 2;
+      halign: start;
+    }
+
   }
 }
+

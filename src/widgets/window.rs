@@ -259,7 +259,7 @@ impl MxWindow {
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
         let msg_view_for_send = imp.message_view.clone();
-        imp.message_view.connect_send_message(move |body| {
+        imp.message_view.connect_send_message(move |body, reply_to| {
             let room_id = window_weak
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
@@ -269,11 +269,39 @@ impl MxWindow {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                msg_view_for_send.append_message("You", &body, now);
+                let echo = crate::matrix::MessageInfo {
+                    sender: "You".to_string(),
+                    body: body.clone(),
+                    timestamp: now,
+                    event_id: String::new(),
+                    reply_to: reply_to.clone(),
+                    thread_root: None,
+                    reactions: Vec::new(),
+                };
+                msg_view_for_send.append_message(&echo);
 
                 let tx = cmd_tx.clone();
                 glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::SendMessage { room_id, body }).await;
+                    let _ = tx.send(MatrixCommand::SendMessage { room_id, body, reply_to }).await;
+                });
+            }
+        });
+
+        // Wire up react callback → send reaction command + local update.
+        let cmd_tx_react = command_tx.clone();
+        let window_weak_react = window.downgrade();
+        let msg_view_react = imp.message_view.clone();
+        imp.message_view.connect_react(move |event_id, emoji| {
+            let room_id = window_weak_react
+                .upgrade()
+                .and_then(|w| w.imp().current_room_id.borrow().clone());
+            if let Some(room_id) = room_id {
+                // Show reaction immediately in the UI.
+                msg_view_react.add_local_reaction(&event_id, &emoji);
+
+                let tx = cmd_tx_react.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::SendReaction { room_id, event_id, emoji }).await;
                 });
             }
         });
@@ -334,31 +362,19 @@ impl MxWindow {
                         if current.as_deref() == Some(&room_id) {
                             window.imp().current_room_meta.replace(Some(room_meta.clone()));
                             message_view.set_room_meta(&room_meta);
-                            let msgs: Vec<(String, String, u64)> = messages
-                                .into_iter()
-                                .map(|m| (m.sender, m.body, m.timestamp))
-                                .collect();
-                            message_view.set_messages(&msgs, prev_batch_token);
+                            message_view.set_messages(&messages, prev_batch_token);
                         }
                     }
                     MatrixEvent::OlderMessages { room_id, messages, prev_batch_token } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
-                            let msgs: Vec<(String, String, u64)> = messages
-                                .into_iter()
-                                .map(|m| (m.sender, m.body, m.timestamp))
-                                .collect();
-                            message_view.prepend_messages(&msgs, prev_batch_token);
+                            message_view.prepend_messages(&messages, prev_batch_token);
                         }
                     }
                     MatrixEvent::NewMessage { room_id, room_name, message, is_mention } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
-                            message_view.append_message(
-                                &message.sender,
-                                &message.body,
-                                message.timestamp,
-                            );
+                            message_view.append_message(&message);
                         }
 
                         // Desktop notification for mentions.
@@ -723,6 +739,26 @@ impl MxWindow {
             }
             .join-banner:hover {
                 background: #2a7de1;
+            }
+            .action-overlay {
+                opacity: 0.7;
+                transition: opacity 200ms ease-in;
+            }
+            .action-overlay:hover {
+                opacity: 1.0;
+            }
+            .msg-action-bar {
+                opacity: 0;
+                transition: opacity 300ms ease-in-out;
+            }
+            .msg-action-bar-visible {
+                opacity: 0.85;
+            }
+            .reaction-pill {
+                background: alpha(@window_fg_color, 0.1);
+                border-radius: 12px;
+                padding: 4px 8px;
+                font-size: 14px;
             }
             .mention-row {
                 background: alpha(@accent_bg_color, 0.12);

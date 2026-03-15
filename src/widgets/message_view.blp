@@ -94,6 +94,35 @@ template $MxMessageView : Gtk.Box {
           orientation: horizontal;
         }
 
+        // Reply preview bar — shown when replying to a message.
+        Gtk.Box reply_preview {
+          orientation: horizontal;
+          spacing: 8;
+          margin-start: 8;
+          margin-end: 8;
+          margin-top: 4;
+          visible: false;
+          styles ["dim-label"]
+
+          Gtk.Image {
+            icon-name: "mail-reply-sender-symbolic";
+            pixel-size: 14;
+          }
+
+          Gtk.Label reply_preview_label {
+            halign: start;
+            hexpand: true;
+            ellipsize: end;
+            styles ["caption"]
+          }
+
+          Gtk.Button reply_cancel_button {
+            icon-name: "window-close-symbolic";
+            tooltip-text: "Cancel reply";
+            styles ["flat", "circular"]
+          }
+        }
+
         Gtk.Box {
           orientation: horizontal;
           spacing: 8;

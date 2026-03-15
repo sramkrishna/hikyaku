@@ -44,7 +44,20 @@ mod imp {
         pub tombstone_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub pinned_box: TemplateChild<gtk::Box>,
-        pub on_send: RefCell<Option<Box<dyn Fn(String)>>>,
+        #[template_child]
+        pub reply_preview: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub reply_preview_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub reply_cancel_button: TemplateChild<gtk::Button>,
+        /// The event ID we're replying to (None = not replying).
+        pub reply_to_event: RefCell<Option<String>>,
+        /// Callback for sending a message: (body, reply_to_event_id).
+        pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>)>>>,
+        /// Callback for sending a reaction: (event_id, emoji).
+        pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for replying — sets up the reply preview.
+        pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
         pub prev_batch_token: RefCell<Option<String>>,
         pub fetching_older: Cell<bool>,
@@ -77,7 +90,13 @@ mod imp {
                 tombstone_banner: Default::default(),
                 tombstone_label: Default::default(),
                 pinned_box: Default::default(),
+                reply_preview: Default::default(),
+                reply_preview_label: Default::default(),
+                reply_cancel_button: Default::default(),
+                reply_to_event: RefCell::new(None),
                 on_send: RefCell::new(None),
+                on_react: RefCell::new(None),
+                on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
                 fetching_older: Cell::new(false),
@@ -120,11 +139,35 @@ mod imp {
             // ListView factories with custom widgets don't work in Blueprint.
             let factory = gtk::SignalListItemFactory::new();
 
-            factory.connect_setup(|_factory, list_item| {
+            let setup_view_weak = self.obj().downgrade();
+            factory.connect_setup(move |_factory, list_item| {
                 let list_item = list_item
                     .downcast_ref::<gtk::ListItem>()
                     .expect("ListItem expected");
-                list_item.set_child(Some(&MessageRow::new()));
+                let row = MessageRow::new();
+
+                // Set reply/react callbacks once per row (not per bind).
+                {
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_reply(move |eid, sender, body| {
+                        if let Some(v) = view_weak.upgrade() {
+                            v.start_reply(&eid, &sender, &body);
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_react(move |eid, emoji| {
+                        if let Some(v) = view_weak.upgrade() {
+                            let has_cb = v.imp().on_react.borrow().is_some();
+                            if has_cb {
+                                let borrow = v.imp().on_react.borrow();
+                                borrow.as_ref().unwrap()(eid, emoji);
+                            }
+                        }
+                    });
+                }
+
+                list_item.set_child(Some(&row));
             });
 
             let obj_weak = self.obj().downgrade();
@@ -145,10 +188,8 @@ mod imp {
                     .upgrade()
                     .map(|o| o.imp().highlight_names.borrow().clone())
                     .unwrap_or_default();
-                row.set_message_with_highlights(
-                    &msg_obj.sender(),
-                    &msg_obj.body(),
-                    msg_obj.timestamp(),
+                row.bind_message_object(
+                    &msg_obj,
                     &names,
                 );
             });
@@ -165,10 +206,13 @@ mod imp {
                 let text = entry.text().to_string();
                 if !text.is_empty() {
                     let imp = view.imp();
+                    let reply_to = imp.reply_to_event.borrow().clone();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text);
+                        cb(text, reply_to);
                     }
                     entry.set_text("");
+                    imp.reply_to_event.replace(None);
+                    imp.reply_preview.set_visible(false);
                 }
             });
 
@@ -189,18 +233,30 @@ mod imp {
                 }
             });
 
-            // Send on Enter key.
+            // Send on Enter key — includes reply_to if replying.
             let entry = self.input_entry.clone();
             let view = obj.clone();
             self.input_entry.connect_activate(move |_| {
                 let text = entry.text().to_string();
                 if !text.is_empty() {
                     let imp = view.imp();
+                    let reply_to = imp.reply_to_event.borrow().clone();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text);
+                        cb(text, reply_to);
                     }
                     entry.set_text("");
+                    // Clear reply state.
+                    imp.reply_to_event.replace(None);
+                    imp.reply_preview.set_visible(false);
                 }
+            });
+
+            // Cancel reply button.
+            let view_for_cancel = obj.clone();
+            self.reply_cancel_button.connect_clicked(move |_| {
+                let imp = view_for_cancel.imp();
+                imp.reply_to_event.replace(None);
+                imp.reply_preview.set_visible(false);
             });
 
             // Set up nick completion popover.
@@ -431,16 +487,61 @@ impl MessageView {
         self.imp().highlight_names.borrow_mut().push(name.to_string());
     }
 
-    pub fn connect_send_message<F: Fn(String) + 'static>(&self, f: F) {
+    pub fn connect_send_message<F: Fn(String, Option<String>) + 'static>(&self, f: F) {
         self.imp().on_send.replace(Some(Box::new(f)));
     }
 
+    pub fn connect_react<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_react.replace(Some(Box::new(f)));
+    }
+
+    /// Add a reaction locally to a message (immediate visual feedback).
+    pub fn add_local_reaction(&self, event_id: &str, emoji: &str) {
+        if event_id.is_empty() {
+            return;
+        }
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        for i in 0..n {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.event_id() == event_id {
+                // Toggle: if already present decrement/remove, else add.
+                let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
+                    .unwrap_or_default();
+                if let Some(pos) = reactions.iter().position(|(e, _)| e == emoji) {
+                    if reactions[pos].1 <= 1 {
+                        reactions.remove(pos);
+                    } else {
+                        reactions[pos].1 -= 1;
+                    }
+                } else {
+                    reactions.push((emoji.to_string(), 1));
+                }
+                // Update the object in place and notify the list.
+                msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+                // Splice to force rebind without scroll jump.
+                imp.list_store.splice(i, 1, &[msg.clone().upcast::<glib::Object>()]);
+                return;
+            }
+        }
+    }
+
+    /// Enter reply mode — show preview and store the target event ID.
+    pub fn start_reply(&self, event_id: &str, sender: &str, body: &str) {
+        let imp = self.imp();
+        imp.reply_to_event.replace(Some(event_id.to_string()));
+        imp.reply_preview_label.set_label(&format!("{sender}: {body}"));
+        imp.reply_preview.set_visible(true);
+        imp.input_entry.grab_focus();
+    }
+
     /// Replace all messages (used when switching rooms).
-    pub fn set_messages(&self, messages: &[(String, String, u64)], prev_batch: Option<String>) {
+    pub fn set_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
         imp.list_store.remove_all();
-        for (sender, body, ts) in messages {
-            imp.list_store.append(&MessageObject::new(sender, body, *ts));
+        for m in messages {
+            imp.list_store.append(&Self::info_to_obj(m));
         }
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
@@ -449,13 +550,25 @@ impl MessageView {
     }
 
     /// Prepend older messages at the top (pagination).
-    pub fn prepend_messages(&self, messages: &[(String, String, u64)], prev_batch: Option<String>) {
+    pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
-        for (i, (sender, body, ts)) in messages.iter().enumerate() {
-            imp.list_store.insert(i as u32, &MessageObject::new(sender, body, *ts));
+        for (i, m) in messages.iter().enumerate() {
+            imp.list_store.insert(i as u32, &Self::info_to_obj(m));
         }
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+    }
+
+    fn info_to_obj(m: &crate::matrix::MessageInfo) -> MessageObject {
+        MessageObject::new(
+            &m.sender,
+            &m.body,
+            m.timestamp,
+            &m.event_id,
+            m.reply_to.as_deref().unwrap_or(""),
+            m.thread_root.as_deref().unwrap_or(""),
+            &m.reactions,
+        )
     }
 
     /// Get the current pagination token.
@@ -560,10 +673,10 @@ impl MessageView {
     }
 
     /// Append a single new message (used for live updates).
-    pub fn append_message(&self, sender: &str, body: &str, timestamp: u64) {
+    pub fn append_message(&self, msg: &crate::matrix::MessageInfo) {
         self.imp()
             .list_store
-            .append(&MessageObject::new(sender, body, timestamp));
+            .append(&Self::info_to_obj(msg));
         self.scroll_to_bottom();
     }
 
