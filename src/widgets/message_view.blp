@@ -1,37 +1,59 @@
 using Gtk 4.0;
+using Adw 1;
 
 template $MxMessageView : Gtk.Box {
   orientation: vertical;
   spacing: 0;
 
-  Gtk.ScrolledWindow scrolled_window {
-    hscrollbar-policy: never;
-    vexpand: true;
+  Gtk.Stack view_stack {
+    transition-type: crossfade;
 
-    Gtk.ListView list_view {
-    }
-  }
-
-  Gtk.Separator {
-    orientation: horizontal;
-  }
-
-  Gtk.Box {
-    orientation: horizontal;
-    spacing: 8;
-    margin-start: 8;
-    margin-end: 8;
-    margin-top: 8;
-    margin-bottom: 8;
-
-    Gtk.Entry input_entry {
-      placeholder-text: "Send a message…";
-      hexpand: true;
+    Gtk.StackPage {
+      name: "placeholder";
+      child: Adw.StatusPage placeholder_page {
+        icon-name: "chat-symbolic";
+        title: "Select a Room";
+        description: "Choose a room from the sidebar to start chatting.";
+        vexpand: true;
+      };
     }
 
-    Gtk.Button send_button {
-      icon-name: "go-up-symbolic";
-      styles ["circular", "suggested-action"]
+    Gtk.StackPage {
+      name: "messages";
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.ScrolledWindow scrolled_window {
+          hscrollbar-policy: never;
+          vexpand: true;
+
+          Gtk.ListView list_view {
+          }
+        }
+
+        Gtk.Separator {
+          orientation: horizontal;
+        }
+
+        Gtk.Box {
+          orientation: horizontal;
+          spacing: 8;
+          margin-start: 8;
+          margin-end: 8;
+          margin-top: 8;
+          margin-bottom: 8;
+
+          Gtk.Entry input_entry {
+            placeholder-text: "Send a message…";
+            hexpand: true;
+          }
+
+          Gtk.Button send_button {
+            icon-name: "go-up-symbolic";
+            styles ["circular", "suggested-action"]
+          }
+        }
+      };
     }
   }
 }

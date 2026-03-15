@@ -136,14 +136,16 @@ impl MxWindow {
         // Wire up room selection → send SelectRoom command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
+        let msg_view = imp.message_view.clone();
         imp.room_list_view.connect_room_selected(move |room_id, room_name| {
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
-                // Update the content header to show the room name.
                 if let Some(page) = window.imp().content_page.get() {
                     page.set_title(&room_name);
                 }
             }
+            // Clear old messages while we fetch the new room's messages.
+            msg_view.clear();
             let tx = cmd_tx.clone();
             let rid = room_id.clone();
             glib::spawn_future_local(async move {

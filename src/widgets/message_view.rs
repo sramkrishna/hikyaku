@@ -19,6 +19,8 @@ mod imp {
     pub struct MessageView {
         pub list_store: gio::ListStore,
         #[template_child]
+        pub view_stack: TemplateChild<gtk::Stack>,
+        #[template_child]
         pub scrolled_window: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
         pub list_view: TemplateChild<gtk::ListView>,
@@ -33,6 +35,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 list_store: gio::ListStore::new::<MessageObject>(),
+                view_stack: Default::default(),
                 scrolled_window: Default::default(),
                 list_view: Default::default(),
                 input_entry: Default::default(),
@@ -150,12 +153,18 @@ impl MessageView {
 
     /// Replace all messages (used when switching rooms).
     pub fn set_messages(&self, messages: &[(String, String, u64)]) {
-        let store = &self.imp().list_store;
-        store.remove_all();
+        let imp = self.imp();
+        imp.list_store.remove_all();
         for (sender, body, ts) in messages {
-            store.append(&MessageObject::new(sender, body, *ts));
+            imp.list_store.append(&MessageObject::new(sender, body, *ts));
         }
+        imp.view_stack.set_visible_child_name("messages");
         self.scroll_to_bottom();
+    }
+
+    /// Clear messages and show placeholder (used when switching rooms before new data arrives).
+    pub fn clear(&self) {
+        self.imp().list_store.remove_all();
     }
 
     /// Append a single new message (used for live updates).
