@@ -679,6 +679,8 @@ async fn start_sync(
         let sync_shutdown = shutdown_rx.clone();
         let initial_sync_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let initial_flag = initial_sync_done.clone();
+        let last_room_update = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_update_flag = last_room_update.clone();
 
         // Build a sync filter to minimize data transferred:
         // - Lazy-load room members (biggest win — avoids downloading every
@@ -712,12 +714,24 @@ async fn start_sync(
                 let client = sync_client.clone();
                 let mut shutdown = sync_shutdown.clone();
                 let is_first = !initial_flag.swap(true, std::sync::atomic::Ordering::Relaxed);
+                let last_update = last_update_flag.clone();
                 async move {
-                    // Only collect the full room list on initial sync.
-                    if is_first {
-                        tracing::info!("Initial sync complete, collecting room list");
+                    // Refresh room list on initial sync and periodically after
+                    // (throttled to at most once every 10 seconds to avoid lag).
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let prev = last_update.load(std::sync::atomic::Ordering::Relaxed);
+                    let should_update = is_first || (now_secs - prev >= 10);
+
+                    if should_update {
+                        if is_first {
+                            tracing::info!("Initial sync complete, collecting room list");
+                        }
                         let rooms = collect_room_info(&client).await;
                         let _ = tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
+                        last_update.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     if *shutdown.borrow_and_update() {
