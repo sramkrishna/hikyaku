@@ -254,9 +254,22 @@ impl MxWindow {
     fn show_main_view(&self) {
         let imp = self.imp();
 
-        // Sidebar: room list.
+        // Register actions for the menu.
+        self.setup_actions();
+
+        // Sidebar header with hamburger menu.
+        let sidebar_header = adw::HeaderBar::new();
+        let menu = gio::Menu::new();
+        menu.append(Some("_Preferences"), Some("win.preferences"));
+        menu.append(Some("_About Matx"), Some("win.about"));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&menu)
+            .build();
+        sidebar_header.pack_end(&menu_button);
+
         let sidebar_toolbar = adw::ToolbarView::new();
-        sidebar_toolbar.add_top_bar(&adw::HeaderBar::new());
+        sidebar_toolbar.add_top_bar(&sidebar_header);
         sidebar_toolbar.set_content(Some(&imp.room_list_view));
 
         let sidebar_page = adw::NavigationPage::builder()
@@ -279,5 +292,92 @@ impl MxWindow {
         split_view.set_content(Some(&content_page));
 
         imp.toast_overlay.set_child(Some(&split_view));
+    }
+
+    fn setup_actions(&self) {
+        use gio::ActionEntryBuilder;
+
+        let about_action = ActionEntryBuilder::new("about")
+            .activate(|window: &Self, _, _| {
+                window.show_about_dialog();
+            })
+            .build();
+
+        let preferences_action = ActionEntryBuilder::new("preferences")
+            .activate(|window: &Self, _, _| {
+                window.show_preferences();
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action]);
+    }
+
+    fn show_about_dialog(&self) {
+        let dialog = adw::AboutDialog::builder()
+            .application_name(crate::config::APP_NAME)
+            .application_icon("mail-send-receive-symbolic")
+            .developer_name("Matx Contributors")
+            .version("0.1.0")
+            .comments("A Matrix client built with Rust and libadwaita, designed around activity awareness.")
+            .website("https://github.com/matx")
+            .license_type(gtk::License::Gpl30)
+            .build();
+
+        dialog.present(Some(self));
+    }
+
+    fn show_preferences(&self) {
+        let dialog = adw::PreferencesDialog::new();
+
+        // Sync settings group.
+        let sync_group = adw::PreferencesGroup::builder()
+            .title("Sync")
+            .description("Matrix sync settings")
+            .build();
+
+        let cfg = crate::config::settings();
+
+        let timeline_row = adw::ActionRow::builder()
+            .title("Timeline Limit")
+            .subtitle(format!("{} events per room", cfg.sync.timeline_limit))
+            .build();
+        sync_group.add(&timeline_row);
+
+        let timeout_row = adw::ActionRow::builder()
+            .title("Sync Timeout")
+            .subtitle(format!("{} seconds", cfg.sync.timeout_secs))
+            .build();
+        sync_group.add(&timeout_row);
+
+        // Room settings group.
+        let rooms_group = adw::PreferencesGroup::builder()
+            .title("Rooms")
+            .description("Room display settings")
+            .build();
+
+        let dm_row = adw::ActionRow::builder()
+            .title("Max DMs")
+            .subtitle(format!("{}", cfg.rooms.max_dms))
+            .build();
+        rooms_group.add(&dm_row);
+
+        let rooms_row = adw::ActionRow::builder()
+            .title("Max Rooms")
+            .subtitle(format!("{}", cfg.rooms.max_rooms))
+            .build();
+        rooms_group.add(&rooms_row);
+
+        let info_row = adw::ActionRow::builder()
+            .title("Config File")
+            .subtitle("~/.config/matx/config.toml")
+            .build();
+        rooms_group.add(&info_row);
+
+        let page = adw::PreferencesPage::new();
+        page.add(&sync_group);
+        page.add(&rooms_group);
+        dialog.add(&page);
+
+        dialog.present(Some(self));
     }
 }

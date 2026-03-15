@@ -259,6 +259,9 @@ async fn matrix_task(
         &client, event_tx.clone(), vs.clone(),
     );
 
+    // Set up E2E encryption: bootstrap cross-signing and enable key backup.
+    setup_encryption(&client).await;
+
     // Spawn sync in a separate task so we can keep processing commands.
     let sync_event_tx = event_tx.clone();
     let sync_client = client.clone();
@@ -395,6 +398,39 @@ async fn try_restore_session(
     }
 }
 
+
+/// Bootstrap cross-signing and enable key backup so we can decrypt
+/// messages in encrypted rooms.
+async fn setup_encryption(client: &Client) {
+    let enc = client.encryption();
+
+    // Bootstrap cross-signing if not already set up.
+    // This creates the signing keys that let other devices verify us.
+    match enc.bootstrap_cross_signing_if_needed(None).await {
+        Ok(()) => tracing::info!("Cross-signing ready"),
+        Err(e) => {
+            // UIAA auth may be required — log but don't block.
+            // The user can still verify interactively.
+            tracing::warn!("Cross-signing bootstrap skipped: {e}");
+        }
+    }
+
+    // Enable key backup if not already enabled, so room keys are
+    // uploaded and available for restore on other devices.
+    let backups = enc.backups();
+    if !backups.are_enabled().await {
+        if backups.exists_on_server().await.unwrap_or(false) {
+            tracing::info!("Key backup exists on server, recovery needed to access keys");
+        } else {
+            match backups.create().await {
+                Ok(()) => tracing::info!("Key backup created"),
+                Err(e) => tracing::warn!("Failed to create key backup: {e}"),
+            }
+        }
+    } else {
+        tracing::info!("Key backup already enabled");
+    }
+}
 
 /// Collect current room info from the client's joined rooms.
 ///
@@ -707,25 +743,50 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
             for timeline_event in response.chunk.iter().rev() {
                 let event = match timeline_event.raw().deserialize() {
                     Ok(ev) => ev,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Likely an encrypted event we can't decrypt (UTD).
+                        messages.push(MessageInfo {
+                            sender: String::new(),
+                            body: "\u{1f512} Unable to decrypt message".to_string(),
+                            timestamp: 0,
+                        });
+                        continue;
+                    }
                 };
-                if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
-                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg_event),
-                ) = event
-                {
-                    let msg_event = match msg_event {
-                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
-                        _ => continue,
-                    };
-                    let body = match &msg_event.content.msgtype {
-                        MessageType::Text(text) => text.body.clone(),
-                        _ => continue,
-                    };
-                    messages.push(MessageInfo {
-                        sender: msg_event.sender.to_string(),
-                        body,
-                        timestamp: msg_event.origin_server_ts.as_secs().into(),
-                    });
+                match event {
+                    matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                        matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg_event),
+                    ) => {
+                        let msg_event = match msg_event {
+                            matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
+                            _ => continue,
+                        };
+                        let body = match &msg_event.content.msgtype {
+                            MessageType::Text(text) => text.body.clone(),
+                            _ => continue,
+                        };
+                        messages.push(MessageInfo {
+                            sender: msg_event.sender.to_string(),
+                            body,
+                            timestamp: msg_event.origin_server_ts.as_secs().into(),
+                        });
+                    }
+                    matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                        matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomEncrypted(enc),
+                    ) => {
+                        // Encrypted event that wasn't decrypted — missing keys.
+                        let sender = match &enc {
+                            matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(o) =>
+                                o.sender.to_string(),
+                            _ => String::new(),
+                        };
+                        messages.push(MessageInfo {
+                            sender,
+                            body: "\u{1f512} Unable to decrypt message".to_string(),
+                            timestamp: 0,
+                        });
+                    }
+                    _ => continue,
                 }
             }
         }
