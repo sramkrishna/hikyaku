@@ -1,0 +1,127 @@
+// VerificationDialog — shows the SAS emoji verification flow.
+//
+// Displays 7 emojis for the user to compare with their other device,
+// with Confirm and Cancel buttons.
+
+use adw::prelude::*;
+use gtk::glib;
+use async_channel::Sender;
+use crate::matrix::MatrixCommand;
+
+/// Show a dialog asking the user to accept an incoming verification request.
+pub fn show_verification_request(
+    parent: &impl IsA<gtk::Widget>,
+    flow_id: &str,
+    other_user: &str,
+    other_device: &str,
+    command_tx: Sender<MatrixCommand>,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Verification Request")
+        .body(format!(
+            "{other_user} ({other_device}) wants to verify this device."
+        ))
+        .build();
+
+    dialog.add_response("cancel", "Decline");
+    dialog.add_response("accept", "Accept");
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("accept"));
+
+    let fid = flow_id.to_string();
+    let tx = command_tx.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        let tx = tx.clone();
+        let fid = fid.clone();
+        if response == "accept" {
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::AcceptVerification { flow_id: fid }).await;
+            });
+        } else {
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CancelVerification { flow_id: fid }).await;
+            });
+        }
+    });
+
+    dialog.present(Some(parent));
+}
+
+/// Show the 7 SAS emojis for the user to confirm.
+pub fn show_verification_emojis(
+    parent: &impl IsA<gtk::Widget>,
+    flow_id: &str,
+    emojis: &[(String, String)],
+    command_tx: Sender<MatrixCommand>,
+) {
+    let emoji_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .margin_top(16)
+        .margin_bottom(16)
+        .build();
+
+    for (symbol, description) in emojis {
+        let item = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .build();
+
+        let symbol_label = gtk::Label::builder()
+            .label(symbol)
+            .css_classes(["title-1"])
+            .build();
+
+        let desc_label = gtk::Label::builder()
+            .label(description)
+            .css_classes(["caption"])
+            .build();
+
+        item.append(&symbol_label);
+        item.append(&desc_label);
+        emoji_box.append(&item);
+    }
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+
+    let instruction = gtk::Label::builder()
+        .label("Compare these emojis with your other device:")
+        .wrap(true)
+        .build();
+
+    content.append(&instruction);
+    content.append(&emoji_box);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Verify Device")
+        .extra_child(&content)
+        .build();
+
+    dialog.add_response("cancel", "They Don't Match");
+    dialog.add_response("confirm", "They Match");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("confirm"));
+
+    let fid = flow_id.to_string();
+    let tx = command_tx.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        let tx = tx.clone();
+        let fid = fid.clone();
+        if response == "confirm" {
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::ConfirmVerification { flow_id: fid }).await;
+            });
+        } else {
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CancelVerification { flow_id: fid }).await;
+            });
+        }
+    });
+
+    dialog.present(Some(parent));
+}
