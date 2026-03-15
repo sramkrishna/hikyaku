@@ -1,32 +1,26 @@
 // LoginPage — a simple form with homeserver, username, and password fields.
-//
-// This is a GObject widget subclass. It uses a callback (closure) pattern
-// to notify the parent when the user clicks "Log in", rather than GObject
-// signals — simpler for our purposes.
 
 mod imp {
     use adw::prelude::*;
     use gtk::glib;
     use gtk::subclass::prelude::*;
+    use gtk::CompositeTemplate;
     use std::cell::RefCell;
 
+    #[derive(CompositeTemplate, Default)]
+    #[template(file = "src/widgets/login_page.blp")]
     pub struct LoginPage {
-        pub login_button: gtk::Button,
-        pub spinner: gtk::Spinner,
+        #[template_child]
+        pub homeserver_row: TemplateChild<adw::EntryRow>,
+        #[template_child]
+        pub username_row: TemplateChild<adw::EntryRow>,
+        #[template_child]
+        pub password_row: TemplateChild<adw::PasswordEntryRow>,
+        #[template_child]
+        pub login_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub login_spinner: TemplateChild<gtk::Spinner>,
         pub on_login: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
-    }
-
-    impl Default for LoginPage {
-        fn default() -> Self {
-            Self {
-                login_button: gtk::Button::builder()
-                    .label("Log in")
-                    .css_classes(["suggested-action", "pill"])
-                    .build(),
-                spinner: gtk::Spinner::new(),
-                on_login: RefCell::new(None),
-            }
-        }
     }
 
     #[glib::object_subclass]
@@ -34,6 +28,14 @@ mod imp {
         const NAME: &'static str = "MxLoginPage";
         type Type = super::LoginPage;
         type ParentType = gtk::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
     }
 
     impl ObjectImpl for LoginPage {
@@ -41,62 +43,12 @@ mod imp {
             self.parent_constructed();
 
             let obj = self.obj();
-            obj.set_orientation(gtk::Orientation::Vertical);
-            obj.set_spacing(0);
-            obj.set_valign(gtk::Align::Center);
-            obj.set_halign(gtk::Align::Center);
-            obj.set_width_request(320);
-            obj.set_margin_start(24);
-            obj.set_margin_end(24);
 
-            let title = gtk::Label::builder()
-                .label("Matx")
-                .css_classes(["title-1"])
-                .margin_bottom(8)
-                .build();
-
-            let subtitle = gtk::Label::builder()
-                .label("Sign in to Matrix")
-                .css_classes(["dim-label"])
-                .margin_bottom(24)
-                .build();
-
-            let group = adw::PreferencesGroup::new();
-            let homeserver_row = adw::EntryRow::builder()
-                .title("Homeserver")
-                .text("matrix.org")
-                .build();
-            let username_row = adw::EntryRow::builder()
-                .title("Username")
-                .build();
-            let password_row = adw::PasswordEntryRow::builder()
-                .title("Password")
-                .activates_default(true)
-                .build();
-
-            group.add(&homeserver_row);
-            group.add(&username_row);
-            group.add(&password_row);
-
-            let button_box = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(8)
-                .margin_top(24)
-                .halign(gtk::Align::Center)
-                .build();
-            button_box.append(&self.login_button);
-            button_box.append(&self.spinner);
-
-            obj.append(&title);
-            obj.append(&subtitle);
-            obj.append(&group);
-            obj.append(&button_box);
-
-            let hs = homeserver_row.clone();
-            let un = username_row.clone();
-            let pw = password_row.clone();
+            let hs = self.homeserver_row.clone();
+            let un = self.username_row.clone();
+            let pw = self.password_row.clone();
             let page = obj.clone();
-            let spinner = self.spinner.clone();
+            let spinner = self.login_spinner.clone();
             let login_button = self.login_button.clone();
             self.login_button.connect_clicked(move |_btn| {
                 let imp = page.imp();
@@ -115,7 +67,6 @@ mod imp {
             login_button.add_css_class("default");
             login_button.set_receives_default(true);
 
-            // Once the window is available, set it as the default widget.
             let btn = login_button.clone();
             obj.connect_realize(move |widget| {
                 if let Some(root) = widget.root() {
@@ -131,6 +82,7 @@ mod imp {
     impl BoxImpl for LoginPage {}
 }
 
+use adw::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
@@ -150,6 +102,14 @@ impl LoginPage {
     }
 
     pub fn stop_spinner(&self) {
-        self.imp().spinner.set_spinning(false);
+        self.imp().login_spinner.set_spinning(false);
+    }
+
+    pub fn set_sensitive(&self, sensitive: bool) {
+        let imp = self.imp();
+        imp.homeserver_row.set_sensitive(sensitive);
+        imp.username_row.set_sensitive(sensitive);
+        imp.password_row.set_sensitive(sensitive);
+        imp.login_button.set_sensitive(sensitive);
     }
 }

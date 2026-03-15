@@ -4,36 +4,19 @@
 // and a lock icon for encrypted rooms.
 
 mod imp {
-    use adw::prelude::*;
     use gtk::glib;
     use gtk::subclass::prelude::*;
+    use gtk::CompositeTemplate;
 
+    #[derive(CompositeTemplate, Default)]
+    #[template(file = "src/widgets/room_row.blp")]
     pub struct RoomRow {
-        pub kind_icon: gtk::Image,
-        pub name_label: gtk::Label,
-        pub lock_icon: gtk::Image,
-    }
-
-    impl Default for RoomRow {
-        fn default() -> Self {
-            Self {
-                kind_icon: gtk::Image::builder()
-                    .icon_name("chat-message-new-symbolic")
-                    .pixel_size(20)
-                    .build(),
-                name_label: gtk::Label::builder()
-                    .halign(gtk::Align::Start)
-                    .hexpand(true)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .build(),
-                lock_icon: gtk::Image::builder()
-                    .icon_name("channel-secure-symbolic")
-                    .pixel_size(16)
-                    .visible(false)
-                    .css_classes(["dim-label"])
-                    .build(),
-            }
-        }
+        #[template_child]
+        pub kind_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub name_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub lock_icon: TemplateChild<gtk::Image>,
     }
 
     #[glib::object_subclass]
@@ -41,26 +24,17 @@ mod imp {
         const NAME: &'static str = "MxRoomRow";
         type Type = super::RoomRow;
         type ParentType = gtk::Box;
-    }
 
-    impl ObjectImpl for RoomRow {
-        fn constructed(&self) {
-            self.parent_constructed();
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+        }
 
-            let obj = self.obj();
-            obj.set_orientation(gtk::Orientation::Horizontal);
-            obj.set_spacing(8);
-            obj.set_margin_top(6);
-            obj.set_margin_bottom(6);
-            obj.set_margin_start(6);
-            obj.set_margin_end(6);
-
-            obj.append(&self.kind_icon);
-            obj.append(&self.name_label);
-            obj.append(&self.lock_icon);
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
         }
     }
 
+    impl ObjectImpl for RoomRow {}
     impl WidgetImpl for RoomRow {}
     impl BoxImpl for RoomRow {}
 }

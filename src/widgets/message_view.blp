@@ -1,0 +1,37 @@
+using Gtk 4.0;
+
+template $MxMessageView : Gtk.Box {
+  orientation: vertical;
+  spacing: 0;
+
+  Gtk.ScrolledWindow scrolled_window {
+    hscrollbar-policy: never;
+    vexpand: true;
+
+    Gtk.ListView list_view {
+    }
+  }
+
+  Gtk.Separator {
+    orientation: horizontal;
+  }
+
+  Gtk.Box {
+    orientation: horizontal;
+    spacing: 8;
+    margin-start: 8;
+    margin-end: 8;
+    margin-top: 8;
+    margin-bottom: 8;
+
+    Gtk.Entry input_entry {
+      placeholder-text: "Send a message…";
+      hexpand: true;
+    }
+
+    Gtk.Button send_button {
+      icon-name: "go-up-symbolic";
+      styles ["circular", "suggested-action"]
+    }
+  }
+}

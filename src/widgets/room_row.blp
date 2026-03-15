@@ -1,0 +1,28 @@
+using Gtk 4.0;
+
+template $MxRoomRow : Gtk.Box {
+  orientation: horizontal;
+  spacing: 8;
+  margin-top: 6;
+  margin-bottom: 6;
+  margin-start: 6;
+  margin-end: 6;
+
+  Gtk.Image kind_icon {
+    icon-name: "chat-message-new-symbolic";
+    pixel-size: 20;
+  }
+
+  Gtk.Label name_label {
+    halign: start;
+    hexpand: true;
+    ellipsize: end;
+  }
+
+  Gtk.Image lock_icon {
+    icon-name: "channel-secure-symbolic";
+    pixel-size: 16;
+    visible: false;
+    styles ["dim-label"]
+  }
+}

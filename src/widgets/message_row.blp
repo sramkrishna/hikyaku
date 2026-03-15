@@ -1,0 +1,30 @@
+using Gtk 4.0;
+
+template $MxMessageRow : Gtk.Box {
+  orientation: horizontal;
+  spacing: 2;
+  margin-top: 4;
+  margin-bottom: 4;
+  margin-start: 12;
+  margin-end: 12;
+
+  Gtk.Box {
+    orientation: vertical;
+    spacing: 2;
+    hexpand: true;
+
+    Gtk.Label sender_label {
+      halign: start;
+      styles ["caption-heading"]
+    }
+
+    Gtk.Label body_label {
+      halign: start;
+      wrap: true;
+      wrap-mode: word_char;
+      xalign: 0;
+      selectable: true;
+      hexpand: true;
+    }
+  }
+}

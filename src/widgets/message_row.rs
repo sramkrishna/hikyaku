@@ -3,29 +3,15 @@
 mod imp {
     use gtk::glib;
     use gtk::subclass::prelude::*;
-    use adw::prelude::*;
+    use gtk::CompositeTemplate;
 
+    #[derive(CompositeTemplate, Default)]
+    #[template(file = "src/widgets/message_row.blp")]
     pub struct MessageRow {
-        pub sender_label: gtk::Label,
-        pub body_label: gtk::Label,
-    }
-
-    impl Default for MessageRow {
-        fn default() -> Self {
-            Self {
-                sender_label: gtk::Label::builder()
-                    .halign(gtk::Align::Start)
-                    .css_classes(["caption-heading"])
-                    .build(),
-                body_label: gtk::Label::builder()
-                    .halign(gtk::Align::Start)
-                    .wrap(true)
-                    .wrap_mode(gtk::pango::WrapMode::WordChar)
-                    .xalign(0.0)
-                    .selectable(true)
-                    .build(),
-            }
-        }
+        #[template_child]
+        pub sender_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub body_label: TemplateChild<gtk::Label>,
     }
 
     #[glib::object_subclass]
@@ -33,25 +19,17 @@ mod imp {
         const NAME: &'static str = "MxMessageRow";
         type Type = super::MessageRow;
         type ParentType = gtk::Box;
-    }
 
-    impl ObjectImpl for MessageRow {
-        fn constructed(&self) {
-            self.parent_constructed();
+        fn class_init(klass: &mut Self::Class) {
+            klass.bind_template();
+        }
 
-            let obj = self.obj();
-            obj.set_orientation(gtk::Orientation::Vertical);
-            obj.set_spacing(2);
-            obj.set_margin_top(4);
-            obj.set_margin_bottom(4);
-            obj.set_margin_start(12);
-            obj.set_margin_end(12);
-
-            obj.append(&self.sender_label);
-            obj.append(&self.body_label);
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
         }
     }
 
+    impl ObjectImpl for MessageRow {}
     impl WidgetImpl for MessageRow {}
     impl BoxImpl for MessageRow {}
 }

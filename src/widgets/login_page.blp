@@ -1,0 +1,55 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $MxLoginPage : Gtk.Box {
+  orientation: vertical;
+  spacing: 0;
+  valign: center;
+  halign: center;
+  width-request: 320;
+  margin-start: 24;
+  margin-end: 24;
+
+  Gtk.Label {
+    label: "Matx";
+    margin-bottom: 8;
+    styles ["title-1"]
+  }
+
+  Gtk.Label {
+    label: "Sign in to Matrix";
+    margin-bottom: 24;
+    styles ["dim-label"]
+  }
+
+  Adw.PreferencesGroup {
+    Adw.EntryRow homeserver_row {
+      title: "Homeserver";
+      text: "matrix.org";
+    }
+
+    Adw.EntryRow username_row {
+      title: "Username";
+    }
+
+    Adw.PasswordEntryRow password_row {
+      title: "Password";
+      activates-default: true;
+    }
+  }
+
+  Gtk.Box {
+    orientation: vertical;
+    spacing: 8;
+    margin-top: 24;
+    halign: center;
+
+    Gtk.Button login_button {
+      label: "Log in";
+      styles ["suggested-action", "pill"]
+    }
+
+    Gtk.Spinner login_spinner {
+    }
+  }
+}
