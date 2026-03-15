@@ -9,14 +9,14 @@ pub const APP_NAME: &str = "Matx";
 ///
 /// All fields have sensible defaults so the file is optional — Matx works
 /// out of the box. Users can create/edit the file to tune behaviour.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub rooms: RoomSettings,
     pub sync: SyncSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoomSettings {
     /// Maximum number of DMs to show in the sidebar.
@@ -27,7 +27,7 @@ pub struct RoomSettings {
     pub pinned_rooms: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncSettings {
     /// Number of timeline events per room during sync.
@@ -110,4 +110,67 @@ pub fn save_settings(settings: &Settings) -> Result<(), Box<dyn std::error::Erro
     std::fs::write(&path, toml_str)?;
     tracing::info!("Settings saved to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_settings() {
+        let s = Settings::default();
+        assert_eq!(s.rooms.max_dms, 50);
+        assert_eq!(s.rooms.max_rooms, 100);
+        assert!(s.rooms.pinned_rooms.is_empty());
+        assert_eq!(s.sync.timeline_limit, 1);
+        assert_eq!(s.sync.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_toml_round_trip() {
+        let original = Settings {
+            rooms: RoomSettings {
+                max_dms: 25,
+                max_rooms: 200,
+                pinned_rooms: vec!["!room1:matrix.org".into(), "!room2:matrix.org".into()],
+            },
+            sync: SyncSettings {
+                timeline_limit: 10,
+                timeout_secs: 120,
+            },
+        };
+        let toml_str = toml::to_string_pretty(&original).unwrap();
+        let parsed: Settings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_partial_toml_uses_defaults() {
+        let toml_str = "[rooms]\nmax_dms = 10\n";
+        let s: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(s.rooms.max_dms, 10);
+        // Unspecified fields should use defaults.
+        assert_eq!(s.rooms.max_rooms, 100);
+        assert_eq!(s.sync.timeline_limit, 1);
+        assert_eq!(s.sync.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_empty_toml_uses_all_defaults() {
+        let s: Settings = toml::from_str("").unwrap();
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn test_malformed_toml_errors() {
+        let result = toml::from_str::<Settings>("not valid toml {{{{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extra_keys_ignored() {
+        let toml_str = "[rooms]\nmax_dms = 30\nfuture_setting = true\n";
+        let s: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(s.rooms.max_dms, 30);
+    }
 }

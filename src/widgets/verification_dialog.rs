@@ -1,12 +1,60 @@
 // VerificationDialog — shows the SAS emoji verification flow.
 //
-// Displays 7 emojis for the user to compare with their other device,
-// with Confirm and Cancel buttons.
+// Displays a waiting dialog after clicking Verify, then transitions
+// to showing 7 emojis for the user to compare with their other device.
 
 use adw::prelude::*;
 use gtk::glib;
 use async_channel::Sender;
 use crate::matrix::MatrixCommand;
+
+/// Show a "waiting for other device" dialog after the user clicks Verify.
+/// Returns the dialog so we can dismiss it when emojis arrive.
+pub fn show_waiting_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    _command_tx: Sender<MatrixCommand>,
+) -> adw::AlertDialog {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(16)
+        .margin_bottom(16)
+        .halign(gtk::Align::Center)
+        .build();
+
+    let spinner = gtk::Spinner::builder()
+        .spinning(true)
+        .width_request(32)
+        .height_request(32)
+        .halign(gtk::Align::Center)
+        .build();
+
+    let label = gtk::Label::builder()
+        .label("Open your other Matrix client (e.g. Element) and accept the verification request.")
+        .wrap(true)
+        .halign(gtk::Align::Center)
+        .build();
+
+    content.append(&spinner);
+    content.append(&label);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Waiting for Other Device")
+        .extra_child(&content)
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
+
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "cancel" {
+            tracing::info!("User cancelled verification wait");
+        }
+    });
+
+    dialog.present(Some(parent));
+    dialog
+}
 
 /// Show a dialog asking the user to accept an incoming verification request.
 pub fn show_verification_request(

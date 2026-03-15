@@ -96,3 +96,8 @@ impl RoomObject {
             .build()
     }
 }
+
+// GObject model tests require GTK main-thread initialization which
+// doesn't work reliably in the Rust test harness. The GObject property
+// layer is tested implicitly by the room_list_view grouping tests and
+// by running the app.

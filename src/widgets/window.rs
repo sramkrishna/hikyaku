@@ -31,6 +31,9 @@ mod imp {
         pub current_room_id: RefCell<Option<String>>,
         /// The content navigation page — title is updated to the selected room name.
         pub content_page: OnceCell<adw::NavigationPage>,
+        /// The currently open waiting/emoji verification dialog, so we can
+        /// dismiss it when the next state arrives.
+        pub verify_dialog: RefCell<Option<adw::AlertDialog>>,
     }
 
     impl Default for MxWindow {
@@ -53,6 +56,7 @@ mod imp {
                 verify_banner,
                 current_room_id: RefCell::new(None),
                 content_page: OnceCell::new(),
+                verify_dialog: RefCell::new(None),
             }
         }
     }
@@ -265,6 +269,10 @@ impl MxWindow {
                         );
                     }
                     MatrixEvent::VerificationEmojis { flow_id, emojis } => {
+                        // Dismiss the waiting dialog if open.
+                        if let Some(dialog) = window.imp().verify_dialog.take() {
+                            dialog.force_close();
+                        }
                         let pairs: Vec<(String, String)> = emojis
                             .into_iter()
                             .map(|e| (e.symbol, e.description))
@@ -275,10 +283,18 @@ impl MxWindow {
                         );
                     }
                     MatrixEvent::VerificationDone { .. } => {
+                        if let Some(dialog) = window.imp().verify_dialog.take() {
+                            dialog.force_close();
+                        }
                         window.imp().verify_banner.set_revealed(false);
                         toast_overlay.add_toast(adw::Toast::new("Device verified successfully!"));
                     }
                     MatrixEvent::VerificationCancelled { reason, .. } => {
+                        if let Some(dialog) = window.imp().verify_dialog.take() {
+                            dialog.force_close();
+                        }
+                        // Re-show the banner so user can try again.
+                        window.imp().verify_banner.set_revealed(true);
                         toast_overlay.add_toast(adw::Toast::new(
                             &format!("Verification cancelled: {reason}"),
                         ));
@@ -343,26 +359,41 @@ impl MxWindow {
         let split_view = adw::NavigationSplitView::new();
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));
-
-        // Banner + split view in a vertical box.
-        let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        main_box.append(&imp.verify_banner);
-        main_box.append(&split_view);
+        split_view.set_min_sidebar_width(200.0);
+        split_view.set_max_sidebar_width(300.0);
+        split_view.set_sidebar_width_fraction(0.25);
 
         // Wire up the banner's Verify button.
         let tx = imp.command_tx.get().unwrap().clone();
         let banner = imp.verify_banner.clone();
+        let window_weak = self.downgrade();
         imp.verify_banner.connect_button_clicked(move |_| {
-            banner.set_revealed(false);
-            let tx = tx.clone();
-            glib::spawn_future_local(async move {
-                let _ = tx
-                    .send(MatrixCommand::RequestSelfVerification)
-                    .await;
-            });
+            // Guard: don't start a second verification if one is already in progress.
+            if let Some(window) = window_weak.upgrade() {
+                if window.imp().verify_dialog.borrow().is_some() {
+                    return;
+                }
+                banner.set_revealed(false);
+                let tx = tx.clone();
+                let dialog = crate::widgets::verification_dialog::show_waiting_dialog(
+                    &window, tx.clone(),
+                );
+                window.imp().verify_dialog.replace(Some(dialog));
+                glib::spawn_future_local(async move {
+                    let _ = tx
+                        .send(MatrixCommand::RequestSelfVerification)
+                        .await;
+                });
+            }
         });
 
-        imp.toast_overlay.set_child(Some(&main_box));
+        // Use a ToolbarView to place the banner above the split view,
+        // spanning the full window width.
+        let main_toolbar = adw::ToolbarView::new();
+        main_toolbar.add_top_bar(&imp.verify_banner);
+        main_toolbar.set_content(Some(&split_view));
+
+        imp.toast_overlay.set_child(Some(&main_toolbar));
     }
 
     fn setup_actions(&self) {
@@ -382,7 +413,14 @@ impl MxWindow {
 
         let verify_action = ActionEntryBuilder::new("verify")
             .activate(|window: &Self, _, _| {
+                if window.imp().verify_dialog.borrow().is_some() {
+                    return;
+                }
                 let tx = window.imp().command_tx.get().unwrap().clone();
+                let dialog = crate::widgets::verification_dialog::show_waiting_dialog(
+                    window, tx.clone(),
+                );
+                window.imp().verify_dialog.replace(Some(dialog));
                 glib::spawn_future_local(async move {
                     let _ = tx
                         .send(MatrixCommand::RequestSelfVerification)

@@ -202,9 +202,12 @@ async fn watch_sas_state(
                 vs.sas_sessions.remove(flow_id);
                 break;
             }
-            _ => {}
+            other => {
+                tracing::info!("SAS {flow_id} state: {other:?}");
+            }
         }
     }
+    tracing::warn!("SAS {flow_id} watch stream ended");
 }
 
 /// Confirm that the emojis match.
@@ -219,7 +222,7 @@ pub async fn confirm_verification(state: &SharedVerificationState, flow_id: &str
             tracing::error!("Failed to confirm verification: {e}");
         }
     } else {
-        tracing::error!("No SAS session found for flow_id: {flow_id}");
+        tracing::info!("No SAS session for flow_id: {flow_id} (likely already completed)");
     }
 }
 
@@ -353,7 +356,10 @@ async fn watch_request_state(
                     .await;
                 return;
             }
-            _ => {}
+            other => {
+                tracing::info!("Verification request {flow_id} unexpected state: {other:?}");
+            }
         }
     }
+    tracing::warn!("Verification request {flow_id} watch stream ended");
 }

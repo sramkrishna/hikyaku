@@ -456,25 +456,33 @@ async fn setup_encryption(client: &Client, event_tx: &Sender<MatrixEvent>) {
         tracing::info!("Key backup already enabled");
     }
 
-    // Check if our device is verified. If not, prompt the user.
+    // Check if our identity is verified by another device. The device
+    // that bootstraps cross-signing auto-trusts itself, but that doesn't
+    // mean we've actually done interactive verification with another
+    // session. Without that, we can't decrypt messages from other devices.
     let user_id = client.user_id().expect("must be logged in");
-    let device_id = client.device_id().expect("must be logged in");
-    match enc.get_device(user_id, device_id).await {
-        Ok(Some(device)) => {
-            if device.is_verified() {
-                tracing::info!("This device is verified");
-            } else {
-                tracing::info!("This device is NOT verified — prompting user");
-                let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;
-            }
+    let is_verified = match enc.get_user_identity(user_id).await {
+        Ok(Some(identity)) => {
+            // For our own identity, check if it's verified — this is
+            // only true if another device has confirmed us via SAS or
+            // we've restored from a recovery key/passphrase.
+            let verified = identity.is_verified();
+            tracing::info!("Own identity verified: {verified}");
+            verified
         }
         Ok(None) => {
-            tracing::warn!("Could not find own device");
-            let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;
+            tracing::warn!("No identity found for own user");
+            false
         }
         Err(e) => {
-            tracing::warn!("Failed to check device verification: {e}");
+            tracing::warn!("Failed to check identity verification: {e}");
+            false
         }
+    };
+
+    if !is_verified {
+        tracing::info!("Device not cross-verified — prompting user");
+        let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;
     }
 }
 

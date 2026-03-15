@@ -47,3 +47,6 @@ impl MessageObject {
             .build()
     }
 }
+
+// GObject model tests require GTK main-thread initialization which
+// doesn't work reliably in the Rust test harness.
