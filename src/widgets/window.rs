@@ -287,7 +287,11 @@ impl MxWindow {
                             dialog.force_close();
                         }
                         window.imp().verify_banner.set_revealed(false);
-                        toast_overlay.add_toast(adw::Toast::new("Device verified successfully!"));
+                        let toast = adw::Toast::builder()
+                            .title("Device verified! Use menu → Recover Encryption Keys to decrypt old messages.")
+                            .timeout(8)
+                            .build();
+                        toast_overlay.add_toast(toast);
                     }
                     MatrixEvent::VerificationCancelled { reason, .. } => {
                         if let Some(dialog) = window.imp().verify_dialog.take() {
@@ -301,6 +305,16 @@ impl MxWindow {
                     }
                     MatrixEvent::DeviceUnverified => {
                         window.imp().verify_banner.set_revealed(true);
+                    }
+                    MatrixEvent::RecoveryComplete => {
+                        toast_overlay.add_toast(adw::Toast::new(
+                            "Encryption keys recovered! Re-select a room to decrypt messages.",
+                        ));
+                    }
+                    MatrixEvent::RecoveryFailed { error } => {
+                        toast_overlay.add_toast(adw::Toast::new(
+                            &format!("Key recovery failed: {error}"),
+                        ));
                     }
                 }
             }
@@ -325,6 +339,7 @@ impl MxWindow {
         let menu = gio::Menu::new();
         let main_section = gio::Menu::new();
         main_section.append(Some("_Verify Device"), Some("win.verify"));
+        main_section.append(Some("_Recover Encryption Keys"), Some("win.recover-keys"));
         main_section.append(Some("_Preferences"), Some("win.preferences"));
         menu.append_section(None, &main_section);
         let about_section = gio::Menu::new();
@@ -429,7 +444,14 @@ impl MxWindow {
             })
             .build();
 
-        self.add_action_entries([about_action, preferences_action, verify_action]);
+        let recover_action = ActionEntryBuilder::new("recover-keys")
+            .activate(|window: &Self, _, _| {
+                let tx = window.imp().command_tx.get().unwrap().clone();
+                crate::widgets::verification_dialog::show_recovery_key_dialog(window, tx);
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action, verify_action, recover_action]);
     }
 
     fn show_about_dialog(&self) {

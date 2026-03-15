@@ -102,6 +102,10 @@ pub enum MatrixEvent {
     DeviceUnverified,
     /// Verification was cancelled.
     VerificationCancelled { flow_id: String, reason: String },
+    /// Recovery key import succeeded.
+    RecoveryComplete,
+    /// Recovery key import failed.
+    RecoveryFailed { error: String },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.
@@ -132,6 +136,8 @@ pub enum MatrixCommand {
         room_id: String,
         from_token: String,
     },
+    /// Import secrets using a recovery key or passphrase.
+    RecoverKeys { recovery_key: String },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -321,6 +327,9 @@ async fn matrix_task(
                     Ok(MatrixCommand::FetchOlderMessages { room_id, from_token }) => {
                         handle_fetch_older(&client, &event_tx, &room_id, &from_token).await;
                     }
+                    Ok(MatrixCommand::RecoverKeys { recovery_key }) => {
+                        handle_recover_keys(&client, &event_tx, &recovery_key).await;
+                    }
                     Err(_) => break,
                 }
             }
@@ -440,20 +449,41 @@ async fn setup_encryption(client: &Client, event_tx: &Sender<MatrixEvent>) {
         }
     }
 
-    // Enable key backup if not already enabled, so room keys are
-    // uploaded and available for restore on other devices.
+    // Enable key backup so room keys are uploaded and available for
+    // restore on other devices. If a backup already exists, try to
+    // download room keys from it so we can decrypt old messages.
     let backups = enc.backups();
-    if !backups.are_enabled().await {
-        if backups.exists_on_server().await.unwrap_or(false) {
-            tracing::info!("Key backup exists on server, recovery needed to access keys");
-        } else {
-            match backups.create().await {
-                Ok(()) => tracing::info!("Key backup created"),
-                Err(e) => tracing::warn!("Failed to create key backup: {e}"),
-            }
+    if backups.are_enabled().await {
+        tracing::info!("Key backup already enabled");
+    } else if backups.exists_on_server().await.unwrap_or(false) {
+        tracing::info!("Key backup exists on server, attempting to download keys");
+        // The SDK can access the backup after verification because it
+        // has the backup decryption key via cross-signing secrets.
+        match backups.create().await {
+            Ok(()) => tracing::info!("Connected to existing key backup"),
+            Err(e) => tracing::warn!("Failed to connect to key backup: {e}"),
         }
     } else {
-        tracing::info!("Key backup already enabled");
+        match backups.create().await {
+            Ok(()) => tracing::info!("Key backup created"),
+            Err(e) => tracing::warn!("Failed to create key backup: {e}"),
+        }
+    }
+
+    // Try to recover room keys using the recovery module. This uses
+    // the secret storage (4S) to get the backup decryption key, which
+    // is available after cross-signing verification.
+    let recovery = enc.recovery();
+    match recovery.state() {
+        matrix_sdk::encryption::recovery::RecoveryState::Enabled => {
+            tracing::info!("Recovery is enabled, room keys should be available");
+        }
+        matrix_sdk::encryption::recovery::RecoveryState::Incomplete => {
+            tracing::info!("Recovery is incomplete — some secrets missing");
+        }
+        state => {
+            tracing::info!("Recovery state: {state:?}");
+        }
     }
 
     // Check if our identity is verified by another device. The device
@@ -880,6 +910,17 @@ async fn handle_select_room(client: &Client, event_tx: &Sender<MatrixEvent>, roo
         return;
     };
 
+    // If the room is encrypted, try to download room keys from backup
+    // so we can decrypt messages. This is a no-op if keys are already
+    // available or if backup isn't set up.
+    if room.is_encrypted().await.unwrap_or(false) {
+        let backups = client.encryption().backups();
+        match backups.download_room_keys_for_room(&room_id).await {
+            Ok(()) => tracing::debug!("Downloaded room keys for {room_id}"),
+            Err(e) => tracing::debug!("Could not download room keys for {room_id}: {e}"),
+        }
+    }
+
     tracing::debug!("Fetching messages for {room_id}");
 
     let mut options = matrix_sdk::room::MessagesOptions::backward();
@@ -966,5 +1007,27 @@ async fn handle_send_message(client: &Client, room_id: &str, body: &str) {
     let content = RoomMessageEventContent::text_plain(body);
     if let Err(e) = room.send(content).await {
         tracing::error!("Failed to send message to {room_id}: {e}");
+    }
+}
+
+/// Import secrets from server-side secret storage using a recovery key/passphrase.
+/// This gives us access to the backup decryption key, enabling room key download.
+async fn handle_recover_keys(client: &Client, event_tx: &Sender<MatrixEvent>, recovery_key: &str) {
+    let recovery = client.encryption().recovery();
+
+    tracing::info!("Attempting key recovery...");
+    match recovery.recover(recovery_key).await {
+        Ok(()) => {
+            tracing::info!("Recovery successful! Room keys should now be available.");
+            let _ = event_tx.send(MatrixEvent::RecoveryComplete).await;
+        }
+        Err(e) => {
+            tracing::error!("Recovery failed: {e}");
+            let _ = event_tx
+                .send(MatrixEvent::RecoveryFailed {
+                    error: e.to_string(),
+                })
+                .await;
+        }
     }
 }

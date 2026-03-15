@@ -56,6 +56,59 @@ pub fn show_waiting_dialog(
     dialog
 }
 
+/// Show a dialog to enter a recovery key or passphrase for decrypting old messages.
+pub fn show_recovery_key_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    command_tx: Sender<MatrixCommand>,
+) {
+    let entry = gtk::PasswordEntry::builder()
+        .placeholder_text("Recovery key or passphrase")
+        .show_peek_icon(true)
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(8)
+        .build();
+
+    let label = gtk::Label::builder()
+        .label("Enter your recovery key or passphrase to decrypt old messages. You can find this in your other Matrix client's security settings.")
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+
+    content.append(&label);
+    content.append(&entry);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Recover Encryption Keys")
+        .extra_child(&content)
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("recover", "Recover");
+    dialog.set_response_appearance("recover", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("recover"));
+
+    let tx = command_tx.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "recover" {
+            let key = entry.text().to_string();
+            if !key.is_empty() {
+                let tx = tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx
+                        .send(MatrixCommand::RecoverKeys { recovery_key: key })
+                        .await;
+                });
+            }
+        }
+    });
+
+    dialog.present(Some(parent));
+}
+
 /// Show a dialog asking the user to accept an incoming verification request.
 pub fn show_verification_request(
     parent: &impl IsA<gtk::Widget>,
