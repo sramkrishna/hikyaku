@@ -87,6 +87,10 @@ mod imp {
         pub on_browse_rooms: RefCell<Option<Box<dyn Fn()>>>,
         /// Cached room data for filtering space children.
         pub cached_rooms: RefCell<Vec<crate::matrix::RoomInfo>>,
+        /// Pre-indexed space children: space_name → Vec<index into cached_rooms>.
+        pub space_children_index: RefCell<std::collections::HashMap<String, Vec<usize>>>,
+        /// room_id → RoomObject for O(1) badge updates.
+        pub room_obj_map: RefCell<std::collections::HashMap<String, crate::models::RoomObject>>,
     }
 
     impl Default for RoomListView {
@@ -214,6 +218,8 @@ mod imp {
                 join_room_btn: room_join_banner,
                 on_browse_rooms: RefCell::new(None),
                 cached_rooms: RefCell::new(Vec::new()),
+                space_children_index: RefCell::new(std::collections::HashMap::new()),
+                room_obj_map: RefCell::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -352,51 +358,58 @@ impl RoomListView {
     }
 
     /// Clear unread/highlight badges for a room immediately in the UI.
+    /// O(1) lookup via room_obj_map.
     pub fn clear_unread(&self, room_id: &str) {
-        use gtk::prelude::*;
         let imp = self.imp();
-        let stores = [&imp.dm_store, &imp.room_store, &imp.space_store, &imp.space_child_store];
-        for store in stores {
-            let n = gio::prelude::ListModelExt::n_items(store);
-            for i in 0..n {
-                let Some(obj) = gio::prelude::ListModelExt::item(store, i) else { continue };
-                let Some(room_obj) = obj.downcast_ref::<crate::models::RoomObject>() else { continue };
-                if room_obj.room_id() == room_id {
-                    room_obj.set_unread_count(0);
-                    room_obj.set_highlight_count(0);
-                    // Notify the list that the item changed so the row re-binds.
-                    gio::prelude::ListModelExt::items_changed(store, i, 1, 1);
-                    return;
-                }
-            }
+        let map = imp.room_obj_map.borrow();
+        if let Some(obj) = map.get(room_id) {
+            obj.set_unread_count(0);
+            obj.set_highlight_count(0);
         }
     }
 
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
         let imp = self.imp();
 
-        // Cache room data for space drill-down.
+        // Cache room data for space drill-down + build index.
         imp.cached_rooms.replace(rooms.to_vec());
+        {
+            let mut idx: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, r) in rooms.iter().enumerate() {
+                if let Some(ref space) = r.parent_space {
+                    idx.entry(space.clone()).or_default().push(i);
+                }
+            }
+            imp.space_children_index.replace(idx);
+        }
 
         imp.dm_store.remove_all();
         imp.room_store.remove_all();
         imp.space_store.remove_all();
 
+        let mut obj_map = std::collections::HashMap::new();
+        let mut add_room = |store: &gio::ListStore, r: &RoomInfo| {
+            let obj = Self::room_to_obj(r);
+            obj_map.insert(r.room_id.clone(), obj.clone());
+            store.append(&obj);
+        };
+
         let (dms, _by_space, ungrouped, cleanup) = group_and_sort_rooms(rooms);
 
         // Messages tab — DMs only, flat list.
         for r in &dms {
-            imp.dm_store.append(&Self::room_to_obj(r));
+            add_room(&imp.dm_store, r);
         }
 
         // Rooms tab — only ungrouped rooms (no space-child rooms).
         for r in &ungrouped {
-            imp.room_store.append(&Self::room_to_obj(r));
+            add_room(&imp.room_store, r);
         }
         if !cleanup.is_empty() {
             imp.room_store.append(&RoomObject::new_header("Suggested Cleanup"));
             for r in &cleanup {
-                imp.room_store.append(&Self::room_to_obj(r));
+                add_room(&imp.room_store, r);
             }
         }
 
@@ -425,8 +438,10 @@ impl RoomListView {
             b_ts.cmp(&a_ts)
         });
         for r in &spaces {
-            imp.space_store.append(&Self::room_to_obj(r));
+            add_room(&imp.space_store, r);
         }
+
+        imp.room_obj_map.replace(obj_map);
     }
 
     /// Drill into a space: show its child rooms in the space child view.
@@ -436,12 +451,12 @@ impl RoomListView {
         imp.space_child_title.set_label(space_name);
 
         let rooms = imp.cached_rooms.borrow();
-        let mut children: Vec<&RoomInfo> = rooms
-            .iter()
-            .filter(|r| {
-                r.parent_space.as_deref() == Some(space_name)
-            })
-            .collect();
+        let index = imp.space_children_index.borrow();
+        // O(1) lookup by space name instead of O(n) filter.
+        let mut children: Vec<&RoomInfo> = index
+            .get(space_name)
+            .map(|indices| indices.iter().filter_map(|&i| rooms.get(i)).collect())
+            .unwrap_or_default();
 
         children.sort_by(|a, b| {
             b.is_pinned

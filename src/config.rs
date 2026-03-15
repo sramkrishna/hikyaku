@@ -25,7 +25,7 @@ pub struct RoomSettings {
     /// Maximum number of rooms (non-DM) to show in the sidebar.
     pub max_rooms: usize,
     /// Room IDs that are pinned (e.g. friend DMs you always want visible).
-    pub pinned_rooms: Vec<String>,
+    pub pinned_rooms: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ impl Default for RoomSettings {
         Self {
             max_dms: 50,
             max_rooms: 100,
-            pinned_rooms: Vec::new(),
+            pinned_rooms: std::collections::HashSet::new(),
         }
     }
 }
@@ -152,7 +152,7 @@ mod tests {
             rooms: RoomSettings {
                 max_dms: 25,
                 max_rooms: 200,
-                pinned_rooms: vec!["!room1:matrix.org".into(), "!room2:matrix.org".into()],
+                pinned_rooms: ["!room1:matrix.org".to_string(), "!room2:matrix.org".to_string()].into(),
             },
             sync: SyncSettings {
                 timeline_limit: 10,

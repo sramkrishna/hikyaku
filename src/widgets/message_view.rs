@@ -50,8 +50,9 @@ mod imp {
         pub fetching_older: Cell<bool>,
         /// Names to highlight in message bodies (user's own name + friends).
         pub highlight_names: RefCell<Vec<String>>,
-        /// Room members for nick completion: (user_id, display_name).
-        pub room_members: RefCell<Vec<(String, String)>>,
+        /// Room members for nick completion: (lowercase_name, display_name, user_id).
+        /// Sorted by lowercase_name for binary search prefix matching.
+        pub room_members: RefCell<Vec<(String, String, String)>>,
         /// Nick completion popover.
         pub nick_popover: gtk::Popover,
         pub nick_list: gtk::ListBox,
@@ -320,9 +321,12 @@ mod imp {
                 let text_after = text[cursor.min(text.len())..].to_string();
                 let prefix_lower = prefix.to_lowercase();
                 let members = imp.room_members.borrow();
-                let matches: Vec<&(String, String)> = members
+                // Binary search to find the start of matching prefix, then
+                // collect consecutive matches. O(log n + k) where k = matches.
+                let start = members.partition_point(|(lower, _, _)| lower.as_str() < prefix_lower.as_str());
+                let matches: Vec<&(String, String, String)> = members[start..]
                     .iter()
-                    .filter(|(_, name)| name.to_lowercase().starts_with(&prefix_lower))
+                    .take_while(|(lower, _, _)| lower.starts_with(&prefix_lower))
                     .take(10)
                     .collect();
 
@@ -345,7 +349,7 @@ mod imp {
                 while let Some(row) = imp.nick_list.first_child() {
                     imp.nick_list.remove(&row);
                 }
-                for (_, name) in &matches {
+                for (_, name, _) in &matches {
                     let label = gtk::Label::builder()
                         .label(name.as_str())
                         .halign(gtk::Align::Start)
@@ -534,8 +538,14 @@ impl MessageView {
         imp.info_banner.set_visible(show_banner);
         imp.info_separator.set_visible(show_banner);
 
-        // Store members for nick completion.
-        imp.room_members.replace(meta.members.clone());
+        // Store members for nick completion, sorted by lowercase name
+        // for O(log n) binary search prefix matching.
+        let mut members: Vec<(String, String, String)> = meta.members
+            .iter()
+            .map(|(uid, name)| (name.to_lowercase(), name.clone(), uid.clone()))
+            .collect();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        imp.room_members.replace(members);
     }
 
     /// Append a single new message (used for live updates).
