@@ -383,6 +383,34 @@ impl RoomListView {
         }
     }
 
+    /// Increment unread count for a room (when a message arrives for a
+    /// room we're not viewing). O(1) via room_obj_map.
+    pub fn increment_unread(&self, room_id: &str, is_highlight: bool) {
+        let imp = self.imp();
+        let map = imp.room_obj_map.borrow();
+        if let Some(obj) = map.get(room_id) {
+            obj.set_unread_count(obj.unread_count() + 1);
+            if is_highlight {
+                obj.set_highlight_count(obj.highlight_count() + 1);
+            }
+            // Notify the stores that this item changed to trigger row rebind.
+            use gtk::prelude::*;
+            for store in [&imp.dm_store, &imp.room_store, &imp.fav_store, &imp.space_child_store] {
+                let n = gio::prelude::ListModelExt::n_items(store);
+                for i in 0..n {
+                    if let Some(item) = gio::prelude::ListModelExt::item(store, i) {
+                        if let Ok(room_obj) = item.downcast::<crate::models::RoomObject>() {
+                            if room_obj.room_id() == room_id {
+                                gio::prelude::ListModelExt::items_changed(store, i, 1, 1);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
         let imp = self.imp();
 

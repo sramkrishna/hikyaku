@@ -633,8 +633,14 @@ impl MxWindow {
                         let my_id = window.imp().user_id.borrow().clone();
                         // Skip our own messages — already shown as local echo.
                         let is_self = sender_id == my_id;
-                        if current.as_deref() == Some(&room_id) && !is_self {
+                        let is_current_room = current.as_deref() == Some(&room_id);
+                        if is_current_room && !is_self {
                             message_view.append_message(&message);
+                        }
+
+                        // Update unread badge on rooms we're NOT viewing.
+                        if !is_current_room && !is_self {
+                            room_list_view.increment_unread(&room_id, is_mention);
                         }
 
                         // In-app toast + desktop notification for mentions and DMs.
