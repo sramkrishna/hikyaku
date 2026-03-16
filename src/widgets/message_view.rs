@@ -649,8 +649,23 @@ impl MessageView {
         }
     }
 
-    /// Toggle an emoji reaction on a message.
-    pub fn toggle_reaction(&self, event_id: &str, emoji: &str) {
+    /// Add an emoji reaction to a message (increment count).
+    pub fn add_reaction(&self, event_id: &str, emoji: &str) {
+        let emoji = emoji.to_string();
+        self.update_message_in_place(event_id, |msg| {
+            let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
+                .unwrap_or_default();
+            if let Some(entry) = reactions.iter_mut().find(|(e, _)| *e == emoji) {
+                entry.1 += 1;
+            } else {
+                reactions.push((emoji.clone(), 1));
+            }
+            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+        });
+    }
+
+    /// Remove an emoji reaction from a message (decrement count).
+    pub fn remove_reaction(&self, event_id: &str, emoji: &str) {
         let emoji = emoji.to_string();
         self.update_message_in_place(event_id, |msg| {
             let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
@@ -661,8 +676,6 @@ impl MessageView {
                 } else {
                     reactions[pos].1 -= 1;
                 }
-            } else {
-                reactions.push((emoji.clone(), 1));
             }
             msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });

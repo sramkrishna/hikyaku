@@ -434,8 +434,9 @@ impl MxWindow {
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
-                // Show reaction immediately in the UI.
-                msg_view_react.toggle_reaction(&event_id, &emoji);
+                // Show reaction immediately — always add locally.
+                // The server handles dedup/removal. Next sync corrects count.
+                msg_view_react.add_reaction(&event_id, &emoji);
 
                 let tx = cmd_tx_react.clone();
                 glib::spawn_future_local(async move {

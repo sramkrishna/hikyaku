@@ -1362,6 +1362,9 @@ async fn start_sync(
                     let local = user_id.localpart();
                     let text_mention = body.contains(uid)
                         || body.to_lowercase().contains(&local.to_lowercase());
+                    if text_mention {
+                        tracing::warn!("Text mention detected for {local}");
+                    }
 
                     // Check if this is a reply to our message.
                     let is_reply_to_us = if let Some(ref relates_to) = event.content.relates_to {
@@ -1401,6 +1404,9 @@ async fn start_sync(
                         false
                     };
 
+                    if is_reply_to_us {
+                        tracing::warn!("Reply-to-us detected!");
+                    }
                     text_mention || is_reply_to_us
                 } else {
                     false
