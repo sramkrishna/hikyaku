@@ -194,6 +194,32 @@ mod imp {
                 }
             });
 
+            // Reaction pill click — toggle via gesture on the reactions box.
+            let event_id = self.event_id.clone();
+            let on_react = self.on_react.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.connect_released(move |gesture, _, x, y| {
+                let Some(widget) = gesture.widget() else { return };
+                if let Some(child) = widget.pick(x, y, gtk::PickFlags::DEFAULT) {
+                    // Walk up to find a Label (the reaction pill).
+                    let mut w: Option<gtk::Widget> = Some(child);
+                    while let Some(ref current) = w {
+                        if let Ok(label) = current.clone().downcast::<gtk::Label>() {
+                            let text = label.text().to_string();
+                            let emoji = text.split_whitespace().next()
+                                .unwrap_or(&text).to_string();
+                            let eid = event_id.borrow().clone();
+                            if let Some(ref cb) = *on_react.borrow() {
+                                cb(eid, emoji);
+                            }
+                            break;
+                        }
+                        w = current.parent();
+                    }
+                }
+            });
+            self.reactions_box.add_controller(gesture);
+
             // Media button hover — download and show preview.
             let media_url = self.media_url.clone();
             let media_filename = self.media_filename.clone();
@@ -454,8 +480,9 @@ impl MessageRow {
             }
         }
 
-        // Reactions.
-        // Clear old reactions.
+        // Reactions — use Labels instead of Buttons to avoid closure
+        // reference cycles that cause double-free on rebind. Click handling
+        // is done via a GestureClick on the reactions_box itself.
         while let Some(child) = imp.reactions_box.first_child() {
             imp.reactions_box.remove(&child);
         }
@@ -467,22 +494,10 @@ impl MessageRow {
                     } else {
                         emoji.clone()
                     };
-                    let pill = gtk::Button::builder()
+                    let pill = gtk::Label::builder()
                         .label(&label)
-                        .css_classes(["reaction-pill", "flat"])
+                        .css_classes(["reaction-pill"])
                         .build();
-                    // Click to toggle — use the same on_react callback as
-                    // the emoji picker MenuButton.
-                    let emoji_str = emoji.clone();
-                    let event_id_rc = imp.event_id.clone();
-                    let on_react_rc = imp.on_react.clone();
-                    pill.connect_clicked(move |_| {
-                        let eid = event_id_rc.borrow().clone();
-                        tracing::warn!("Pill clicked: emoji={emoji_str} eid={eid}");
-                        if let Some(ref cb) = *on_react_rc.borrow() {
-                            cb(eid, emoji_str.clone());
-                        }
-                    });
                     imp.reactions_box.append(&pill);
                 }
                 imp.reactions_box.set_visible(true);

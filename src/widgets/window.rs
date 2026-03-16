@@ -329,11 +329,14 @@ impl MxWindow {
         let cmd_tx_delete = command_tx.clone();
         let window_weak_del = window.downgrade();
         let toast_del = imp.toast_overlay.clone();
+        let msg_view_del = imp.message_view.clone();
         imp.message_view.connect_delete(move |event_id| {
             let room_id = window_weak_del
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
+                // Remove from timeline immediately.
+                msg_view_del.remove_message(&event_id);
                 toast(&toast_del, "Message deleted");
                 let tx = cmd_tx_delete.clone();
                 glib::spawn_future_local(async move {

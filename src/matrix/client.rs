@@ -1613,17 +1613,8 @@ async fn extract_messages(
         let event = match timeline_event.raw().deserialize() {
             Ok(ev) => ev,
             Err(_) => {
-                messages.push(MessageInfo {
-                    sender: String::new(),
-                    sender_id: String::new(),
-                    body: "\u{1f512} Unable to decrypt message".to_string(),
-                    timestamp: 0,
-                    event_id: String::new(),
-                    reply_to: None,
-                    thread_root: None,
-                    reactions: Vec::new(),
-                            media: None,
-                });
+                // Skip events that can't be deserialized (redacted,
+                // unknown types, or corrupted). Don't show blank rows.
                 continue;
             }
         };

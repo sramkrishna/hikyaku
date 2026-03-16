@@ -676,6 +676,21 @@ impl MessageView {
         });
     }
 
+    /// Remove a message from the timeline (for deletes).
+    pub fn remove_message(&self, event_id: &str) {
+        if event_id.is_empty() { return; }
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        for i in 0..n {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.event_id() == event_id {
+                imp.list_store.remove(i);
+                return;
+            }
+        }
+    }
+
     /// Enter reply mode — show preview and store the target event ID.
     pub fn start_reply(&self, event_id: &str, sender: &str, body: &str) {
         let imp = self.imp();
