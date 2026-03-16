@@ -176,6 +176,31 @@ pub(crate) fn format_timestamp(ts: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Convert URLs in already-escaped markup text into clickable <a> links.
+fn linkify_urls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("http") {
+        // Check it's https:// or http://
+        let candidate = &rest[start..];
+        if !candidate.starts_with("https://") && !candidate.starts_with("http://") {
+            result.push_str(&rest[..start + 4]);
+            rest = &rest[start + 4..];
+            continue;
+        }
+        result.push_str(&rest[..start]);
+        // Find end of URL — stop at whitespace, >, or end of string.
+        let url_end = candidate
+            .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
+            .unwrap_or(candidate.len());
+        let url = &candidate[..url_end];
+        result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
+        rest = &candidate[url_end..];
+    }
+    result.push_str(rest);
+    result
+}
+
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
         @extends gtk::Box, gtk::Widget,
@@ -284,12 +309,14 @@ impl MessageRow {
             .iter()
             .any(|n| !n.is_empty() && body_lower.contains(&n.to_lowercase()));
 
-        if has_highlight {
-            // Highlight the entire row with a background.
-            self.add_css_class("mention-row");
+        // Escape markup, linkify URLs, then apply highlights.
+        let mut escaped = glib::markup_escape_text(body).to_string();
 
-            // Also bold the matched name inline.
-            let mut escaped = glib::markup_escape_text(body).to_string();
+        // Linkify URLs — find http(s):// patterns and wrap in <a> tags.
+        escaped = linkify_urls(&escaped);
+
+        if has_highlight {
+            self.add_css_class("mention-row");
             for name in highlight_names {
                 if name.is_empty() {
                     continue;
@@ -309,11 +336,10 @@ impl MessageRow {
                 result.push_str(&escaped[pos..]);
                 escaped = result;
             }
-            imp.body_label.set_markup(&escaped);
         } else {
             self.remove_css_class("mention-row");
-            imp.body_label.set_label(body);
         }
+        imp.body_label.set_markup(&escaped);
 
         if timestamp > 0 {
             imp.timestamp_label.set_label(&format_timestamp(timestamp));

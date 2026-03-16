@@ -41,6 +41,8 @@ mod imp {
         pub details_content: gtk::Box,
         /// Info button in the content header (shown only when a room is selected).
         pub info_button: OnceCell<gtk::Button>,
+        /// Bookmark toggle button.
+        pub bookmark_button: OnceCell<gtk::Button>,
     }
 
     impl Default for MxWindow {
@@ -74,6 +76,7 @@ mod imp {
                     .width_request(280)
                     .build(),
                 info_button: OnceCell::new(),
+                bookmark_button: OnceCell::new(),
             }
         }
     }
@@ -199,8 +202,11 @@ impl MxWindow {
                 if let Some(page) = window.imp().content_page.get() {
                     page.set_title(&room_name);
                 }
-                // Show the info button now that a room is selected.
+                // Show header buttons now that a room is selected.
                 if let Some(btn) = window.imp().info_button.get() {
+                    btn.set_visible(true);
+                }
+                if let Some(btn) = window.imp().bookmark_button.get() {
                     btn.set_visible(true);
                 }
                 // Hide details sidebar when switching rooms.
@@ -362,6 +368,19 @@ impl MxWindow {
                         if current.as_deref() == Some(&room_id) {
                             window.imp().current_room_meta.replace(Some(room_meta.clone()));
                             message_view.set_room_meta(&room_meta);
+                            // Update bookmark button icon.
+                            if let Some(btn) = window.imp().bookmark_button.get() {
+                                btn.set_icon_name(if room_meta.is_favourite {
+                                    "starred-symbolic"
+                                } else {
+                                    "non-starred-symbolic"
+                                });
+                                btn.set_tooltip_text(Some(if room_meta.is_favourite {
+                                    "Remove bookmark"
+                                } else {
+                                    "Bookmark this room"
+                                }));
+                            }
                             message_view.set_messages(&messages, prev_batch_token);
                         }
                     }
@@ -529,6 +548,15 @@ impl MxWindow {
         spacer.add_css_class("spacer");
         content_header.pack_end(&spacer);
 
+        // Bookmark toggle button — hidden until a room is selected.
+        let bookmark_button = gtk::Button::builder()
+            .icon_name("non-starred-symbolic")
+            .tooltip_text("Bookmark this room")
+            .visible(false)
+            .build();
+        bookmark_button.add_css_class("flat");
+        content_header.pack_end(&bookmark_button);
+
         // Leave button (flat, to the left of info).
         let leave_button = gtk::Button::builder()
             .icon_name("application-exit-symbolic")
@@ -537,8 +565,34 @@ impl MxWindow {
         leave_button.add_css_class("flat");
         content_header.pack_end(&leave_button);
 
-        // Store info button reference so room selection can show/hide it.
+        // Store button references so room selection can show/hide them.
         let _ = imp.info_button.set(info_button.clone());
+        let _ = imp.bookmark_button.set(bookmark_button.clone());
+
+        // Wire bookmark toggle.
+        let window_weak_bm = self.downgrade();
+        let toast_bm = imp.toast_overlay.clone();
+        bookmark_button.connect_clicked(move |btn| {
+            let Some(window) = window_weak_bm.upgrade() else { return };
+            let imp = window.imp();
+            let Some(room_id) = imp.current_room_id.borrow().clone() else { return };
+            let Some(tx) = imp.command_tx.get().cloned() else { return };
+
+            // Toggle: check current icon to determine state.
+            let is_currently_fav = btn.icon_name().as_deref() == Some("starred-symbolic");
+            let new_fav = !is_currently_fav;
+
+            // Update icon immediately.
+            btn.set_icon_name(if new_fav { "starred-symbolic" } else { "non-starred-symbolic" });
+            btn.set_tooltip_text(Some(if new_fav { "Remove bookmark" } else { "Bookmark this room" }));
+
+            let msg = if new_fav { "Bookmarked" } else { "Bookmark removed" };
+            toast(&toast_bm, msg);
+
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::SetFavourite { room_id, is_favourite: new_fav }).await;
+            });
+        });
 
         // Wire up info button — toggle room details sidebar.
         let window_weak_info = self.downgrade();
@@ -631,8 +685,8 @@ impl MxWindow {
         let split_view = adw::NavigationSplitView::new();
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));
-        split_view.set_min_sidebar_width(200.0);
-        split_view.set_max_sidebar_width(300.0);
+        split_view.set_min_sidebar_width(160.0);
+        split_view.set_max_sidebar_width(240.0);
         split_view.set_sidebar_width_fraction(0.25);
 
         // Wire up the banner's Verify button.

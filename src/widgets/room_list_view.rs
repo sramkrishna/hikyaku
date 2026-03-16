@@ -76,11 +76,13 @@ mod imp {
     pub struct RoomListView {
         pub dm_store: gio::ListStore,
         pub room_store: gio::ListStore,
+        pub fav_store: gio::ListStore,
         pub space_store: gio::ListStore,
         /// Store for child rooms when drilling into a space.
         pub space_child_store: gio::ListStore,
         pub dm_selection: gtk::SingleSelection,
         pub room_selection: gtk::SingleSelection,
+        pub fav_selection: gtk::SingleSelection,
         pub space_selection: gtk::SingleSelection,
         pub space_child_selection: gtk::SingleSelection,
         pub view_stack: adw::ViewStack,
@@ -108,12 +110,15 @@ mod imp {
         pub space_children_index: RefCell<std::collections::HashMap<String, Vec<usize>>>,
         /// room_id → RoomObject for O(1) badge updates.
         pub room_obj_map: RefCell<std::collections::HashMap<String, crate::models::RoomObject>>,
+        /// Bookmarks tab page — for badge updates.
+        pub fav_page: std::cell::OnceCell<adw::ViewStackPage>,
     }
 
     impl Default for RoomListView {
         fn default() -> Self {
             let (dm_store, dm_selection, dm_list_view) = make_room_list();
             let (room_store, room_selection, room_list_view) = make_room_list();
+            let (fav_store, fav_selection, fav_list_view) = make_room_list();
             let (space_store, space_selection, space_list_view) = make_room_list();
             let (space_child_store, space_child_selection, space_child_list_view) = make_room_list();
 
@@ -180,6 +185,14 @@ mod imp {
             let room_page = view_stack.add_titled(&room_tab_box, Some("rooms"), "Rooms");
             room_page.set_icon_name(Some("system-users-symbolic"));
 
+            let fav_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&fav_list_view)
+                .build();
+            let fav_page_ref = view_stack.add_titled(&fav_scroll, Some("bookmarks"), "Bookmarks");
+            fav_page_ref.set_icon_name(Some("starred-symbolic"));
+
             let space_page = view_stack.add_titled(&space_nav_stack, Some("spaces"), "Spaces");
             space_page.set_icon_name(Some("view-grid-symbolic"));
 
@@ -193,10 +206,12 @@ mod imp {
             Self {
                 dm_store,
                 room_store,
+                fav_store,
                 space_store,
                 space_child_store,
                 dm_selection,
                 room_selection,
+                fav_selection,
                 space_selection,
                 space_child_selection,
                 view_stack,
@@ -214,6 +229,11 @@ mod imp {
                 cached_rooms: RefCell::new(Vec::new()),
                 space_children_index: RefCell::new(std::collections::HashMap::new()),
                 room_obj_map: RefCell::new(std::collections::HashMap::new()),
+                fav_page: {
+                    let cell = std::cell::OnceCell::new();
+                    let _ = cell.set(fav_page_ref);
+                    cell
+                },
             }
         }
     }
@@ -258,6 +278,7 @@ mod imp {
 
             connect_room_selection(&self.dm_selection, &obj);
             connect_room_selection(&self.room_selection, &obj);
+            connect_room_selection(&self.fav_selection, &obj);
             connect_room_selection(&self.space_child_selection, &obj);
 
             // Space list: clicking a space drills into its child rooms.
@@ -380,6 +401,7 @@ impl RoomListView {
 
         imp.dm_store.remove_all();
         imp.room_store.remove_all();
+        imp.fav_store.remove_all();
         imp.space_store.remove_all();
 
         let mut obj_map = std::collections::HashMap::new();
@@ -405,6 +427,28 @@ impl RoomListView {
             for r in &cleanup {
                 add_room(&imp.room_store, r);
             }
+        }
+
+        // Bookmarks tab — all rooms with m.favourite tag, sorted by activity.
+        let mut favourites: Vec<&RoomInfo> = rooms
+            .iter()
+            .filter(|r| r.is_favourite)
+            .collect();
+        favourites.sort_by(|a, b| b.last_activity_ts.cmp(&a.last_activity_ts));
+        let mut fav_unread: u32 = 0;
+        let mut fav_has_highlight = false;
+        for r in &favourites {
+            add_room(&imp.fav_store, r);
+            fav_unread += r.unread_count as u32 + r.highlight_count as u32;
+            if r.highlight_count > 0 {
+                fav_has_highlight = true;
+            }
+        }
+        // Update bookmarks tab badge with total unread from favourited rooms.
+        if let Some(page) = imp.fav_page.get() {
+            use adw::prelude::*;
+            page.set_badge_number(fav_unread);
+            page.set_needs_attention(fav_has_highlight);
         }
 
         // Spaces tab — sort by most recent child room activity so active
@@ -568,6 +612,7 @@ mod tests {
             highlight_count: 0,
             is_admin: false,
             is_tombstoned: false,
+            is_favourite: false,
         }
     }
 
@@ -590,6 +635,7 @@ mod tests {
             highlight_count,
             is_admin: false,
             is_tombstoned: false,
+            is_favourite: false,
         }
     }
 

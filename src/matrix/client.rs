@@ -50,6 +50,8 @@ pub struct RoomInfo {
     pub is_admin: bool,
     /// Whether this room has been tombstoned (upgraded to a new room).
     pub is_tombstoned: bool,
+    /// Whether this room is marked as favourite (m.favourite tag).
+    pub is_favourite: bool,
 }
 
 /// A single message sent to the UI.
@@ -85,6 +87,8 @@ pub struct RoomMeta {
     pub is_encrypted: bool,
     /// Number of joined members.
     pub member_count: u64,
+    /// Whether this room is bookmarked (m.favourite).
+    pub is_favourite: bool,
     /// Room member display names (for nick completion).
     pub members: Vec<(String, String)>, // (user_id, display_name)
 }
@@ -219,6 +223,8 @@ pub enum MatrixCommand {
     BrowseSpaceRooms { space_id: String },
     /// Join a room by ID or alias.
     JoinRoom { room_id_or_alias: String },
+    /// Toggle bookmark (m.favourite tag) on a room.
+    SetFavourite { room_id: String, is_favourite: bool },
     /// Leave a room.
     LeaveRoom { room_id: String },
 }
@@ -440,6 +446,15 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
                         handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    }
+                    Ok(MatrixCommand::SetFavourite { room_id, is_favourite }) => {
+                        if let Ok(rid) = RoomId::parse(&room_id) {
+                            if let Some(room) = client.get_room(&rid) {
+                                if let Err(e) = room.set_is_favourite(is_favourite, None).await {
+                                    tracing::error!("Failed to set favourite: {e}");
+                                }
+                            }
+                        }
                     }
                     Ok(MatrixCommand::LeaveRoom { room_id }) => {
                         handle_leave_room(&client, &event_tx, &room_id).await;
@@ -965,6 +980,8 @@ async fn collect_room_info(
             .flatten()
             .is_some();
 
+        let is_favourite = room.is_favourite();
+
         // Check if current user is admin (power level >= state_default).
         let is_admin = if let Some(user_id) = client.user_id() {
             room.get_member_no_sync(user_id)
@@ -990,6 +1007,7 @@ async fn collect_room_info(
                 highlight_count: unread.highlight_count.into(),
                 is_admin,
                 is_tombstoned,
+                is_favourite,
             });
             continue;
         }
@@ -1015,6 +1033,7 @@ async fn collect_room_info(
             highlight_count: unread.highlight_count.into(),
             is_admin,
             is_tombstoned,
+            is_favourite,
         };
 
         if unread.notification_count > 0 || unread.highlight_count > 0 {
@@ -1737,6 +1756,7 @@ async fn handle_select_room(
         pinned_messages,
         is_encrypted,
         member_count,
+        is_favourite: room.is_favourite(),
         members,
     };
 
