@@ -190,8 +190,8 @@ pub enum MatrixEvent {
         space_id: String,
         rooms: Vec<SpaceDirectoryRoom>,
     },
-    /// Media downloaded to a temp file — open it.
-    MediaReady { path: String },
+    /// Media downloaded to a temp file — show preview.
+    MediaReady { url: String, path: String },
     /// Successfully joined a room.
     RoomJoined { room_id: String, room_name: String },
     /// Failed to join a room.
@@ -245,6 +245,8 @@ pub enum MatrixCommand {
     BrowseSpaceRooms { space_id: String },
     /// Join a room by ID or alias.
     JoinRoom { room_id_or_alias: String },
+    /// Upload and send a media file.
+    SendMedia { room_id: String, file_path: String },
     /// Download media and open with system viewer.
     DownloadMedia { url: String, filename: String },
     /// Toggle bookmark (m.favourite tag) on a room.
@@ -470,6 +472,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
                         handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    }
+                    Ok(MatrixCommand::SendMedia { room_id, file_path }) => {
+                        handle_send_media(&client, &event_tx, &room_id, &file_path).await;
                     }
                     Ok(MatrixCommand::DownloadMedia { url, filename }) => {
                         handle_download_media(&client, &event_tx, &url, &filename).await;
@@ -1914,6 +1919,57 @@ async fn handle_fetch_older(
 }
 
 /// Send a text message to a room.
+async fn handle_send_media(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    file_path: &str,
+) {
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    use std::path::Path;
+
+    let Ok(room_id) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&room_id) else { return };
+
+    let path = Path::new(file_path);
+    let filename = path.file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    // Read file.
+    let data = match std::fs::read(file_path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to read file {file_path}: {e}");
+            return;
+        }
+    };
+
+    // Detect MIME type from extension.
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    };
+    let mime_type: mime::Mime = mime.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+
+    // send_attachment handles all media types based on MIME.
+    if let Err(e) = room.send_attachment(&filename, &mime_type, data, Default::default()).await {
+        tracing::error!("Failed to send attachment: {e}");
+    }
+}
+
 async fn handle_download_media(
     client: &Client,
     event_tx: &Sender<MatrixEvent>,
@@ -1944,6 +2000,7 @@ async fn handle_download_media(
             }
             let _ = event_tx
                 .send(MatrixEvent::MediaReady {
+                    url: mxc_url.to_string(),
                     path: path.to_string_lossy().to_string(),
                 })
                 .await;

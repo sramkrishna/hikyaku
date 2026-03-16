@@ -21,5 +21,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 dirs = "6"
+mime = "0.3"
 futures-util = "0.3"
 oo7 = { version = "0.3", default-features = false, features = ["tokio", "native_crypto"] }

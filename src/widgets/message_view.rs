@@ -25,6 +25,8 @@ mod imp {
         #[template_child]
         pub list_view: TemplateChild<gtk::ListView>,
         #[template_child]
+        pub attach_button: TemplateChild<gtk::Button>,
+        #[template_child]
         pub input_entry: TemplateChild<gtk::Entry>,
         #[template_child]
         pub emoji_button: TemplateChild<gtk::MenuButton>,
@@ -56,8 +58,10 @@ mod imp {
         pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>)>>>,
         /// Callback for sending a reaction: (event_id, emoji).
         pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
-        /// Callback for media click: (mxc_url, filename).
-        pub on_media_click: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for media hover: (mxc_url, filename, anchor widget).
+        pub on_media_hover: RefCell<Option<Box<dyn Fn(String, String, gtk::Widget)>>>,
+        /// Callback for sending a file: (file_path).
+        pub on_attach: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
@@ -82,6 +86,7 @@ mod imp {
                 view_stack: Default::default(),
                 scrolled_window: Default::default(),
                 list_view: Default::default(),
+                attach_button: Default::default(),
                 input_entry: Default::default(),
                 emoji_button: Default::default(),
                 emoji_chooser: Default::default(),
@@ -98,7 +103,8 @@ mod imp {
                 reply_to_event: RefCell::new(None),
                 on_send: RefCell::new(None),
                 on_react: RefCell::new(None),
-                on_media_click: RefCell::new(None),
+                on_media_hover: RefCell::new(None),
+                on_attach: RefCell::new(None),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
@@ -159,12 +165,12 @@ mod imp {
                     });
 
                     let view_weak = setup_view_weak.clone();
-                    row.set_on_media_click(move |url, filename| {
+                    row.set_on_media_hover(move |url, filename, widget| {
                         if let Some(v) = view_weak.upgrade() {
-                            let has_cb = v.imp().on_media_click.borrow().is_some();
+                            let has_cb = v.imp().on_media_hover.borrow().is_some();
                             if has_cb {
-                                let borrow = v.imp().on_media_click.borrow();
-                                borrow.as_ref().unwrap()(url, filename);
+                                let borrow = v.imp().on_media_hover.borrow();
+                                borrow.as_ref().unwrap()(url, filename, widget);
                             }
                         }
                     });
@@ -263,6 +269,34 @@ mod imp {
                     imp.reply_to_event.replace(None);
                     imp.reply_preview.set_visible(false);
                 }
+            });
+
+            // Attach button — open file chooser.
+            let view_for_attach = obj.clone();
+            self.attach_button.connect_clicked(move |btn| {
+                let dialog = gtk::FileDialog::builder()
+                    .title("Attach a file")
+                    .build();
+
+                let btn_widget = btn.clone().upcast::<gtk::Widget>();
+                let root = btn_widget.root();
+                let window = root.and_then(|r| r.downcast::<gtk::Window>().ok());
+                let view = view_for_attach.clone();
+                dialog.open(
+                    window.as_ref(),
+                    gio::Cancellable::NONE,
+                    move |result| {
+                        if let Ok(file) = result {
+                            if let Some(path) = file.path() {
+                                let path_str = path.to_string_lossy().to_string();
+                                let imp = view.imp();
+                                if let Some(ref cb) = *imp.on_attach.borrow() {
+                                    cb(path_str);
+                                }
+                            }
+                        }
+                    },
+                );
             });
 
             // Cancel reply button.
@@ -509,8 +543,12 @@ impl MessageView {
         self.imp().on_react.replace(Some(Box::new(f)));
     }
 
-    pub fn connect_media_click<F: Fn(String, String) + 'static>(&self, f: F) {
-        self.imp().on_media_click.replace(Some(Box::new(f)));
+    pub fn connect_attach<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_attach.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_media_hover<F: Fn(String, String, gtk::Widget) + 'static>(&self, f: F) {
+        self.imp().on_media_hover.replace(Some(Box::new(f)));
     }
 
     /// Add a reaction locally to a message (immediate visual feedback).

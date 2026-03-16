@@ -20,11 +20,13 @@ mod imp {
         pub on_react: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Emoji chooser for reactions (created once per row).
         pub react_chooser: gtk::EmojiChooser,
-        /// Callback: media clicked → (mxc_url, filename).
-        pub on_media_click: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
-        /// Current media URL and filename for click handler.
+        /// Callback: media hover → (mxc_url, filename, callback for file path).
+        pub on_media_hover: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, gtk::Widget)>>>>,
+        /// Current media URL and filename.
         pub media_url: std::rc::Rc<std::cell::RefCell<String>>,
         pub media_filename: std::rc::Rc<std::cell::RefCell<String>>,
+        /// Cached local file path after download.
+        pub media_cached_path: std::rc::Rc<std::cell::RefCell<Option<String>>>,
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -145,19 +147,22 @@ mod imp {
                 }
             });
 
-            // Media button click — download and open.
+            // Media button hover — download and show preview.
             let media_url = self.media_url.clone();
             let media_filename = self.media_filename.clone();
-            let on_media = self.on_media_click.clone();
-            self.media_button.connect_clicked(move |_| {
+            let on_media = self.on_media_hover.clone();
+            let hover = gtk::EventControllerMotion::new();
+            let media_btn = self.media_button.clone();
+            hover.connect_enter(move |_, _, _| {
                 let url = media_url.borrow().clone();
                 let filename = media_filename.borrow().clone();
                 if !url.is_empty() {
                     if let Some(ref cb) = *on_media.borrow() {
-                        cb(url, filename);
+                        cb(url, filename, media_btn.clone().upcast::<gtk::Widget>());
                     }
                 }
             });
+            self.media_button.add_controller(hover);
         }
     }
     impl WidgetImpl for MessageRow {}
@@ -245,8 +250,8 @@ impl MessageRow {
         self.imp().on_react.borrow_mut().replace(Box::new(f));
     }
 
-    pub fn set_on_media_click<F: Fn(String, String) + 'static>(&self, f: F) {
-        self.imp().on_media_click.borrow_mut().replace(Box::new(f));
+    pub fn set_on_media_hover<F: Fn(String, String, gtk::Widget) + 'static>(&self, f: F) {
+        self.imp().on_media_hover.borrow_mut().replace(Box::new(f));
     }
 
     /// Bind a MessageObject to this row — sets all visual elements.

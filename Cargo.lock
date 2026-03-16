@@ -2262,6 +2262,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "matrix-sdk",
+ "mime",
  "oo7",
  "serde",
  "serde_json",

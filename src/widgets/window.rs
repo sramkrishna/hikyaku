@@ -43,6 +43,10 @@ mod imp {
         pub info_button: OnceCell<gtk::Button>,
         /// Bookmark toggle button.
         pub bookmark_button: OnceCell<gtk::Button>,
+        /// Media cache: mxc_url → local file path.
+        pub media_cache: RefCell<std::collections::HashMap<String, String>>,
+        /// Widget to anchor the next media preview popover to.
+        pub media_preview_anchor: RefCell<Option<gtk::Widget>>,
     }
 
     impl Default for MxWindow {
@@ -77,6 +81,8 @@ mod imp {
                     .build(),
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
+                media_cache: RefCell::new(std::collections::HashMap::new()),
+                media_preview_anchor: RefCell::new(None),
             }
         }
     }
@@ -126,6 +132,53 @@ use crate::config::AppearanceSettings;
 use crate::matrix::{MatrixCommand, MatrixEvent};
 
 /// Show a simple toast message.
+/// Show a media preview popover anchored to the given widget.
+fn show_media_popover(anchor: &gtk::Widget, path: &str) {
+    let popover = gtk::Popover::new();
+    popover.set_autohide(true);
+    popover.set_has_arrow(true);
+
+    let path_lower = path.to_lowercase();
+    if path_lower.ends_with(".mp4")
+        || path_lower.ends_with(".webm")
+        || path_lower.ends_with(".mov")
+        || path_lower.ends_with(".avi")
+    {
+        // Video preview.
+        let video = gtk::Video::for_filename(Some(path));
+        video.set_autoplay(true);
+        video.set_size_request(320, 240);
+        popover.set_child(Some(&video));
+    } else if path_lower.ends_with(".mp3")
+        || path_lower.ends_with(".ogg")
+        || path_lower.ends_with(".wav")
+        || path_lower.ends_with(".flac")
+    {
+        // Audio — just show a label with the filename.
+        let label = gtk::Label::builder()
+            .label(&format!("🔊 {}", std::path::Path::new(path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()))
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+        popover.set_child(Some(&label));
+    } else {
+        // Image preview.
+        let picture = gtk::Picture::for_filename(path);
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_size_request(320, 240);
+        popover.set_child(Some(&picture));
+    }
+
+    popover.set_parent(anchor);
+    popover.popup();
+}
+
 fn toast(overlay: &adw::ToastOverlay, msg: &str) {
     overlay.add_toast(adw::Toast::new(msg));
 }
@@ -313,12 +366,52 @@ impl MxWindow {
             }
         });
 
-        // Wire up media click → download and open.
+        // Wire up attach button → upload and send media.
+        let cmd_tx_attach = command_tx.clone();
+        let window_weak_attach = window.downgrade();
+        let toast_attach = imp.toast_overlay.clone();
+        imp.message_view.connect_attach(move |file_path| {
+            let room_id = window_weak_attach
+                .upgrade()
+                .and_then(|w| w.imp().current_room_id.borrow().clone());
+            if let Some(room_id) = room_id {
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                toast(&toast_attach, &format!("Sending {filename}…"));
+                let tx = cmd_tx_attach.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::SendMedia { room_id, file_path }).await;
+                });
+            }
+        });
+
+        // Wire up media hover → check cache or download, then show preview.
         let cmd_tx_media = command_tx.clone();
-        imp.message_view.connect_media_click(move |url, filename| {
+        let window_weak_media = window.downgrade();
+        imp.message_view.connect_media_hover(move |url, filename, widget| {
+            let Some(win) = window_weak_media.upgrade() else { return };
+            let imp = win.imp();
+
+            // Check cache first.
+            let cached = imp.media_cache.borrow().get(&url).cloned();
+            if let Some(path) = cached {
+                show_media_popover(&widget, &path);
+                return;
+            }
+
+            // Store the anchor widget for when download completes.
+            imp.media_preview_anchor.replace(Some(widget.clone()));
+
             let tx = cmd_tx_media.clone();
+            let url2 = url.clone();
+            let filename2 = filename.clone();
             glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::DownloadMedia { url, filename }).await;
+                let _ = tx.send(MatrixCommand::DownloadMedia {
+                    url: url2,
+                    filename: filename2,
+                }).await;
             });
         });
 
@@ -474,13 +567,14 @@ impl MxWindow {
                     MatrixEvent::RecoveryFailed { error } => {
                         toast_error(&toast_overlay, "Key recovery failed", &error);
                     }
-                    MatrixEvent::MediaReady { path } => {
-                        // Open the downloaded file with the system viewer.
-                        if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
-                            &format!("file://{path}"),
-                            gtk::gio::AppLaunchContext::NONE,
-                        ) {
-                            toast_error(&toast_overlay, "Failed to open", &e.to_string());
+                    MatrixEvent::MediaReady { url, path } => {
+                        // Cache the downloaded path.
+                        window.imp().media_cache.borrow_mut().insert(url, path.clone());
+
+                        // Show preview on the anchor widget if still available.
+                        let anchor = window.imp().media_preview_anchor.borrow().clone();
+                        if let Some(widget) = anchor {
+                            show_media_popover(&widget, &path);
                         }
                     }
                     MatrixEvent::RoomJoined { room_id: _, room_name } => {

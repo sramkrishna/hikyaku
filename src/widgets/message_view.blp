@@ -131,6 +131,12 @@ template $MxMessageView : Gtk.Box {
           margin-top: 8;
           margin-bottom: 8;
 
+          Gtk.Button attach_button {
+            icon-name: "mail-attachment-symbolic";
+            tooltip-text: "Attach image, video, or file";
+            styles ["circular", "flat"]
+          }
+
           Gtk.Entry input_entry {
             placeholder-text: "Send a message…";
             hexpand: true;
