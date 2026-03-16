@@ -43,6 +43,8 @@ mod imp {
         pub info_button: OnceCell<gtk::Button>,
         /// Bookmark toggle button.
         pub bookmark_button: OnceCell<gtk::Button>,
+        /// Current user ID for deduplicating local echo.
+        pub user_id: RefCell<String>,
         /// Media cache: mxc_url → local file path.
         pub media_cache: RefCell<std::collections::HashMap<String, String>>,
         /// Widget to anchor the next media preview popover to.
@@ -81,6 +83,7 @@ mod imp {
                     .build(),
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
+                user_id: RefCell::new(String::new()),
                 media_cache: RefCell::new(std::collections::HashMap::new()),
                 media_preview_anchor: RefCell::new(None),
             }
@@ -166,8 +169,17 @@ fn show_media_popover(anchor: &gtk::Widget, path: &str) {
             .margin_bottom(8)
             .build();
         popover.set_child(Some(&label));
+    } else if path_lower.ends_with(".gif") {
+        // Animated GIF — use MediaFile for animation support.
+        let media_file = gtk::MediaFile::for_filename(path);
+        media_file.set_loop(true);
+        media_file.play();
+        let video = gtk::Video::new();
+        video.set_media_stream(Some(&media_file));
+        video.set_size_request(320, 240);
+        popover.set_child(Some(&video));
     } else {
-        // Image preview.
+        // Static image preview.
         let picture = gtk::Picture::for_filename(path);
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Contain);
@@ -436,6 +448,7 @@ impl MxWindow {
                         toast(&toast_overlay, &msg);
                         login_page.stop_spinner();
                         tracing::info!("{msg}");
+                        window.imp().user_id.replace(user_id.clone());
                         // Highlight the user's display name, localpart, and
                         // full user ID so mentions in any form get highlighted.
                         let localpart = user_id
@@ -493,9 +506,12 @@ impl MxWindow {
                             message_view.prepend_messages(&messages, prev_batch_token);
                         }
                     }
-                    MatrixEvent::NewMessage { room_id, room_name, message, is_mention } => {
+                    MatrixEvent::NewMessage { room_id, room_name, sender_id, message, is_mention } => {
                         let current = window.imp().current_room_id.borrow().clone();
-                        if current.as_deref() == Some(&room_id) {
+                        let my_id = window.imp().user_id.borrow().clone();
+                        // Skip our own messages — already shown as local echo.
+                        let is_self = sender_id == my_id;
+                        if current.as_deref() == Some(&room_id) && !is_self {
                             message_view.append_message(&message);
                         }
 

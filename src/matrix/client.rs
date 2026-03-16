@@ -157,6 +157,7 @@ pub enum MatrixEvent {
     NewMessage {
         room_id: String,
         room_name: String,
+        sender_id: String,
         message: MessageInfo,
         is_mention: bool,
     },
@@ -1320,10 +1321,12 @@ async fn start_sync(
                     .map(|n| n.to_string())
                     .unwrap_or_default();
 
+                let sender_id = event.sender.to_string();
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
                         room_name,
+                        sender_id,
                         message: MessageInfo {
                             sender: display_name,
                             body,
@@ -1358,10 +1361,12 @@ async fn start_sync(
                     .map(|n| n.to_string())
                     .unwrap_or_default();
 
+                let sender_id = event.sender.to_string();
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
                         room_name,
+                        sender_id,
                         message: MessageInfo {
                             sender: display_name,
                             body: "\u{1f512} Unable to decrypt message".to_string(),
@@ -1977,6 +1982,55 @@ async fn handle_download_media(
     filename: &str,
 ) {
     use matrix_sdk::media::MediaFormat;
+
+    // Handle HTTPS URLs (e.g. Giphy) — download directly.
+    if mxc_url.starts_with("https://") || mxc_url.starts_with("http://") {
+        match reqwest::get(mxc_url).await {
+            Ok(resp) => {
+                // Determine extension from Content-Type header or URL.
+                let content_type = resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                if let Ok(data) = resp.bytes().await {
+                    let tmp_dir = std::env::temp_dir().join("matx-media");
+                    let _ = std::fs::create_dir_all(&tmp_dir);
+                    let ext = if content_type.contains("gif") { "gif" }
+                        else if content_type.contains("png") { "png" }
+                        else if content_type.contains("webp") { "webp" }
+                        else if content_type.contains("mp4") { "mp4" }
+                        else if content_type.contains("webm") { "webm" }
+                        else if content_type.contains("jpeg") || content_type.contains("jpg") { "jpg" }
+                        else {
+                            // Fall back to URL path extension.
+                            mxc_url.rsplit('.').next()
+                                .filter(|e| e.len() <= 4)
+                                .unwrap_or("gif")
+                        };
+                    // Use a hash of the URL as filename to avoid collisions.
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    mxc_url.hash(&mut hasher);
+                    let safe_name = format!("{:x}.{ext}", hasher.finish());
+                    let path = tmp_dir.join(&safe_name);
+                    if let Err(e) = std::fs::write(&path, &data) {
+                        tracing::error!("Failed to write media file: {e}");
+                        return;
+                    }
+                    let _ = event_tx
+                        .send(MatrixEvent::MediaReady {
+                            url: mxc_url.to_string(),
+                            path: path.to_string_lossy().to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(e) => tracing::error!("Failed to download {mxc_url}: {e}"),
+        }
+        return;
+    }
 
     let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
         tracing::error!("Invalid mxc URL: {mxc_url}");

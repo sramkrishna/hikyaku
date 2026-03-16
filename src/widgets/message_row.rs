@@ -206,6 +206,52 @@ pub(crate) fn format_timestamp(ts: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Extract an image/gif URL from message body text, if present.
+/// Converts Giphy page URLs to direct media URLs.
+fn extract_image_url(body: &str) -> Option<String> {
+    let body_trimmed = body.trim();
+    for word in body_trimmed.split_whitespace() {
+        if !(word.starts_with("https://") || word.starts_with("http://")) {
+            continue;
+        }
+        // Strip query params/fragments for extension check.
+        let lower = word.to_lowercase();
+        let path_part = lower.split('?').next().unwrap_or(&lower);
+        let path_part = path_part.split('#').next().unwrap_or(path_part);
+        // Any URL ending in an image extension.
+        if path_part.ends_with(".gif")
+            || path_part.ends_with(".png")
+            || path_part.ends_with(".jpg")
+            || path_part.ends_with(".jpeg")
+            || path_part.ends_with(".webp")
+        {
+            return Some(word.to_string());
+        }
+        // Giphy page URLs → convert to direct media URL.
+        // https://giphy.com/gifs/NAME-ID → https://media.giphy.com/media/ID/giphy.gif
+        if lower.contains("giphy.com/gifs/") {
+            if let Some(slug) = word.rsplit('/').next() {
+                // The ID is the last part after the last dash, or the whole slug.
+                let id = slug.rsplit('-').next().unwrap_or(slug);
+                return Some(format!("https://media.giphy.com/media/{id}/giphy.gif"));
+            }
+        }
+        // media.giphy.com URLs are already direct.
+        if lower.contains("media.giphy.com") {
+            return Some(word.to_string());
+        }
+        // Tenor media URLs — media.tenor.com serves GIFs/videos directly.
+        if lower.contains("media.tenor.com") || lower.contains("c.tenor.com") {
+            return Some(word.to_string());
+        }
+        // Tenor page URLs.
+        if lower.contains("tenor.com/view/") {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
 /// Convert URLs in already-escaped markup text into clickable <a> links.
 fn linkify_urls(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -322,7 +368,21 @@ impl MessageRow {
                 imp.media_button.set_visible(false);
             }
         } else {
-            imp.media_button.set_visible(false);
+            // Check if body contains an image/gif URL — show as media placeholder.
+            if let Some(url) = extract_image_url(&body) {
+                imp.media_icon.set_icon_name(Some("image-x-generic-symbolic"));
+                let display = if url.contains("giphy.com") {
+                    "GIF".to_string()
+                } else {
+                    url.split('/').last().unwrap_or("image").to_string()
+                };
+                imp.media_label.set_label(&display);
+                imp.media_button.set_visible(true);
+                imp.media_url.replace(url.clone());
+                imp.media_filename.replace(display);
+            } else {
+                imp.media_button.set_visible(false);
+            }
         }
 
         // Reactions.
