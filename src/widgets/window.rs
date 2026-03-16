@@ -283,6 +283,7 @@ impl MxWindow {
                     reply_to: reply_to.clone(),
                     thread_root: None,
                     reactions: Vec::new(),
+                    media: None,
                 };
                 msg_view_for_send.append_message(&echo);
 
@@ -310,6 +311,15 @@ impl MxWindow {
                     let _ = tx.send(MatrixCommand::SendReaction { room_id, event_id, emoji }).await;
                 });
             }
+        });
+
+        // Wire up media click → download and open.
+        let cmd_tx_media = command_tx.clone();
+        imp.message_view.connect_media_click(move |url, filename| {
+            let tx = cmd_tx_media.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::DownloadMedia { url, filename }).await;
+            });
         });
 
         // Event loop.
@@ -463,6 +473,15 @@ impl MxWindow {
                     }
                     MatrixEvent::RecoveryFailed { error } => {
                         toast_error(&toast_overlay, "Key recovery failed", &error);
+                    }
+                    MatrixEvent::MediaReady { path } => {
+                        // Open the downloaded file with the system viewer.
+                        if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
+                            &format!("file://{path}"),
+                            gtk::gio::AppLaunchContext::NONE,
+                        ) {
+                            toast_error(&toast_overlay, "Failed to open", &e.to_string());
+                        }
                     }
                     MatrixEvent::RoomJoined { room_id: _, room_name } => {
                         toast(&toast_overlay, &format!("Joined {room_name}"));
@@ -807,6 +826,11 @@ impl MxWindow {
             }
             .msg-action-bar-visible {
                 opacity: 0.85;
+            }
+            .media-placeholder {
+                background: alpha(@accent_bg_color, 0.1);
+                border-radius: 8px;
+                padding: 8px 12px;
             }
             .reaction-pill {
                 background: alpha(@window_fg_color, 0.1);

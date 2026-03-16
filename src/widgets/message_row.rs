@@ -20,6 +20,11 @@ mod imp {
         pub on_react: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Emoji chooser for reactions (created once per row).
         pub react_chooser: gtk::EmojiChooser,
+        /// Callback: media clicked → (mxc_url, filename).
+        pub on_media_click: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
+        /// Current media URL and filename for click handler.
+        pub media_url: std::rc::Rc<std::cell::RefCell<String>>,
+        pub media_filename: std::rc::Rc<std::cell::RefCell<String>>,
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -32,6 +37,12 @@ mod imp {
         pub reply_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub thread_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub media_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub media_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub media_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub reactions_box: TemplateChild<gtk::Box>,
         /// Floating action bar (not in template — created programmatically).
@@ -133,6 +144,20 @@ mod imp {
                     cb(eid, emoji.to_string());
                 }
             });
+
+            // Media button click — download and open.
+            let media_url = self.media_url.clone();
+            let media_filename = self.media_filename.clone();
+            let on_media = self.on_media_click.clone();
+            self.media_button.connect_clicked(move |_| {
+                let url = media_url.borrow().clone();
+                let filename = media_filename.borrow().clone();
+                if !url.is_empty() {
+                    if let Some(ref cb) = *on_media.borrow() {
+                        cb(url, filename);
+                    }
+                }
+            });
         }
     }
     impl WidgetImpl for MessageRow {}
@@ -220,6 +245,10 @@ impl MessageRow {
         self.imp().on_react.borrow_mut().replace(Box::new(f));
     }
 
+    pub fn set_on_media_click<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_media_click.borrow_mut().replace(Box::new(f));
+    }
+
     /// Bind a MessageObject to this row — sets all visual elements.
     pub fn bind_message_object(
         &self,
@@ -249,6 +278,47 @@ impl MessageRow {
 
         // Thread indicator.
         imp.thread_icon.set_visible(!thread_root.is_empty());
+
+        // Media attachment.
+        let media_json = msg.media_json();
+        if !media_json.is_empty() {
+            if let Ok(media) = serde_json::from_str::<crate::matrix::MediaInfo>(&media_json) {
+                use std::sync::LazyLock;
+                static MEDIA_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
+                    LazyLock::new(|| {
+                        [
+                            ("Image", "image-x-generic-symbolic"),
+                            ("Video", "video-x-generic-symbolic"),
+                            ("Audio", "audio-x-generic-symbolic"),
+                            ("File", "text-x-generic-symbolic"),
+                        ].into_iter().collect()
+                    });
+                let kind_str = match media.kind {
+                    crate::matrix::MediaKind::Image => "Image",
+                    crate::matrix::MediaKind::Video => "Video",
+                    crate::matrix::MediaKind::Audio => "Audio",
+                    crate::matrix::MediaKind::File => "File",
+                };
+                let icon = MEDIA_ICONS.get(kind_str).unwrap_or(&"text-x-generic-symbolic");
+                imp.media_icon.set_icon_name(Some(icon));
+                let size_str = media.size
+                    .map(|s| {
+                        if s > 1_048_576 { format!(" ({:.1} MB)", s as f64 / 1_048_576.0) }
+                        else if s > 1024 { format!(" ({:.0} KB)", s as f64 / 1024.0) }
+                        else { format!(" ({s} B)") }
+                    })
+                    .unwrap_or_default();
+                imp.media_label.set_label(&format!("{}{size_str}", media.filename));
+                imp.media_button.set_visible(true);
+
+                imp.media_url.replace(media.url.clone());
+                imp.media_filename.replace(media.filename.clone());
+            } else {
+                imp.media_button.set_visible(false);
+            }
+        } else {
+            imp.media_button.set_visible(false);
+        }
 
         // Reactions.
         // Clear old reactions.

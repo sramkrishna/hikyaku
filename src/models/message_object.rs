@@ -35,6 +35,10 @@ mod imp {
         /// Reactions as JSON string: [["👍", 3], ["❤️", 1]]
         #[property(get, set)]
         reactions_json: RefCell<String>,
+
+        /// Media info as JSON: {"kind":"Image","filename":"photo.jpg","size":12345,"url":"mxc://..."}
+        #[property(get, set)]
+        media_json: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -63,6 +67,7 @@ impl MessageObject {
         reply_to: &str,
         thread_root: &str,
         reactions: &[(String, u64)],
+        media_json: &str,
     ) -> Self {
         let reactions_json = serde_json::to_string(reactions).unwrap_or_default();
         Object::builder()
@@ -73,6 +78,7 @@ impl MessageObject {
             .property("reply-to", reply_to)
             .property("thread-root", thread_root)
             .property("reactions-json", reactions_json)
+            .property("media-json", media_json)
             .build()
     }
 }

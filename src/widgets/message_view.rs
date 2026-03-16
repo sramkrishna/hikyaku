@@ -56,6 +56,8 @@ mod imp {
         pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>)>>>,
         /// Callback for sending a reaction: (event_id, emoji).
         pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for media click: (mxc_url, filename).
+        pub on_media_click: RefCell<Option<Box<dyn Fn(String, String)>>>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
@@ -96,6 +98,7 @@ mod imp {
                 reply_to_event: RefCell::new(None),
                 on_send: RefCell::new(None),
                 on_react: RefCell::new(None),
+                on_media_click: RefCell::new(None),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
@@ -152,6 +155,17 @@ mod imp {
                     row.set_on_reply(move |eid, sender, body| {
                         if let Some(v) = view_weak.upgrade() {
                             v.start_reply(&eid, &sender, &body);
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_media_click(move |url, filename| {
+                        if let Some(v) = view_weak.upgrade() {
+                            let has_cb = v.imp().on_media_click.borrow().is_some();
+                            if has_cb {
+                                let borrow = v.imp().on_media_click.borrow();
+                                borrow.as_ref().unwrap()(url, filename);
+                            }
                         }
                     });
 
@@ -495,6 +509,10 @@ impl MessageView {
         self.imp().on_react.replace(Some(Box::new(f)));
     }
 
+    pub fn connect_media_click<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_media_click.replace(Some(Box::new(f)));
+    }
+
     /// Add a reaction locally to a message (immediate visual feedback).
     pub fn add_local_reaction(&self, event_id: &str, emoji: &str) {
         if event_id.is_empty() {
@@ -598,6 +616,9 @@ impl MessageView {
     }
 
     fn info_to_obj(m: &crate::matrix::MessageInfo) -> MessageObject {
+        let media_json = m.media.as_ref()
+            .and_then(|media| serde_json::to_string(media).ok())
+            .unwrap_or_default();
         MessageObject::new(
             &m.sender,
             &m.body,
@@ -606,6 +627,7 @@ impl MessageView {
             m.reply_to.as_deref().unwrap_or(""),
             m.thread_root.as_deref().unwrap_or(""),
             &m.reactions,
+            &media_json,
         )
     }
 

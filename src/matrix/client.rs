@@ -67,6 +67,26 @@ pub struct MessageInfo {
     pub thread_root: Option<String>,
     /// Aggregated emoji reactions: (emoji, count).
     pub reactions: Vec<(String, u64)>,
+    /// Media attachment info (if this is an image/file/video/audio message).
+    pub media: Option<MediaInfo>,
+}
+
+/// Media attachment on a message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MediaInfo {
+    pub kind: MediaKind,
+    pub filename: String,
+    pub size: Option<u64>,
+    /// Matrix content URI (mxc://).
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    File,
 }
 
 /// Room metadata sent alongside messages for display in the content header.
@@ -170,6 +190,8 @@ pub enum MatrixEvent {
         space_id: String,
         rooms: Vec<SpaceDirectoryRoom>,
     },
+    /// Media downloaded to a temp file — open it.
+    MediaReady { path: String },
     /// Successfully joined a room.
     RoomJoined { room_id: String, room_name: String },
     /// Failed to join a room.
@@ -223,6 +245,8 @@ pub enum MatrixCommand {
     BrowseSpaceRooms { space_id: String },
     /// Join a room by ID or alias.
     JoinRoom { room_id_or_alias: String },
+    /// Download media and open with system viewer.
+    DownloadMedia { url: String, filename: String },
     /// Toggle bookmark (m.favourite tag) on a room.
     SetFavourite { room_id: String, is_favourite: bool },
     /// Leave a room.
@@ -446,6 +470,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
                         handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    }
+                    Ok(MatrixCommand::DownloadMedia { url, filename }) => {
+                        handle_download_media(&client, &event_tx, &url, &filename).await;
                     }
                     Ok(MatrixCommand::SetFavourite { room_id, is_favourite }) => {
                         if let Ok(rid) = RoomId::parse(&room_id) {
@@ -743,14 +770,75 @@ fn is_room_activity(v: &serde_json::Value) -> bool {
         .map_or(false, |t| ACTIVITY_TYPES.contains(t))
 }
 
-/// Extract the text body from a MessageType, returning None for non-text types.
-fn extract_message_body(
+/// Extract the mxc:// URL from a MediaSource.
+fn media_source_url(source: &matrix_sdk::ruma::events::room::MediaSource) -> String {
+    use matrix_sdk::ruma::events::room::MediaSource;
+    match source {
+        MediaSource::Plain(uri) => uri.to_string(),
+        MediaSource::Encrypted(file) => file.url.to_string(),
+    }
+}
+
+/// Extract body text and optional media info from a MessageType.
+fn extract_message_content(
     msgtype: &matrix_sdk::ruma::events::room::message::MessageType,
-) -> Option<String> {
+) -> Option<(String, Option<MediaInfo>)> {
     use matrix_sdk::ruma::events::room::message::MessageType;
     match msgtype {
-        MessageType::Text(text) => Some(text.body.clone()),
-        MessageType::Notice(notice) => Some(notice.body.clone()),
+        MessageType::Text(text) => Some((text.body.clone(), None)),
+        MessageType::Notice(notice) => Some((notice.body.clone(), None)),
+        MessageType::Image(image) => {
+            let url = media_source_url(&image.source);
+            let size = image.info.as_ref().and_then(|i| i.size).map(|s| s.into());
+            Some((
+                image.body.clone(),
+                Some(MediaInfo {
+                    kind: MediaKind::Image,
+                    filename: image.filename.clone().unwrap_or_else(|| image.body.clone()),
+                    size,
+                    url,
+                }),
+            ))
+        }
+        MessageType::Video(video) => {
+            let url = media_source_url(&video.source);
+            let size = video.info.as_ref().and_then(|i| i.size).map(|s| s.into());
+            Some((
+                video.body.clone(),
+                Some(MediaInfo {
+                    kind: MediaKind::Video,
+                    filename: video.filename.clone().unwrap_or_else(|| video.body.clone()),
+                    size,
+                    url,
+                }),
+            ))
+        }
+        MessageType::Audio(audio) => {
+            let url = media_source_url(&audio.source);
+            let size = audio.info.as_ref().and_then(|i| i.size).map(|s| s.into());
+            Some((
+                audio.body.clone(),
+                Some(MediaInfo {
+                    kind: MediaKind::Audio,
+                    filename: audio.body.clone(),
+                    size,
+                    url,
+                }),
+            ))
+        }
+        MessageType::File(file) => {
+            let url = media_source_url(&file.source);
+            let size = file.info.as_ref().and_then(|i| i.size).map(|s| s.into());
+            Some((
+                file.body.clone(),
+                Some(MediaInfo {
+                    kind: MediaKind::File,
+                    filename: file.filename.clone().unwrap_or_else(|| file.body.clone()),
+                    size,
+                    url,
+                }),
+            ))
+        }
         _ => None,
     }
 }
@@ -1201,7 +1289,7 @@ async fn start_sync(
             let tx = msg_tx.clone();
             let client = msg_client.clone();
             async move {
-                let Some(body) = extract_message_body(&event.content.msgtype) else {
+                let Some((body, media)) = extract_message_content(&event.content.msgtype) else {
                     return;
                 };
                 let timestamp = event
@@ -1239,6 +1327,7 @@ async fn start_sync(
                             reply_to: None,
                             thread_root: None,
                             reactions: Vec::new(),
+                            media,
                         },
                         is_mention,
                     })
@@ -1276,6 +1365,7 @@ async fn start_sync(
                             reply_to: None,
                             thread_root: None,
                             reactions: Vec::new(),
+                            media: None,
                         },
                         is_mention: false,
                     })
@@ -1487,6 +1577,7 @@ async fn extract_messages(
                     reply_to: None,
                     thread_root: None,
                     reactions: Vec::new(),
+                            media: None,
                 });
                 continue;
             }
@@ -1499,7 +1590,7 @@ async fn extract_messages(
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
                     _ => continue,
                 };
-                let Some(body) = extract_message_body(&msg_event.content.msgtype) else {
+                let Some((body, media)) = extract_message_content(&msg_event.content.msgtype) else {
                     continue;
                 };
                 let display_name = resolve_display_name(room, &msg_event.sender).await;
@@ -1530,6 +1621,7 @@ async fn extract_messages(
                     reply_to,
                     thread_root,
                     reactions,
+                    media,
                 });
             }
             matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
@@ -1549,6 +1641,7 @@ async fn extract_messages(
                     reply_to: None,
                     thread_root: None,
                     reactions: Vec::new(),
+                    media: None,
                 });
             }
             _ => continue,
@@ -1717,7 +1810,7 @@ async fn handle_select_room(
                                 ),
                             ) = timeline_ev
                             {
-                                let Some(body) = extract_message_body(&msg.content.msgtype) else {
+                                let Some((body, _media)) = extract_message_content(&msg.content.msgtype) else {
                                     continue;
                                 };
                                 let sender = resolve_display_name(&room, &msg.sender).await;
@@ -1821,6 +1914,46 @@ async fn handle_fetch_older(
 }
 
 /// Send a text message to a room.
+async fn handle_download_media(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    mxc_url: &str,
+    filename: &str,
+) {
+    use matrix_sdk::media::MediaFormat;
+
+    let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
+        tracing::error!("Invalid mxc URL: {mxc_url}");
+        return;
+    };
+
+    let request = matrix_sdk::media::MediaRequestParameters {
+        source: matrix_sdk::ruma::events::room::MediaSource::Plain(uri.to_owned()),
+        format: MediaFormat::File,
+    };
+
+    match client.media().get_media_content(&request, true).await {
+        Ok(data) => {
+            // Write to temp file with the original filename.
+            let tmp_dir = std::env::temp_dir().join("matx-media");
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            let path = tmp_dir.join(filename);
+            if let Err(e) = std::fs::write(&path, &data) {
+                tracing::error!("Failed to write media file: {e}");
+                return;
+            }
+            let _ = event_tx
+                .send(MatrixEvent::MediaReady {
+                    path: path.to_string_lossy().to_string(),
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to download media: {e}");
+        }
+    }
+}
+
 async fn handle_send_message(
     client: &Client,
     room_id: &str,

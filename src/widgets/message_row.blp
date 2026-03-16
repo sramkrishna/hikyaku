@@ -66,6 +66,28 @@ template $MxMessageRow : Gtk.Box {
       styles ["mx-message-body"]
     }
 
+    // Media attachment placeholder — clickable.
+    Gtk.Button media_button {
+      visible: false;
+      halign: start;
+      margin-top: 4;
+      styles ["flat", "media-placeholder"]
+
+      Gtk.Box {
+        orientation: horizontal;
+        spacing: 8;
+
+        Gtk.Image media_icon {
+          pixel-size: 20;
+        }
+
+        Gtk.Label media_label {
+          halign: start;
+          ellipsize: end;
+        }
+      }
+    }
+
     // Reactions row — emoji pills.
     Gtk.Box reactions_box {
       orientation: horizontal;
