@@ -77,6 +77,12 @@ mod imp {
                 if let Some(tx) = imp.shutdown_tx.get() {
                     let _ = tx.send(true);
                 }
+                // Failsafe: force exit after 3 seconds if sync hangs.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    tracing::warn!("Force exiting — sync did not stop in time");
+                    std::process::exit(0);
+                });
             });
 
             // Create and present the main window.

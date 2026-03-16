@@ -31,6 +31,9 @@ mod imp {
         pub media_filename: std::rc::Rc<std::cell::RefCell<String>>,
         /// Cached local file path after download.
         pub media_cached_path: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+        /// Edit and delete buttons — visibility toggled per message.
+        pub edit_button: std::cell::RefCell<Option<gtk::Button>>,
+        pub delete_button: std::cell::RefCell<Option<gtk::Button>>,
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -108,6 +111,8 @@ mod imp {
             self.action_bar.append(&self.react_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
+            self.edit_button.replace(Some(edit_button.clone()));
+            self.delete_button.replace(Some(delete_button.clone()));
 
             // Add action bar inside the vertical content box, below the
             // message body. Uses CSS class toggle for gentle fade on hover.
@@ -355,6 +360,7 @@ impl MessageRow {
         &self,
         msg: &crate::models::MessageObject,
         highlight_names: &[String],
+        my_user_id: &str,
     ) {
         let sender = msg.sender();
         let body = msg.body();
@@ -379,6 +385,15 @@ impl MessageRow {
 
         // Thread indicator.
         imp.thread_icon.set_visible(!thread_root.is_empty());
+
+        // Show edit/delete only on own messages.
+        let is_own = !my_user_id.is_empty() && msg.sender_id() == my_user_id;
+        if let Some(ref btn) = *imp.edit_button.borrow() {
+            btn.set_visible(is_own);
+        }
+        if let Some(ref btn) = *imp.delete_button.borrow() {
+            btn.set_visible(is_own);
+        }
 
         // Media attachment.
         let media_json = msg.media_json();

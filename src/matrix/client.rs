@@ -58,6 +58,7 @@ pub struct RoomInfo {
 #[derive(Debug, Clone)]
 pub struct MessageInfo {
     pub sender: String,
+    pub sender_id: String,
     pub body: String,
     pub timestamp: u64,
     pub event_id: String,
@@ -1354,9 +1355,10 @@ async fn start_sync(
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
                         room_name,
-                        sender_id,
+                        sender_id: sender_id.clone(),
                         message: MessageInfo {
                             sender: display_name,
+                            sender_id: sender_id.clone(),
                             body,
                             timestamp,
                             event_id: event.event_id.to_string(),
@@ -1394,9 +1396,10 @@ async fn start_sync(
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
                         room_name,
-                        sender_id,
+                        sender_id: sender_id.clone(),
                         message: MessageInfo {
                             sender: display_name,
+                            sender_id: sender_id.clone(),
                             body: "\u{1f512} Unable to decrypt message".to_string(),
                             timestamp: event.origin_server_ts.as_secs().into(),
                             event_id: event.event_id.to_string(),
@@ -1609,6 +1612,7 @@ async fn extract_messages(
             Err(_) => {
                 messages.push(MessageInfo {
                     sender: String::new(),
+                    sender_id: String::new(),
                     body: "\u{1f512} Unable to decrypt message".to_string(),
                     timestamp: 0,
                     event_id: String::new(),
@@ -1653,6 +1657,7 @@ async fn extract_messages(
 
                 messages.push(MessageInfo {
                     sender: display_name,
+                    sender_id: msg_event.sender.to_string(),
                     body,
                     timestamp: msg_event.origin_server_ts.as_secs().into(),
                     event_id,
@@ -1672,7 +1677,8 @@ async fn extract_messages(
                     _ => (String::new(), String::new()),
                 };
                 messages.push(MessageInfo {
-                    sender,
+                    sender: sender.clone(),
+                    sender_id: sender,
                     body: "\u{1f512} Unable to decrypt message".to_string(),
                     timestamp: 0,
                     event_id,

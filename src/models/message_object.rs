@@ -12,6 +12,9 @@ mod imp {
         sender: RefCell<String>,
 
         #[property(get, set)]
+        sender_id: RefCell<String>,
+
+        #[property(get, set)]
         body: RefCell<String>,
 
         #[property(get, set)]
@@ -61,6 +64,7 @@ glib::wrapper! {
 impl MessageObject {
     pub fn new(
         sender: &str,
+        sender_id: &str,
         body: &str,
         timestamp: u64,
         event_id: &str,
@@ -72,6 +76,7 @@ impl MessageObject {
         let reactions_json = serde_json::to_string(reactions).unwrap_or_default();
         Object::builder()
             .property("sender", sender)
+            .property("sender-id", sender_id)
             .property("body", body)
             .property("timestamp", timestamp)
             .property("event-id", event_id)

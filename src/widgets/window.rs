@@ -383,8 +383,12 @@ impl MxWindow {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+                let my_id = window_weak.upgrade()
+                    .map(|w| w.imp().user_id.borrow().clone())
+                    .unwrap_or_default();
                 let echo = crate::matrix::MessageInfo {
                     sender: "You".to_string(),
+                    sender_id: my_id,
                     body: body.clone(),
                     timestamp: now,
                     event_id: String::new(),
@@ -492,6 +496,7 @@ impl MxWindow {
                         login_page.stop_spinner();
                         tracing::info!("{msg}");
                         window.imp().user_id.replace(user_id.clone());
+                        message_view.set_user_id(&user_id);
                         // Highlight the user's display name, localpart, and
                         // full user ID so mentions in any form get highlighted.
                         let localpart = user_id

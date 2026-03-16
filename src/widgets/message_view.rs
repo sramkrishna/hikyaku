@@ -73,6 +73,8 @@ mod imp {
         pub fetching_older: Cell<bool>,
         /// Names to highlight in message bodies (user's own name + friends).
         pub highlight_names: RefCell<Vec<String>>,
+        /// Current user's Matrix ID for showing edit/delete on own messages.
+        pub user_id: RefCell<String>,
         /// Room members for nick completion: (lowercase_name, display_name, user_id).
         /// Sorted by lowercase_name for binary search prefix matching.
         pub room_members: RefCell<Vec<(String, String, String)>>,
@@ -116,6 +118,7 @@ mod imp {
                 prev_batch_token: RefCell::new(None),
                 fetching_older: Cell::new(false),
                 highlight_names: RefCell::new(Vec::new()),
+                user_id: RefCell::new(String::new()),
                 room_members: RefCell::new(Vec::new()),
                 nick_popover: {
                     let popover = gtk::Popover::new();
@@ -226,13 +229,17 @@ mod imp {
                     .and_downcast::<MessageRow>()
                     .expect("MessageRow expected");
 
-                let names = obj_weak
-                    .upgrade()
+                let view = obj_weak.upgrade();
+                let names = view.as_ref()
                     .map(|o| o.imp().highlight_names.borrow().clone())
+                    .unwrap_or_default();
+                let my_id = view.as_ref()
+                    .map(|o| o.imp().user_id.borrow().clone())
                     .unwrap_or_default();
                 row.bind_message_object(
                     &msg_obj,
                     &names,
+                    &my_id,
                 );
             });
 
@@ -585,6 +592,10 @@ impl MessageView {
         imp.input_entry.grab_focus();
     }
 
+    pub fn set_user_id(&self, user_id: &str) {
+        self.imp().user_id.replace(user_id.to_string());
+    }
+
     pub fn connect_attach<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_attach.replace(Some(Box::new(f)));
     }
@@ -635,7 +646,8 @@ impl MessageView {
                         // Found the ListItem widget — find our MessageRow inside.
                         if let Some(row) = Self::find_message_row(widget) {
                             let names = imp.highlight_names.borrow().clone();
-                            row.bind_message_object(&msg, &names);
+                            let my_id = imp.user_id.borrow().clone();
+                            row.bind_message_object(&msg, &names, &my_id);
                         }
                         break;
                     }
@@ -701,6 +713,7 @@ impl MessageView {
             .unwrap_or_default();
         MessageObject::new(
             &m.sender,
+            &m.sender_id,
             &m.body,
             m.timestamp,
             &m.event_id,
