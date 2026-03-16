@@ -66,8 +66,8 @@ pub struct MessageInfo {
     pub reply_to: Option<String>,
     /// If this message is part of a thread, the thread root event ID.
     pub thread_root: Option<String>,
-    /// Aggregated emoji reactions: (emoji, count).
-    pub reactions: Vec<(String, u64)>,
+    /// Aggregated emoji reactions: (emoji, count, reactor_names).
+    pub reactions: Vec<(String, u64, Vec<String>)>,
     /// Media attachment info (if this is an image/file/video/audio message).
     pub media: Option<MediaInfo>,
     /// Whether this message should be highlighted (reply to us, thread reply, etc.)
@@ -901,15 +901,24 @@ fn extract_message_content(
 }
 
 /// Aggregate a list of emoji strings into (emoji, count) pairs using a HashMap.
-fn aggregate_reactions(emojis: Option<&Vec<String>>) -> Vec<(String, u64)> {
-    let Some(emojis) = emojis else {
+/// Aggregate reactions: (emoji, count, list of reactor display names).
+fn aggregate_reactions(
+    entries: Option<&Vec<(String, String)>>,
+) -> Vec<(String, u64, Vec<String>)> {
+    let Some(entries) = entries else {
         return Vec::new();
     };
-    let mut counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-    for emoji in emojis {
-        *counts.entry(emoji.as_str()).or_insert(0) += 1;
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (emoji, sender) in entries {
+        map.entry(emoji.clone()).or_default().push(sender.clone());
     }
-    counts.into_iter().map(|(e, c)| (e.to_string(), c)).collect()
+    map.into_iter()
+        .map(|(emoji, senders)| {
+            let count = senders.len() as u64;
+            (emoji, count, senders)
+        })
+        .collect()
 }
 
 /// Resolve a user's display name from room membership, falling back to user ID.
@@ -1663,7 +1672,8 @@ async fn extract_messages(
         };
 
     // First pass: collect reactions and replacements (edits).
-    let mut reaction_map: std::collections::HashMap<String, Vec<String>> =
+    // reaction_map: target_event_id → Vec<(emoji, sender_id)>
+    let mut reaction_map: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
     // Map of original_event_id → (latest replacement body, replacement event_id).
     let mut replacement_map: std::collections::HashMap<String, (String, String)> =
@@ -1682,7 +1692,8 @@ async fn extract_messages(
                 ) => {
                     let target = reaction.content.relates_to.event_id.to_string();
                     let emoji = reaction.content.relates_to.key.clone();
-                    reaction_map.entry(target).or_default().push(emoji);
+                    let sender = reaction.sender.to_string();
+                    reaction_map.entry(target).or_default().push((emoji, sender));
                 }
                 matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
                     matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(

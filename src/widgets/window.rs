@@ -77,6 +77,7 @@ mod imp {
                 current_room_meta: RefCell::new(None),
                 details_revealer: gtk::Revealer::builder()
                     .transition_type(gtk::RevealerTransitionType::SlideLeft)
+                    .transition_duration(300)
                     .reveal_child(false)
                     .build(),
                 details_content: gtk::Box::builder()
@@ -283,8 +284,11 @@ impl MxWindow {
                     btn.set_visible(true);
                 }
                 // Hide details sidebar when switching rooms.
-                window.imp().details_revealer.set_reveal_child(false);
-                window.imp().details_revealer.set_visible(false);
+                let rev = window.imp().details_revealer.clone();
+                rev.set_reveal_child(false);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                    if !rev.reveals_child() { rev.set_visible(false); }
+                });
             }
             // Clear unread badge immediately — don't wait for server round-trip.
             room_list.clear_unread(&room_id);
@@ -631,8 +635,17 @@ impl MxWindow {
                             message_view.append_message(&message);
                         }
 
-                        // Desktop notification for mentions.
-                        if is_mention {
+                        // In-app toast + desktop notification for mentions and DMs.
+                        if is_mention && !is_self {
+                            // In-app toast with room name.
+                            let preview = &message.body[..message.body.len().min(60)];
+                            let toast_msg = adw::Toast::builder()
+                                .title(&format!("{} in {}: {preview}", message.sender, room_name))
+                                .timeout(5)
+                                .build();
+                            toast_overlay.add_toast(toast_msg);
+
+                            // Desktop notification.
                             let app = window.application().unwrap();
                             let notif = gio::Notification::new(&format!(
                                 "Mentioned in {}", room_name
@@ -844,7 +857,13 @@ impl MxWindow {
             let currently_visible = imp.details_revealer.reveals_child();
             if currently_visible {
                 imp.details_revealer.set_reveal_child(false);
-                imp.details_revealer.set_visible(false);
+                // Hide after transition completes to release width.
+                let revealer = imp.details_revealer.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                    if !revealer.reveals_child() {
+                        revealer.set_visible(false);
+                    }
+                });
             } else {
                 window.show_room_details();
                 imp.details_revealer.set_visible(true);
@@ -897,7 +916,10 @@ impl MxWindow {
         let revealer_for_close = imp.details_revealer.clone();
         details_close_btn.connect_clicked(move |_| {
             revealer_for_close.set_reveal_child(false);
-            revealer_for_close.set_visible(false);
+            let r = revealer_for_close.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                if !r.reveals_child() { r.set_visible(false); }
+            });
         });
         let details_wrapper = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

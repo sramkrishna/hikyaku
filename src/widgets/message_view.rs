@@ -653,12 +653,13 @@ impl MessageView {
     pub fn add_reaction(&self, event_id: &str, emoji: &str) {
         let emoji = emoji.to_string();
         self.update_message_in_place(event_id, |msg| {
-            let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
-                .unwrap_or_default();
-            if let Some(entry) = reactions.iter_mut().find(|(e, _)| *e == emoji) {
+            let mut reactions: Vec<(String, u64, Vec<String>)> =
+                serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
+            if let Some(entry) = reactions.iter_mut().find(|(e, _, _)| *e == emoji) {
                 entry.1 += 1;
+                entry.2.push("You".to_string());
             } else {
-                reactions.push((emoji.clone(), 1));
+                reactions.push((emoji.clone(), 1, vec!["You".to_string()]));
             }
             msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
@@ -668,9 +669,9 @@ impl MessageView {
     pub fn remove_reaction(&self, event_id: &str, emoji: &str) {
         let emoji = emoji.to_string();
         self.update_message_in_place(event_id, |msg| {
-            let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
-                .unwrap_or_default();
-            if let Some(pos) = reactions.iter().position(|(e, _)| *e == emoji) {
+            let mut reactions: Vec<(String, u64, Vec<String>)> =
+                serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
+            if let Some(pos) = reactions.iter().position(|(e, _, _)| *e == emoji) {
                 if reactions[pos].1 <= 1 {
                     reactions.remove(pos);
                 } else {

@@ -70,7 +70,7 @@ impl MessageObject {
         event_id: &str,
         reply_to: &str,
         thread_root: &str,
-        reactions: &[(String, u64)],
+        reactions: &[(String, u64, Vec<String>)],
         media_json: &str,
     ) -> Self {
         let reactions_json = serde_json::to_string(reactions).unwrap_or_default();

@@ -401,9 +401,18 @@ impl MessageRow {
         imp.sender_text.replace(sender.clone());
         imp.body_text.replace(body.clone());
 
-        // Reply indicator.
+        // Reply indicator — extract original sender from reply fallback.
         if !reply_to.is_empty() {
-            imp.reply_label.set_label(&format!("Reply to message"));
+            // Try to extract the sender from reply fallback format: "> <@user:server>"
+            let reply_sender = body.lines()
+                .find(|l| l.starts_with("> <@"))
+                .and_then(|l| l.strip_prefix("> <"))
+                .and_then(|l| l.split('>').next())
+                .and_then(|uid| uid.strip_prefix('@'))
+                .and_then(|uid| uid.split(':').next())
+                .map(|local| format!("Replying to {local}"))
+                .unwrap_or_else(|| "Reply to message".to_string());
+            imp.reply_label.set_label(&reply_sender);
             imp.reply_box.set_visible(true);
         } else {
             imp.reply_box.set_visible(false);
@@ -487,16 +496,19 @@ impl MessageRow {
         while let Some(child) = imp.reactions_box.first_child() {
             imp.reactions_box.remove(&child);
         }
-        if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64)>>(&reactions_json) {
+        if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(&reactions_json) {
             if !reactions.is_empty() {
-                for (emoji, count) in &reactions {
+                for (emoji, count, names) in &reactions {
                     let label = if *count > 1 {
                         format!("{emoji} {count}")
                     } else {
                         emoji.clone()
                     };
+                    // Tooltip shows who reacted.
+                    let tooltip = names.join(", ");
                     let pill = gtk::Label::builder()
                         .label(&label)
+                        .tooltip_text(&tooltip)
                         .css_classes(["reaction-pill"])
                         .build();
                     imp.reactions_box.append(&pill);
