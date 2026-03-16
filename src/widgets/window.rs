@@ -144,46 +144,25 @@ use crate::matrix::{MatrixCommand, MatrixEvent};
 
 /// Show a simple toast message.
 /// Show a media preview using a shared popover on the MxWindow.
-fn show_media_preview(window: &MxWindow, anchor: &gtk::Widget, path: &str) {
-    let popover = &window.imp().media_popover;
-
-    // Dismiss if already showing.
-    popover.popdown();
-
-    // Reparent to the new anchor.
-    if popover.parent().is_some() {
-        popover.unparent();
+/// Show a media preview — opens the file with the system viewer.
+/// This is the most reliable approach across all file types.
+fn show_media_preview(_window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
+    let uri = format!("file://{}", path);
+    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
+        &uri,
+        gtk::gio::AppLaunchContext::NONE,
+    ) {
+        tracing::error!("Failed to open media: {e}");
     }
-    popover.set_parent(anchor);
+}
 
-    let path_lower = path.to_lowercase();
-    if path_lower.ends_with(".mp4")
-        || path_lower.ends_with(".webm")
-        || path_lower.ends_with(".mov")
-    {
-        let video = gtk::Video::for_filename(Some(path));
-        video.set_autoplay(true);
-        video.set_size_request(400, -1); // Natural aspect ratio.
-        popover.set_child(Some(&video));
-    } else if path_lower.ends_with(".gif") {
-        let media_file = gtk::MediaFile::for_filename(path);
-        media_file.set_loop(true);
-        media_file.play();
-        let video = gtk::Video::new();
-        video.set_media_stream(Some(&media_file));
-        video.set_size_request(400, -1);
-        popover.set_child(Some(&video));
-    } else {
-        // Static image — preserve aspect ratio.
-        let picture = gtk::Picture::for_filename(path);
-        picture.set_can_shrink(true);
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        // Set max width, let height follow aspect ratio.
-        picture.set_width_request(400);
-        popover.set_child(Some(&picture));
-    }
-
-    popover.popup();
+/// Auto-dismiss the media preview popover after 15 seconds.
+fn auto_dismiss_preview(win_weak: glib::WeakRef<MxWindow>) {
+    glib::timeout_add_local_once(std::time::Duration::from_secs(15), move || {
+        if let Some(win) = win_weak.upgrade() {
+            win.imp().media_popover.popdown();
+        }
+    });
 }
 
 fn toast(overlay: &adw::ToastOverlay, msg: &str) {
@@ -435,15 +414,55 @@ impl MxWindow {
         let cmd_tx_attach = command_tx.clone();
         let window_weak_attach = window.downgrade();
         let toast_attach = imp.toast_overlay.clone();
+        let msg_view_attach = imp.message_view.clone();
         imp.message_view.connect_attach(move |file_path| {
             let room_id = window_weak_attach
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
-                let filename = std::path::Path::new(&file_path)
+                let path = std::path::Path::new(&file_path);
+                let filename = path
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default();
+
+                // Detect media kind from extension.
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let kind = match ext.to_lowercase().as_str() {
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => crate::matrix::MediaKind::Image,
+                    "mp4" | "webm" | "mov" => crate::matrix::MediaKind::Video,
+                    "mp3" | "ogg" | "wav" | "flac" => crate::matrix::MediaKind::Audio,
+                    _ => crate::matrix::MediaKind::File,
+                };
+                let size = std::fs::metadata(&file_path).ok().map(|m| m.len());
+
+                // Local echo — show the media message immediately.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let my_id = window_weak_attach.upgrade()
+                    .map(|w| w.imp().user_id.borrow().clone())
+                    .unwrap_or_default();
+                let echo = crate::matrix::MessageInfo {
+                    sender: "You".to_string(),
+                    sender_id: my_id,
+                    body: filename.clone(),
+                    timestamp: now,
+                    event_id: String::new(),
+                    reply_to: None,
+                    thread_root: None,
+                    reactions: Vec::new(),
+                    media: Some(crate::matrix::MediaInfo {
+                        kind,
+                        filename: filename.clone(),
+                        size,
+                        url: format!("file://{file_path}"),
+                        source_json: String::new(),
+                    }),
+                };
+                msg_view_attach.append_message(&echo);
+
                 toast(&toast_attach, &format!("Sending {filename}…"));
                 let tx = cmd_tx_attach.clone();
                 glib::spawn_future_local(async move {
@@ -452,30 +471,35 @@ impl MxWindow {
             }
         });
 
-        // Wire up media hover → check cache or download, then show preview.
+        // Wire up media click → download and open with system viewer.
         let cmd_tx_media = command_tx.clone();
         let window_weak_media = window.downgrade();
-        imp.message_view.connect_media_hover(move |url, filename, widget| {
-            let Some(win) = window_weak_media.upgrade() else { return };
-            let imp = win.imp();
-
-            // Check cache first.
-            let cached = imp.media_cache.borrow().get(&url).cloned();
-            if let Some(path) = cached {
-                show_media_preview(&win, &widget, &path);
+        imp.message_view.connect_media_click(move |url, filename, source_json| {
+            // Local file:// URLs — open directly.
+            if let Some(path) = url.strip_prefix("file://") {
+                show_media_preview(
+                    &window_weak_media.upgrade().unwrap(),
+                    &window_weak_media.upgrade().unwrap().upcast_ref::<gtk::Widget>(),
+                    path,
+                );
                 return;
             }
 
-            // Store the anchor widget for when download completes.
-            imp.media_preview_anchor.replace(Some(widget.clone()));
+            // Check cache.
+            if let Some(win) = window_weak_media.upgrade() {
+                let cached = win.imp().media_cache.borrow().get(&url).cloned();
+                if let Some(path) = cached {
+                    show_media_preview(&win, win.upcast_ref::<gtk::Widget>(), &path);
+                    return;
+                }
+            }
 
             let tx = cmd_tx_media.clone();
-            let url2 = url.clone();
-            let filename2 = filename.clone();
             glib::spawn_future_local(async move {
                 let _ = tx.send(MatrixCommand::DownloadMedia {
-                    url: url2,
-                    filename: filename2,
+                    url,
+                    filename,
+                    source_json,
                 }).await;
             });
         });
@@ -641,11 +665,8 @@ impl MxWindow {
                         // Cache the downloaded path.
                         window.imp().media_cache.borrow_mut().insert(url, path.clone());
 
-                        // Show preview on the anchor widget if still available.
-                        let anchor = window.imp().media_preview_anchor.borrow().clone();
-                        if let Some(widget) = anchor {
-                            show_media_preview(&window, &widget, &path);
-                        }
+                        // Open with system viewer.
+                        show_media_preview(&window, window.upcast_ref::<gtk::Widget>(), &path);
                     }
                     MatrixEvent::RoomJoined { room_id: _, room_name } => {
                         toast(&toast_overlay, &format!("Joined {room_name}"));

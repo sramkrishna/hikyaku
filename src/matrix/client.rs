@@ -78,8 +78,12 @@ pub struct MediaInfo {
     pub kind: MediaKind,
     pub filename: String,
     pub size: Option<u64>,
-    /// Matrix content URI (mxc://).
+    /// Matrix content URI (mxc://) or file:// for local files.
     pub url: String,
+    /// Raw JSON of the MediaSource for encrypted media downloads.
+    /// Empty for unencrypted or non-Matrix URLs.
+    #[serde(default)]
+    pub source_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -257,7 +261,7 @@ pub enum MatrixCommand {
     /// Upload and send a media file.
     SendMedia { room_id: String, file_path: String },
     /// Download media and open with system viewer.
-    DownloadMedia { url: String, filename: String },
+    DownloadMedia { url: String, filename: String, source_json: String },
     /// Toggle bookmark (m.favourite tag) on a room.
     SetFavourite { room_id: String, is_favourite: bool },
     /// Leave a room.
@@ -509,8 +513,8 @@ async fn matrix_task(
                     Ok(MatrixCommand::SendMedia { room_id, file_path }) => {
                         handle_send_media(&client, &event_tx, &room_id, &file_path).await;
                     }
-                    Ok(MatrixCommand::DownloadMedia { url, filename }) => {
-                        handle_download_media(&client, &event_tx, &url, &filename).await;
+                    Ok(MatrixCommand::DownloadMedia { url, filename, source_json }) => {
+                        handle_download_media(&client, &event_tx, &url, &filename, &source_json).await;
                     }
                     Ok(MatrixCommand::SetFavourite { room_id, is_favourite }) => {
                         if let Ok(rid) = RoomId::parse(&room_id) {
@@ -808,6 +812,11 @@ fn is_room_activity(v: &serde_json::Value) -> bool {
         .map_or(false, |t| ACTIVITY_TYPES.contains(t))
 }
 
+/// Serialize a MediaSource to JSON for later reconstruction during download.
+fn media_source_json(source: &matrix_sdk::ruma::events::room::MediaSource) -> String {
+    serde_json::to_string(source).unwrap_or_default()
+}
+
 /// Extract the mxc:// URL from a MediaSource.
 fn media_source_url(source: &matrix_sdk::ruma::events::room::MediaSource) -> String {
     use matrix_sdk::ruma::events::room::MediaSource;
@@ -827,6 +836,7 @@ fn extract_message_content(
         MessageType::Notice(notice) => Some((notice.body.clone(), None)),
         MessageType::Image(image) => {
             let url = media_source_url(&image.source);
+            let source_json = media_source_json(&image.source);
             let size = image.info.as_ref().and_then(|i| i.size).map(|s| s.into());
             Some((
                 image.body.clone(),
@@ -835,11 +845,13 @@ fn extract_message_content(
                     filename: image.filename.clone().unwrap_or_else(|| image.body.clone()),
                     size,
                     url,
+                    source_json,
                 }),
             ))
         }
         MessageType::Video(video) => {
             let url = media_source_url(&video.source);
+            let source_json = media_source_json(&video.source);
             let size = video.info.as_ref().and_then(|i| i.size).map(|s| s.into());
             Some((
                 video.body.clone(),
@@ -848,11 +860,13 @@ fn extract_message_content(
                     filename: video.filename.clone().unwrap_or_else(|| video.body.clone()),
                     size,
                     url,
+                    source_json,
                 }),
             ))
         }
         MessageType::Audio(audio) => {
             let url = media_source_url(&audio.source);
+            let source_json = media_source_json(&audio.source);
             let size = audio.info.as_ref().and_then(|i| i.size).map(|s| s.into());
             Some((
                 audio.body.clone(),
@@ -861,11 +875,13 @@ fn extract_message_content(
                     filename: audio.body.clone(),
                     size,
                     url,
+                    source_json,
                 }),
             ))
         }
         MessageType::File(file) => {
             let url = media_source_url(&file.source);
+            let source_json = media_source_json(&file.source);
             let size = file.info.as_ref().and_then(|i| i.size).map(|s| s.into());
             Some((
                 file.body.clone(),
@@ -874,6 +890,7 @@ fn extract_message_content(
                     filename: file.filename.clone().unwrap_or_else(|| file.body.clone()),
                     size,
                     url,
+                    source_json,
                 }),
             ))
         }
@@ -2068,8 +2085,20 @@ async fn handle_download_media(
     event_tx: &Sender<MatrixEvent>,
     mxc_url: &str,
     filename: &str,
+    source_json: &str,
 ) {
     use matrix_sdk::media::MediaFormat;
+
+    // Handle local file:// URLs (from local echo) — already on disk.
+    if let Some(path) = mxc_url.strip_prefix("file://") {
+        let _ = event_tx
+            .send(MatrixEvent::MediaReady {
+                url: mxc_url.to_string(),
+                path: path.to_string(),
+            })
+            .await;
+        return;
+    }
 
     // Handle HTTPS URLs (e.g. Giphy) — download directly.
     if mxc_url.starts_with("https://") || mxc_url.starts_with("http://") {
@@ -2120,17 +2149,30 @@ async fn handle_download_media(
         return;
     }
 
-    let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
-        tracing::error!("Invalid mxc URL: {mxc_url}");
-        return;
+    // Reconstruct the MediaSource from JSON if available (handles encrypted media).
+    let source = if !source_json.is_empty() {
+        match serde_json::from_str::<matrix_sdk::ruma::events::room::MediaSource>(source_json) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to parse media source JSON: {e}");
+                return;
+            }
+        }
+    } else {
+        let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
+            tracing::error!("Invalid mxc URL: {mxc_url}");
+            return;
+        };
+        matrix_sdk::ruma::events::room::MediaSource::Plain(uri.to_owned())
     };
 
     let request = matrix_sdk::media::MediaRequestParameters {
-        source: matrix_sdk::ruma::events::room::MediaSource::Plain(uri.to_owned()),
+        source,
         format: MediaFormat::File,
     };
 
-    match client.media().get_media_content(&request, true).await {
+    // cache=false ensures encrypted media is freshly decrypted.
+    match client.media().get_media_content(&request, false).await {
         Ok(data) => {
             // Write to temp file with the original filename.
             let tmp_dir = std::env::temp_dir().join("matx-media");

@@ -65,7 +65,7 @@ mod imp {
         /// Callback for deleting a message: (event_id).
         pub on_delete: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for media hover: (mxc_url, filename, anchor widget).
-        pub on_media_hover: RefCell<Option<Box<dyn Fn(String, String, gtk::Widget)>>>,
+        pub on_media_click: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         /// Callback for sending a file: (file_path).
         pub on_attach: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for replying — sets up the reply preview.
@@ -114,7 +114,7 @@ mod imp {
                 on_react: RefCell::new(None),
                 on_edit: RefCell::new(None),
                 on_delete: RefCell::new(None),
-                on_media_hover: RefCell::new(None),
+                on_media_click: RefCell::new(None),
                 on_attach: RefCell::new(None),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
@@ -193,12 +193,12 @@ mod imp {
                     });
 
                     let view_weak = setup_view_weak.clone();
-                    row.set_on_media_hover(move |url, filename, widget| {
+                    row.set_on_media_click(move |url, filename, source_json| {
                         if let Some(v) = view_weak.upgrade() {
-                            let has_cb = v.imp().on_media_hover.borrow().is_some();
+                            let has_cb = v.imp().on_media_click.borrow().is_some();
                             if has_cb {
-                                let borrow = v.imp().on_media_hover.borrow();
-                                borrow.as_ref().unwrap()(url, filename, widget);
+                                let borrow = v.imp().on_media_click.borrow();
+                                borrow.as_ref().unwrap()(url, filename, source_json);
                             }
                         }
                     });
@@ -607,8 +607,8 @@ impl MessageView {
         self.imp().on_attach.replace(Some(Box::new(f)));
     }
 
-    pub fn connect_media_hover<F: Fn(String, String, gtk::Widget) + 'static>(&self, f: F) {
-        self.imp().on_media_hover.replace(Some(Box::new(f)));
+    pub fn connect_media_click<F: Fn(String, String, String) + 'static>(&self, f: F) {
+        self.imp().on_media_click.replace(Some(Box::new(f)));
     }
 
     /// Update a message in the timeline by event_id. The `mutate` closure

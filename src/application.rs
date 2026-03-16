@@ -89,6 +89,15 @@ mod imp {
             let window = MxWindow::new(&app, event_rx, command_tx);
             window.set_title(Some(config::APP_NAME));
             window.set_default_size(1000, 700);
+
+            // Ensure closing the window quits the app.
+            let app_weak = app.downgrade();
+            window.connect_close_request(move |_| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.quit();
+                }
+                glib::Propagation::Proceed
+            });
             window.present();
         }
     }
