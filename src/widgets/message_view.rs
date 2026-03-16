@@ -781,12 +781,23 @@ impl MessageView {
         self.imp().prev_batch_token.borrow().clone()
     }
 
-    /// Clear messages and show placeholder (used when switching rooms before new data arrives).
+    /// Clear messages and room meta (used when switching rooms before new data arrives).
     pub fn clear(&self) {
         let imp = self.imp();
         imp.list_store.remove_all();
         imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
+        // Clear info banner so stale pinned messages don't flash.
+        imp.info_banner.set_visible(false);
+        imp.info_separator.set_visible(false);
+        imp.topic_label.set_visible(false);
+        imp.tombstone_banner.set_visible(false);
+        imp.pinned_box.set_visible(false);
+        self.remove_css_class("tombstone-view");
+        // Clear reply state.
+        imp.reply_to_event.replace(None);
+        imp.reply_quote.replace(None);
+        imp.reply_preview.set_visible(false);
     }
 
     /// Connect a callback for when the user scrolls to the top (load older messages).
