@@ -58,6 +58,10 @@ mod imp {
         pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>)>>>,
         /// Callback for sending a reaction: (event_id, emoji).
         pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for editing a message: (event_id, body).
+        pub on_edit: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback for deleting a message: (event_id).
+        pub on_delete: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for media hover: (mxc_url, filename, anchor widget).
         pub on_media_hover: RefCell<Option<Box<dyn Fn(String, String, gtk::Widget)>>>,
         /// Callback for sending a file: (file_path).
@@ -103,6 +107,8 @@ mod imp {
                 reply_to_event: RefCell::new(None),
                 on_send: RefCell::new(None),
                 on_react: RefCell::new(None),
+                on_edit: RefCell::new(None),
+                on_delete: RefCell::new(None),
                 on_media_hover: RefCell::new(None),
                 on_attach: RefCell::new(None),
                 on_reply: RefCell::new(None),
@@ -161,6 +167,22 @@ mod imp {
                     row.set_on_reply(move |eid, sender, body| {
                         if let Some(v) = view_weak.upgrade() {
                             v.start_reply(&eid, &sender, &body);
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_edit(move |eid, body| {
+                        if let Some(v) = view_weak.upgrade() {
+                            v.start_edit(&eid, &body);
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_delete(move |eid| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_delete.borrow() {
+                                cb(eid);
+                            }
                         }
                     });
 
@@ -541,6 +563,26 @@ impl MessageView {
 
     pub fn connect_react<F: Fn(String, String) + 'static>(&self, f: F) {
         self.imp().on_react.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_edit<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_edit.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_delete<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_delete.replace(Some(Box::new(f)));
+    }
+
+    /// Enter edit mode — populate compose box with old text.
+    pub fn start_edit(&self, event_id: &str, body: &str) {
+        let imp = self.imp();
+        // Use reply_to_event to store the event being edited.
+        // The send handler checks if this is an edit or new message.
+        imp.reply_to_event.replace(Some(format!("edit:{event_id}")));
+        imp.reply_preview_label.set_label(&format!("Editing message"));
+        imp.reply_preview.set_visible(true);
+        imp.input_entry.set_text(body);
+        imp.input_entry.grab_focus();
     }
 
     pub fn connect_attach<F: Fn(String) + 'static>(&self, f: F) {

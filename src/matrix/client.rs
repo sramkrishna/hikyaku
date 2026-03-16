@@ -246,6 +246,10 @@ pub enum MatrixCommand {
     BrowseSpaceRooms { space_id: String },
     /// Join a room by ID or alias.
     JoinRoom { room_id_or_alias: String },
+    /// Delete (redact) a message.
+    RedactMessage { room_id: String, event_id: String },
+    /// Edit a message (send replacement).
+    EditMessage { room_id: String, event_id: String, new_body: String },
     /// Upload and send a media file.
     SendMedia { room_id: String, file_path: String },
     /// Download media and open with system viewer.
@@ -473,6 +477,30 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
                         handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    }
+                    Ok(MatrixCommand::RedactMessage { room_id, event_id }) => {
+                        if let (Ok(rid), Ok(eid)) = (RoomId::parse(&room_id), matrix_sdk::ruma::EventId::parse(&event_id)) {
+                            if let Some(room) = client.get_room(&rid) {
+                                if let Err(e) = room.redact(&eid, None, None).await {
+                                    tracing::error!("Failed to redact: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(MatrixCommand::EditMessage { room_id, event_id, new_body }) => {
+                        if let (Ok(rid), Ok(eid)) = (RoomId::parse(&room_id), matrix_sdk::ruma::EventId::parse(&event_id)) {
+                            if let Some(room) = client.get_room(&rid) {
+                                use matrix_sdk::ruma::events::room::message::{
+                                    RoomMessageEventContent, ReplacementMetadata,
+                                };
+                                let metadata = ReplacementMetadata::new(eid.to_owned(), None);
+                                let content = RoomMessageEventContent::text_plain(&new_body)
+                                    .make_replacement(metadata, None);
+                                if let Err(e) = room.send(content).await {
+                                    tracing::error!("Failed to edit message: {e}");
+                                }
+                            }
+                        }
                     }
                     Ok(MatrixCommand::SendMedia { room_id, file_path }) => {
                         handle_send_media(&client, &event_tx, &room_id, &file_path).await;

@@ -49,6 +49,8 @@ mod imp {
         pub media_cache: RefCell<std::collections::HashMap<String, String>>,
         /// Widget to anchor the next media preview popover to.
         pub media_preview_anchor: RefCell<Option<gtk::Widget>>,
+        /// Shared media preview popover — reused across hovers.
+        pub media_popover: gtk::Popover,
     }
 
     impl Default for MxWindow {
@@ -86,6 +88,12 @@ mod imp {
                 user_id: RefCell::new(String::new()),
                 media_cache: RefCell::new(std::collections::HashMap::new()),
                 media_preview_anchor: RefCell::new(None),
+                media_popover: {
+                    let p = gtk::Popover::new();
+                    p.set_autohide(true);
+                    p.set_has_arrow(true);
+                    p
+                },
             }
         }
     }
@@ -135,59 +143,46 @@ use crate::config::AppearanceSettings;
 use crate::matrix::{MatrixCommand, MatrixEvent};
 
 /// Show a simple toast message.
-/// Show a media preview popover anchored to the given widget.
-fn show_media_popover(anchor: &gtk::Widget, path: &str) {
-    let popover = gtk::Popover::new();
-    popover.set_autohide(true);
-    popover.set_has_arrow(true);
+/// Show a media preview using a shared popover on the MxWindow.
+fn show_media_preview(window: &MxWindow, anchor: &gtk::Widget, path: &str) {
+    let popover = &window.imp().media_popover;
+
+    // Dismiss if already showing.
+    popover.popdown();
+
+    // Reparent to the new anchor.
+    if popover.parent().is_some() {
+        popover.unparent();
+    }
+    popover.set_parent(anchor);
 
     let path_lower = path.to_lowercase();
     if path_lower.ends_with(".mp4")
         || path_lower.ends_with(".webm")
         || path_lower.ends_with(".mov")
-        || path_lower.ends_with(".avi")
     {
-        // Video preview.
         let video = gtk::Video::for_filename(Some(path));
         video.set_autoplay(true);
-        video.set_size_request(320, 240);
+        video.set_size_request(400, -1); // Natural aspect ratio.
         popover.set_child(Some(&video));
-    } else if path_lower.ends_with(".mp3")
-        || path_lower.ends_with(".ogg")
-        || path_lower.ends_with(".wav")
-        || path_lower.ends_with(".flac")
-    {
-        // Audio — just show a label with the filename.
-        let label = gtk::Label::builder()
-            .label(&format!("🔊 {}", std::path::Path::new(path)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default()))
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(8)
-            .margin_bottom(8)
-            .build();
-        popover.set_child(Some(&label));
     } else if path_lower.ends_with(".gif") {
-        // Animated GIF — use MediaFile for animation support.
         let media_file = gtk::MediaFile::for_filename(path);
         media_file.set_loop(true);
         media_file.play();
         let video = gtk::Video::new();
         video.set_media_stream(Some(&media_file));
-        video.set_size_request(320, 240);
+        video.set_size_request(400, -1);
         popover.set_child(Some(&video));
     } else {
-        // Static image preview.
+        // Static image — preserve aspect ratio.
         let picture = gtk::Picture::for_filename(path);
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_size_request(320, 240);
+        // Set max width, let height follow aspect ratio.
+        picture.set_width_request(400);
         popover.set_child(Some(&picture));
     }
 
-    popover.set_parent(anchor);
     popover.popup();
 }
 
@@ -330,11 +325,59 @@ impl MxWindow {
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
         let msg_view_for_send = imp.message_view.clone();
+        // Wire up delete → redact command.
+        let cmd_tx_delete = command_tx.clone();
+        let window_weak_del = window.downgrade();
+        let toast_del = imp.toast_overlay.clone();
+        imp.message_view.connect_delete(move |event_id| {
+            let room_id = window_weak_del
+                .upgrade()
+                .and_then(|w| w.imp().current_room_id.borrow().clone());
+            if let Some(room_id) = room_id {
+                toast(&toast_del, "Message deleted");
+                let tx = cmd_tx_delete.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::RedactMessage { room_id, event_id }).await;
+                });
+            }
+        });
+
+        // Wire up edit → send replacement.
+        let cmd_tx_edit = command_tx.clone();
+        let window_weak_edit = window.downgrade();
+        imp.message_view.connect_edit(move |event_id, new_body| {
+            let room_id = window_weak_edit
+                .upgrade()
+                .and_then(|w| w.imp().current_room_id.borrow().clone());
+            if let Some(room_id) = room_id {
+                let tx = cmd_tx_edit.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::EditMessage { room_id, event_id, new_body }).await;
+                });
+            }
+        });
+
+        let cmd_tx_edit2 = command_tx.clone();
         imp.message_view.connect_send_message(move |body, reply_to| {
             let room_id = window_weak
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
+                // Check if this is an edit (reply_to starts with "edit:").
+                if let Some(ref rt) = reply_to {
+                    if let Some(event_id) = rt.strip_prefix("edit:") {
+                        let tx = cmd_tx_edit2.clone();
+                        let eid = event_id.to_string();
+                        let new_body = body.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(MatrixCommand::EditMessage {
+                                room_id, event_id: eid, new_body,
+                            }).await;
+                        });
+                        return;
+                    }
+                }
+
                 // Local echo — show the message immediately.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -409,7 +452,7 @@ impl MxWindow {
             // Check cache first.
             let cached = imp.media_cache.borrow().get(&url).cloned();
             if let Some(path) = cached {
-                show_media_popover(&widget, &path);
+                show_media_preview(&win, &widget, &path);
                 return;
             }
 
@@ -590,7 +633,7 @@ impl MxWindow {
                         // Show preview on the anchor widget if still available.
                         let anchor = window.imp().media_preview_anchor.borrow().clone();
                         if let Some(widget) = anchor {
-                            show_media_popover(&widget, &path);
+                            show_media_preview(&window, &widget, &path);
                         }
                     }
                     MatrixEvent::RoomJoined { room_id: _, room_name } => {

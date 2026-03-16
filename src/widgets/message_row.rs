@@ -20,6 +20,10 @@ mod imp {
         pub on_react: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Emoji chooser for reactions (created once per row).
         pub react_chooser: gtk::EmojiChooser,
+        /// Callback: edit clicked → (event_id, body).
+        pub on_edit: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
+        /// Callback: delete clicked → (event_id).
+        pub on_delete: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Callback: media hover → (mxc_url, filename, callback for file path).
         pub on_media_hover: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, gtk::Widget)>>>>,
         /// Current media URL and filename.
@@ -84,10 +88,26 @@ mod imp {
             self.react_button.add_css_class("flat");
             self.react_button.add_css_class("circular");
 
+            let edit_button = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Edit")
+                .build();
+            edit_button.add_css_class("flat");
+            edit_button.add_css_class("circular");
+
+            let delete_button = gtk::Button::builder()
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Delete")
+                .build();
+            delete_button.add_css_class("flat");
+            delete_button.add_css_class("circular");
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
             self.action_bar.append(&self.react_button);
+            self.action_bar.append(&edit_button);
+            self.action_bar.append(&delete_button);
 
             // Add action bar inside the vertical content box, below the
             // message body. Uses CSS class toggle for gentle fade on hover.
@@ -144,6 +164,28 @@ mod imp {
                 let eid = event_id.borrow().clone();
                 if let Some(ref cb) = *on_react_ref.borrow() {
                     cb(eid, emoji.to_string());
+                }
+            });
+
+            // Edit button — enter edit mode with current body.
+            let event_id = self.event_id.clone();
+            let body_text = self.body_text.clone();
+            let on_edit = self.on_edit.clone();
+            edit_button.connect_clicked(move |_| {
+                let eid = event_id.borrow().clone();
+                let body = body_text.borrow().clone();
+                if let Some(ref cb) = *on_edit.borrow() {
+                    cb(eid, body);
+                }
+            });
+
+            // Delete button — redact the message.
+            let event_id = self.event_id.clone();
+            let on_delete = self.on_delete.clone();
+            delete_button.connect_clicked(move |_| {
+                let eid = event_id.borrow().clone();
+                if let Some(ref cb) = *on_delete.borrow() {
+                    cb(eid);
                 }
             });
 
@@ -294,6 +336,14 @@ impl MessageRow {
 
     pub fn set_on_react<F: Fn(String, String) + 'static>(&self, f: F) {
         self.imp().on_react.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_edit<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_edit.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_delete<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_delete.borrow_mut().replace(Box::new(f));
     }
 
     pub fn set_on_media_hover<F: Fn(String, String, gtk::Widget) + 'static>(&self, f: F) {
