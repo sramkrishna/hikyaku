@@ -1710,8 +1710,26 @@ async fn extract_messages(
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(o) => {
                         (o.sender.to_string(), o.event_id.to_string())
                     }
-                    _ => (String::new(), String::new()),
+                    _ => continue,
                 };
+                // Skip replacement events, redacted events, and encrypted
+                // events that are edits (check raw JSON for m.relates_to).
+                if replacement_event_ids.contains(&event_id) || event_id.is_empty() {
+                    continue;
+                }
+                // Check raw JSON for replacement relation (encrypted edits).
+                let raw = timeline_event.raw().json().get();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(rel_type) = v.get("content")
+                        .and_then(|c| c.get("m.relates_to"))
+                        .and_then(|r| r.get("rel_type"))
+                        .and_then(|t| t.as_str())
+                    {
+                        if rel_type == "m.replace" {
+                            continue;
+                        }
+                    }
+                }
                 messages.push(MessageInfo {
                     sender: sender.clone(),
                     sender_id: sender,
