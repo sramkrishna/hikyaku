@@ -1354,11 +1354,54 @@ async fn start_sync(
 
                 let display_name = resolve_display_name(&room, &event.sender).await;
 
-                // Check if this message mentions the current user.
+                // Check if this message mentions the current user:
+                // 1. Direct @mention in body text
+                // 2. Reply to one of our messages (in_reply_to or thread)
                 let is_mention = if let Some(user_id) = client.user_id() {
                     let uid = user_id.as_str();
                     let local = user_id.localpart();
-                    body.contains(uid) || body.to_lowercase().contains(&local.to_lowercase())
+                    let text_mention = body.contains(uid)
+                        || body.to_lowercase().contains(&local.to_lowercase());
+
+                    // Check if this is a reply to our message.
+                    let is_reply_to_us = if let Some(ref relates_to) = event.content.relates_to {
+                        use matrix_sdk::ruma::events::room::message::Relation;
+                        match relates_to {
+                            Relation::Reply { in_reply_to } => {
+                                // Check if the replied-to event is ours.
+                                if let Some(original_room) = client.get_room(room.room_id()) {
+                                    original_room.event(&in_reply_to.event_id, None).await
+                                        .ok()
+                                        .and_then(|ev| ev.raw().deserialize().ok())
+                                        .map(|ev: matrix_sdk::ruma::events::AnySyncTimelineEvent| {
+                                            ev.sender() == user_id
+                                        })
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
+                            }
+                            Relation::Thread(thread) => {
+                                // Thread reply — check if the thread root is ours.
+                                if let Some(original_room) = client.get_room(room.room_id()) {
+                                    original_room.event(&thread.event_id, None).await
+                                        .ok()
+                                        .and_then(|ev| ev.raw().deserialize().ok())
+                                        .map(|ev: matrix_sdk::ruma::events::AnySyncTimelineEvent| {
+                                            ev.sender() == user_id
+                                        })
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    text_mention || is_reply_to_us
                 } else {
                     false
                 };

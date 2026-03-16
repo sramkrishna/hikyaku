@@ -144,16 +144,50 @@ use crate::matrix::{MatrixCommand, MatrixEvent};
 
 /// Show a simple toast message.
 /// Show a media preview using a shared popover on the MxWindow.
-/// Show a media preview — opens the file with the system viewer.
-/// This is the most reliable approach across all file types.
-fn show_media_preview(_window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
-    let uri = format!("file://{}", path);
-    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
-        &uri,
-        gtk::gio::AppLaunchContext::NONE,
-    ) {
-        tracing::error!("Failed to open media: {e}");
+/// Show a media preview in-app using a dialog with gtk::Picture or gtk::Video.
+fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
+    let path_lower = path.to_lowercase();
+
+    let dialog = adw::Dialog::builder()
+        .content_width(600)
+        .content_height(500)
+        .title("Media Preview")
+        .build();
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+
+    if path_lower.ends_with(".mp4")
+        || path_lower.ends_with(".webm")
+        || path_lower.ends_with(".mov")
+    {
+        let video = gtk::Video::for_filename(Some(path));
+        video.set_autoplay(true);
+        video.set_vexpand(true);
+        video.set_hexpand(true);
+        toolbar.set_content(Some(&video));
+    } else if path_lower.ends_with(".gif") {
+        let media_file = gtk::MediaFile::for_filename(path);
+        media_file.set_loop(true);
+        media_file.play();
+        let video = gtk::Video::new();
+        video.set_media_stream(Some(&media_file));
+        video.set_vexpand(true);
+        video.set_hexpand(true);
+        toolbar.set_content(Some(&video));
+    } else {
+        // Image — use gio::File to handle paths with spaces.
+        let file = gio::File::for_path(path);
+        let picture = gtk::Picture::for_file(&file);
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_vexpand(true);
+        picture.set_hexpand(true);
+        toolbar.set_content(Some(&picture));
     }
+
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(window));
 }
 
 /// Auto-dismiss the media preview popover after 15 seconds.
