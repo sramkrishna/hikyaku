@@ -76,13 +76,12 @@ mod imp {
                 verify_dialog: RefCell::new(None),
                 current_room_meta: RefCell::new(None),
                 details_revealer: gtk::Revealer::builder()
-                    .transition_type(gtk::RevealerTransitionType::Crossfade)
-                    .transition_duration(200)
+                    .transition_type(gtk::RevealerTransitionType::None)
                     .reveal_child(false)
                     .build(),
                 details_content: gtk::Box::builder()
                     .orientation(gtk::Orientation::Vertical)
-                    .width_request(280)
+                    .width_request(200)
                     .build(),
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
@@ -284,11 +283,8 @@ impl MxWindow {
                     btn.set_visible(true);
                 }
                 // Hide details sidebar when switching rooms.
-                let rev = window.imp().details_revealer.clone();
-                rev.set_reveal_child(false);
-                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                    if !rev.reveals_child() { rev.set_visible(false); }
-                });
+                window.imp().details_revealer.set_reveal_child(false);
+                window.imp().details_revealer.set_visible(false);
             }
             // Clear unread badge immediately — don't wait for server round-trip.
             room_list.clear_unread(&room_id);
@@ -864,13 +860,7 @@ impl MxWindow {
             let currently_visible = imp.details_revealer.reveals_child();
             if currently_visible {
                 imp.details_revealer.set_reveal_child(false);
-                // Hide after transition completes to release width.
-                let revealer = imp.details_revealer.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                    if !revealer.reveals_child() {
-                        revealer.set_visible(false);
-                    }
-                });
+                imp.details_revealer.set_visible(false);
             } else {
                 window.show_room_details();
                 imp.details_revealer.set_visible(true);
@@ -923,10 +913,7 @@ impl MxWindow {
         let revealer_for_close = imp.details_revealer.clone();
         details_close_btn.connect_clicked(move |_| {
             revealer_for_close.set_reveal_child(false);
-            let r = revealer_for_close.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                if !r.reveals_child() { r.set_visible(false); }
-            });
+            revealer_for_close.set_visible(false);
         });
         let details_wrapper = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
