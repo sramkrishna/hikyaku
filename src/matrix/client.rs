@@ -218,7 +218,10 @@ pub enum MatrixCommand {
     SendMessage {
         room_id: String,
         body: String,
+        /// Event ID to reply to (if replying).
         reply_to: Option<String>,
+        /// Original sender + body for quote fallback (if replying).
+        quote_text: Option<(String, String)>,
     },
     /// Send an emoji reaction to a message.
     SendReaction {
@@ -442,8 +445,8 @@ async fn matrix_task(
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
                         handle_select_room(&client, &event_tx, &room_id, &mut rooms_with_keys).await;
                     }
-                    Ok(MatrixCommand::SendMessage { room_id, body, reply_to }) => {
-                        handle_send_message(&client, &room_id, &body, reply_to.as_deref()).await;
+                    Ok(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }) => {
+                        handle_send_message(&client, &room_id, &body, reply_to.as_deref(), quote_text.as_ref()).await;
                     }
                     Ok(MatrixCommand::SendReaction { room_id, event_id, emoji }) => {
                         handle_send_reaction(&client, &room_id, &event_id, &emoji).await;
@@ -2104,6 +2107,7 @@ async fn handle_send_message(
     room_id: &str,
     body: &str,
     reply_to: Option<&str>,
+    quote_text: Option<&(String, String)>,
 ) {
     use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 
@@ -2117,7 +2121,19 @@ async fn handle_send_message(
         return;
     };
 
-    let mut content = RoomMessageEventContent::text_plain(body);
+    // Build body with quote fallback if replying.
+    let full_body = if let Some((quote_sender, quote_body)) = quote_text {
+        // Matrix fallback format: "> <sender> original\n\nreply"
+        let quoted_lines: String = quote_body
+            .lines()
+            .map(|l| format!("> {l}\n"))
+            .collect();
+        format!("> <{quote_sender}>\n{quoted_lines}\n{body}")
+    } else {
+        body.to_string()
+    };
+
+    let mut content = RoomMessageEventContent::text_plain(&full_body);
 
     // If replying, set the in_reply_to relation.
     if let Some(reply_event_id) = reply_to {

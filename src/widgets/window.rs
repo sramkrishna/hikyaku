@@ -358,7 +358,7 @@ impl MxWindow {
         });
 
         let cmd_tx_edit2 = command_tx.clone();
-        imp.message_view.connect_send_message(move |body, reply_to| {
+        imp.message_view.connect_send_message(move |body, reply_to, quote_text| {
             let room_id = window_weak
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
@@ -401,7 +401,7 @@ impl MxWindow {
 
                 let tx = cmd_tx.clone();
                 glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::SendMessage { room_id, body, reply_to }).await;
+                    let _ = tx.send(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }).await;
                 });
             }
         });

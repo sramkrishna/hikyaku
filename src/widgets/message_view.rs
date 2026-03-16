@@ -54,8 +54,10 @@ mod imp {
         pub reply_cancel_button: TemplateChild<gtk::Button>,
         /// The event ID we're replying to (None = not replying).
         pub reply_to_event: RefCell<Option<String>>,
-        /// Callback for sending a message: (body, reply_to_event_id).
-        pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>)>>>,
+        /// Quote sender + body for the reply (for fallback format).
+        pub reply_quote: RefCell<Option<(String, String)>>,
+        /// Callback for sending a message: (body, reply_to_event_id, quote_text).
+        pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>, Option<(String, String)>)>>>,
         /// Callback for sending a reaction: (event_id, emoji).
         pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
         /// Callback for editing a message: (event_id, body).
@@ -107,6 +109,7 @@ mod imp {
                 reply_preview_label: Default::default(),
                 reply_cancel_button: Default::default(),
                 reply_to_event: RefCell::new(None),
+                reply_quote: RefCell::new(None),
                 on_send: RefCell::new(None),
                 on_react: RefCell::new(None),
                 on_edit: RefCell::new(None),
@@ -256,11 +259,13 @@ mod imp {
                 if !text.is_empty() {
                     let imp = view.imp();
                     let reply_to = imp.reply_to_event.borrow().clone();
+                    let quote = imp.reply_quote.borrow().clone();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text, reply_to);
+                        cb(text, reply_to, quote);
                     }
                     entry.set_text("");
                     imp.reply_to_event.replace(None);
+                    imp.reply_quote.replace(None);
                     imp.reply_preview.set_visible(false);
                 }
             });
@@ -290,12 +295,14 @@ mod imp {
                 if !text.is_empty() {
                     let imp = view.imp();
                     let reply_to = imp.reply_to_event.borrow().clone();
+                    let quote = imp.reply_quote.borrow().clone();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text, reply_to);
+                        cb(text, reply_to, quote);
                     }
                     entry.set_text("");
                     // Clear reply state.
                     imp.reply_to_event.replace(None);
+                    imp.reply_quote.replace(None);
                     imp.reply_preview.set_visible(false);
                 }
             });
@@ -564,7 +571,7 @@ impl MessageView {
         self.imp().highlight_names.borrow_mut().push(name.to_string());
     }
 
-    pub fn connect_send_message<F: Fn(String, Option<String>) + 'static>(&self, f: F) {
+    pub fn connect_send_message<F: Fn(String, Option<String>, Option<(String, String)>) + 'static>(&self, f: F) {
         self.imp().on_send.replace(Some(Box::new(f)));
     }
 
@@ -663,6 +670,7 @@ impl MessageView {
     pub fn start_reply(&self, event_id: &str, sender: &str, body: &str) {
         let imp = self.imp();
         imp.reply_to_event.replace(Some(event_id.to_string()));
+        imp.reply_quote.replace(Some((sender.to_string(), body.to_string())));
         imp.reply_preview_label.set_label(&format!("{sender}: {body}"));
         imp.reply_preview.set_visible(true);
         imp.input_entry.grab_focus();
