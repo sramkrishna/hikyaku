@@ -510,7 +510,9 @@ impl MessageRow {
         }
 
         // Delegate to text rendering with highlights.
-        self.render_body(&sender, &body, timestamp, highlight_names);
+        // Also highlight if the message is marked as a reply-to-us.
+        let force_highlight = msg.is_highlight();
+        self.render_body(&sender, &body, timestamp, highlight_names, force_highlight);
     }
 
     fn render_body(
@@ -519,13 +521,15 @@ impl MessageRow {
         body: &str,
         timestamp: u64,
         highlight_names: &[String],
+        force_highlight: bool,
     ) {
         let imp = self.imp();
         imp.sender_label.set_label(sender);
 
-        // Check if any highlight name appears in the body.
+        // Check if any highlight name appears in the body,
+        // or if this message is flagged as a reply-to-us.
         let body_lower = body.to_lowercase();
-        let has_highlight = highlight_names
+        let has_highlight = force_highlight || highlight_names
             .iter()
             .any(|n| !n.is_empty() && body_lower.contains(&n.to_lowercase()));
 

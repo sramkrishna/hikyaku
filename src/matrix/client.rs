@@ -70,6 +70,8 @@ pub struct MessageInfo {
     pub reactions: Vec<(String, u64)>,
     /// Media attachment info (if this is an image/file/video/audio message).
     pub media: Option<MediaInfo>,
+    /// Whether this message should be highlighted (reply to us, thread reply, etc.)
+    pub is_highlight: bool,
 }
 
 /// Media attachment on a message.
@@ -1435,6 +1437,7 @@ async fn start_sync(
                             thread_root: None,
                             reactions: Vec::new(),
                             media,
+                            is_highlight: false,
                         },
                         is_mention,
                     })
@@ -1476,6 +1479,7 @@ async fn start_sync(
                             thread_root: None,
                             reactions: Vec::new(),
                             media: None,
+                            is_highlight: false,
                         },
                         is_mention: false,
                     })
@@ -1646,6 +1650,7 @@ async fn extract_messages(
     room: &matrix_sdk::room::Room,
     chunk: &[matrix_sdk::deserialized_responses::TimelineEvent],
     reverse: bool,
+    my_user_id: Option<&matrix_sdk::ruma::UserId>,
 ) -> Vec<MessageInfo> {
     use matrix_sdk::ruma::events::room::message::MessageType;
 
@@ -1767,6 +1772,7 @@ async fn extract_messages(
                     thread_root,
                     reactions,
                     media,
+                    is_highlight: false,
                 });
             }
             matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
@@ -1806,11 +1812,36 @@ async fn extract_messages(
                     thread_root: None,
                     reactions: Vec::new(),
                     media: None,
+                    is_highlight: false,
                 });
             }
             _ => continue,
         }
     }
+    // Post-process: mark messages as highlights if they reply to us.
+    if let Some(uid) = my_user_id {
+        // Collect our event_ids from this batch.
+        let my_event_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|m| m.sender_id == uid.as_str())
+            .map(|m| m.event_id.clone())
+            .collect();
+
+        // Mark any message that replies to one of our event_ids.
+        for msg in &mut messages {
+            if let Some(ref reply_to) = msg.reply_to {
+                if my_event_ids.contains(reply_to) {
+                    msg.is_highlight = true;
+                }
+            }
+            if let Some(ref thread_root) = msg.thread_root {
+                if my_event_ids.contains(thread_root) {
+                    msg.is_highlight = true;
+                }
+            }
+        }
+    }
+
     messages
 }
 
@@ -1879,7 +1910,7 @@ async fn handle_select_room(
     let (all_messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
             tracing::debug!("Got {} events for {room_id}", response.chunk.len());
-            let msgs = extract_messages(&room, &response.chunk, true).await;
+            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
             let token = response.end.map(|t| t.to_string());
 
             // Send a read receipt for the most recent event to clear unread count.
@@ -2058,7 +2089,7 @@ async fn handle_fetch_older(
 
     let (messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
-            let msgs = extract_messages(&room, &response.chunk, true).await;
+            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
             let token = response.end.map(|t| t.to_string());
             (msgs, token)
         }

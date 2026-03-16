@@ -757,7 +757,7 @@ impl MessageView {
         let media_json = m.media.as_ref()
             .and_then(|media| serde_json::to_string(media).ok())
             .unwrap_or_default();
-        MessageObject::new(
+        let obj = MessageObject::new(
             &m.sender,
             &m.sender_id,
             &m.body,
@@ -767,7 +767,9 @@ impl MessageView {
             m.thread_root.as_deref().unwrap_or(""),
             &m.reactions,
             &media_json,
-        )
+        );
+        obj.set_is_highlight(m.is_highlight);
+        obj
     }
 
     /// Get the current pagination token.

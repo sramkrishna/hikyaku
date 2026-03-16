@@ -284,6 +284,7 @@ impl MxWindow {
                 }
                 // Hide details sidebar when switching rooms.
                 window.imp().details_revealer.set_reveal_child(false);
+                window.imp().details_revealer.set_visible(false);
             }
             // Clear unread badge immediately — don't wait for server round-trip.
             room_list.clear_unread(&room_id);
@@ -415,6 +416,7 @@ impl MxWindow {
                     thread_root: None,
                     reactions: Vec::new(),
                     media: None,
+                    is_highlight: false,
                 };
                 msg_view_for_send.append_message(&echo);
 
@@ -495,6 +497,7 @@ impl MxWindow {
                         url: format!("file://{file_path}"),
                         source_json: String::new(),
                     }),
+                    is_highlight: false,
                 };
                 msg_view_attach.append_message(&echo);
 
@@ -841,8 +844,10 @@ impl MxWindow {
             let currently_visible = imp.details_revealer.reveals_child();
             if currently_visible {
                 imp.details_revealer.set_reveal_child(false);
+                imp.details_revealer.set_visible(false);
             } else {
                 window.show_room_details();
+                imp.details_revealer.set_visible(true);
                 imp.details_revealer.set_reveal_child(true);
             }
         });
@@ -892,6 +897,7 @@ impl MxWindow {
         let revealer_for_close = imp.details_revealer.clone();
         details_close_btn.connect_clicked(move |_| {
             revealer_for_close.set_reveal_child(false);
+            revealer_for_close.set_visible(false);
         });
         let details_wrapper = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
