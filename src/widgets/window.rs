@@ -366,6 +366,9 @@ impl MxWindow {
                 // Check if this is an edit (reply_to starts with "edit:").
                 if let Some(ref rt) = reply_to {
                     if let Some(event_id) = rt.strip_prefix("edit:") {
+                        // Update locally immediately.
+                        msg_view_for_send.update_message_body(event_id, &body);
+
                         let tx = cmd_tx_edit2.clone();
                         let eid = event_id.to_string();
                         let new_body = body.clone();
@@ -416,7 +419,7 @@ impl MxWindow {
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
                 // Show reaction immediately in the UI.
-                msg_view_react.add_local_reaction(&event_id, &emoji);
+                msg_view_react.toggle_reaction(&event_id, &emoji);
 
                 let tx = cmd_tx_react.clone();
                 glib::spawn_future_local(async move {

@@ -387,7 +387,11 @@ impl MessageRow {
         imp.thread_icon.set_visible(!thread_root.is_empty());
 
         // Show edit/delete only on own messages.
-        let is_own = !my_user_id.is_empty() && msg.sender_id() == my_user_id;
+        let msg_sender_id = msg.sender_id();
+        let is_own = !my_user_id.is_empty() && msg_sender_id == my_user_id;
+        if !msg_sender_id.is_empty() {
+            tracing::debug!("Edit check: sender_id='{}' my_id='{}' is_own={}", msg_sender_id, my_user_id, is_own);
+        }
         if let Some(ref btn) = *imp.edit_button.borrow() {
             btn.set_visible(is_own);
         }

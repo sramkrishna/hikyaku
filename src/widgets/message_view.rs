@@ -611,46 +611,29 @@ impl MessageView {
         self.imp().on_media_hover.replace(Some(Box::new(f)));
     }
 
-    /// Add a reaction locally to a message (immediate visual feedback).
-    pub fn add_local_reaction(&self, event_id: &str, emoji: &str) {
-        if event_id.is_empty() {
-            return;
-        }
+    /// Update a message in the timeline by event_id. The `mutate` closure
+    /// modifies the MessageObject's properties, then the row is rebound
+    /// in-place without scrolling or flashing. This is the single entry
+    /// point for all local timeline updates (reactions, edits, deletes, etc.).
+    fn update_message_in_place(
+        &self,
+        event_id: &str,
+        mutate: impl FnOnce(&MessageObject),
+    ) {
+        if event_id.is_empty() { return; }
         let imp = self.imp();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
         for i in 0..n {
             let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id() == event_id {
-                // Toggle: if already present decrement/remove, else add.
-                let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
-                    .unwrap_or_default();
-                if let Some(pos) = reactions.iter().position(|(e, _)| e == emoji) {
-                    if reactions[pos].1 <= 1 {
-                        reactions.remove(pos);
-                    } else {
-                        reactions[pos].1 -= 1;
-                    }
-                } else {
-                    reactions.push((emoji.to_string(), 1));
-                }
-                // Update the GObject properties directly — the factory's
-                // bind already has a reference to this object, so changing
-                // the property triggers the UI update via GObject notify.
-                // No remove/insert needed.
-                msg.set_reactions_json(
-                    serde_json::to_string(&reactions).unwrap_or_default(),
-                );
-
-                // Find the row widget for this position and rebind it
-                // directly, bypassing the ListStore entirely.
-                let list_view = &imp.list_view;
-                // Walk the ListView's children to find the row at position i.
-                let mut child = list_view.first_child();
+                mutate(&msg);
+                // Rebind the row widget directly — no ListStore change,
+                // no scroll jump, no visual flash.
+                let mut child = imp.list_view.first_child();
                 let mut idx = 0u32;
                 while let Some(ref widget) = child {
                     if idx == i {
-                        // Found the ListItem widget — find our MessageRow inside.
                         if let Some(row) = Self::find_message_row(widget) {
                             let names = imp.highlight_names.borrow().clone();
                             let my_id = imp.user_id.borrow().clone();
@@ -664,6 +647,33 @@ impl MessageView {
                 return;
             }
         }
+    }
+
+    /// Toggle an emoji reaction on a message.
+    pub fn toggle_reaction(&self, event_id: &str, emoji: &str) {
+        let emoji = emoji.to_string();
+        self.update_message_in_place(event_id, |msg| {
+            let mut reactions: Vec<(String, u64)> = serde_json::from_str(&msg.reactions_json())
+                .unwrap_or_default();
+            if let Some(pos) = reactions.iter().position(|(e, _)| *e == emoji) {
+                if reactions[pos].1 <= 1 {
+                    reactions.remove(pos);
+                } else {
+                    reactions[pos].1 -= 1;
+                }
+            } else {
+                reactions.push((emoji.clone(), 1));
+            }
+            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+        });
+    }
+
+    /// Update a message's body text (for edits).
+    pub fn update_message_body(&self, event_id: &str, new_body: &str) {
+        let new_body = new_body.to_string();
+        self.update_message_in_place(event_id, |msg| {
+            msg.set_body(new_body);
+        });
     }
 
     /// Enter reply mode — show preview and store the target event ID.
