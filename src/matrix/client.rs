@@ -1591,20 +1591,45 @@ async fn extract_messages(
             Box::new(chunk.iter())
         };
 
-    // Collect reactions separately, then merge into messages by event_id.
+    // First pass: collect reactions and replacements (edits).
     let mut reaction_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Map of original_event_id → (latest replacement body, replacement event_id).
+    let mut replacement_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    // Set of event_ids that are replacement events (to skip in main loop).
+    let mut replacement_event_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     for timeline_event in chunk {
         if let Ok(ev) = timeline_event.raw().deserialize() {
-            if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
-                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::Reaction(
-                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(reaction),
-                ),
-            ) = ev
-            {
-                let target = reaction.content.relates_to.event_id.to_string();
-                let emoji = reaction.content.relates_to.key.clone();
-                reaction_map.entry(target).or_default().push(emoji);
+            match ev {
+                matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::Reaction(
+                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(reaction),
+                    ),
+                ) => {
+                    let target = reaction.content.relates_to.event_id.to_string();
+                    let emoji = reaction.content.relates_to.key.clone();
+                    reaction_map.entry(target).or_default().push(emoji);
+                }
+                matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(
+                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(msg),
+                    ),
+                ) => {
+                    // Check if this is a replacement (edit) event.
+                    use matrix_sdk::ruma::events::room::message::Relation;
+                    if let Some(Relation::Replacement(replacement)) = &msg.content.relates_to {
+                        let original_id = replacement.event_id.to_string();
+                        let new_body = extract_message_content(&msg.content.msgtype)
+                            .map(|(b, _)| b)
+                            .unwrap_or_default();
+                        replacement_map.insert(original_id, (new_body, msg.event_id.to_string()));
+                        replacement_event_ids.insert(msg.event_id.to_string());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1626,14 +1651,31 @@ async fn extract_messages(
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
                     _ => continue,
                 };
-                let Some((body, media)) = extract_message_content(&msg_event.content.msgtype) else {
-                    continue;
-                };
-                let display_name = resolve_display_name(room, &msg_event.sender).await;
                 let event_id = msg_event.event_id.to_string();
 
-                // Extract reply and thread relations.
+                // Skip replacement events — they're edits displayed
+                // via the original message with updated body.
+                if replacement_event_ids.contains(&event_id) {
+                    continue;
+                }
+
+                // Skip events that are replacements (relates_to = Replacement).
                 use matrix_sdk::ruma::events::room::message::Relation;
+                if matches!(&msg_event.content.relates_to, Some(Relation::Replacement(_))) {
+                    continue;
+                }
+
+                let Some((mut body, media)) = extract_message_content(&msg_event.content.msgtype) else {
+                    continue;
+                };
+
+                // Apply the latest edit if this message was replaced.
+                if let Some((new_body, _)) = replacement_map.get(&event_id) {
+                    body = new_body.clone();
+                }
+
+                let display_name = resolve_display_name(room, &msg_event.sender).await;
+
                 let (reply_to, thread_root) = match &msg_event.content.relates_to {
                     Some(Relation::Reply { in_reply_to }) => {
                         (Some(in_reply_to.event_id.to_string()), None)
