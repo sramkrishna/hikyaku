@@ -76,8 +76,8 @@ mod imp {
                 verify_dialog: RefCell::new(None),
                 current_room_meta: RefCell::new(None),
                 details_revealer: gtk::Revealer::builder()
-                    .transition_type(gtk::RevealerTransitionType::SlideLeft)
-                    .transition_duration(300)
+                    .transition_type(gtk::RevealerTransitionType::Crossfade)
+                    .transition_duration(200)
                     .reveal_child(false)
                     .build(),
                 details_content: gtk::Box::builder()
@@ -286,7 +286,7 @@ impl MxWindow {
                 // Hide details sidebar when switching rooms.
                 let rev = window.imp().details_revealer.clone();
                 rev.set_reveal_child(false);
-                glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
                     if !rev.reveals_child() { rev.set_visible(false); }
                 });
             }
@@ -441,9 +441,8 @@ impl MxWindow {
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             if let Some(room_id) = room_id {
-                // Show reaction immediately — always add locally.
-                // The server handles dedup/removal. Next sync corrects count.
-                msg_view_react.add_reaction(&event_id, &emoji);
+                // Toggle locally — checks if "You" already reacted.
+                msg_view_react.toggle_reaction(&event_id, &emoji);
 
                 let tx = cmd_tx_react.clone();
                 glib::spawn_future_local(async move {
@@ -867,7 +866,7 @@ impl MxWindow {
                 imp.details_revealer.set_reveal_child(false);
                 // Hide after transition completes to release width.
                 let revealer = imp.details_revealer.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
                     if !revealer.reveals_child() {
                         revealer.set_visible(false);
                     }
@@ -925,7 +924,7 @@ impl MxWindow {
         details_close_btn.connect_clicked(move |_| {
             revealer_for_close.set_reveal_child(false);
             let r = revealer_for_close.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
                 if !r.reveals_child() { r.set_visible(false); }
             });
         });
