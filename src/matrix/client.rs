@@ -64,6 +64,8 @@ pub struct MessageInfo {
     pub event_id: String,
     /// If this message is a reply, the event ID it replies to.
     pub reply_to: Option<String>,
+    /// Display name of who this message replies to (if known).
+    pub reply_to_sender: Option<String>,
     /// If this message is part of a thread, the thread root event ID.
     pub thread_root: Option<String>,
     /// Aggregated emoji reactions: (emoji, count, reactor_names).
@@ -1443,6 +1445,7 @@ async fn start_sync(
                             timestamp,
                             event_id: event.event_id.to_string(),
                             reply_to: None,
+                            reply_to_sender: None,
                             thread_root: None,
                             reactions: Vec::new(),
                             media,
@@ -1485,6 +1488,7 @@ async fn start_sync(
                             timestamp: event.origin_server_ts.as_secs().into(),
                             event_id: event.event_id.to_string(),
                             reply_to: None,
+                            reply_to_sender: None,
                             thread_root: None,
                             reactions: Vec::new(),
                             media: None,
@@ -1780,6 +1784,7 @@ async fn extract_messages(
                     timestamp: msg_event.origin_server_ts.as_secs().into(),
                     event_id,
                     reply_to,
+                    reply_to_sender: None, // Populated in post-processing.
                     thread_root,
                     reactions,
                     media,
@@ -1820,6 +1825,7 @@ async fn extract_messages(
                     timestamp: 0,
                     event_id,
                     reply_to: None,
+                    reply_to_sender: None,
                     thread_root: None,
                     reactions: Vec::new(),
                     media: None,
@@ -1829,18 +1835,31 @@ async fn extract_messages(
             _ => continue,
         }
     }
-    // Post-process: mark messages as highlights if they reply to us.
-    if let Some(uid) = my_user_id {
-        // Collect our event_ids from this batch.
-        let my_event_ids: std::collections::HashSet<String> = messages
+    // Post-process: populate reply_to_sender and mark highlights.
+    {
+        // Build event_id → sender_name map for the batch.
+        let sender_map: std::collections::HashMap<String, String> = messages
             .iter()
-            .filter(|m| m.sender_id == uid.as_str())
-            .map(|m| m.event_id.clone())
+            .filter(|m| !m.event_id.is_empty())
+            .map(|m| (m.event_id.clone(), m.sender.clone()))
             .collect();
 
-        // Mark any message that replies to one of our event_ids.
+        let my_event_ids: std::collections::HashSet<String> = my_user_id
+            .map(|uid| {
+                messages.iter()
+                    .filter(|m| m.sender_id == uid.as_str())
+                    .map(|m| m.event_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for msg in &mut messages {
             if let Some(ref reply_to) = msg.reply_to {
+                // Set reply_to_sender from the batch map.
+                if let Some(name) = sender_map.get(reply_to) {
+                    msg.reply_to_sender = Some(name.clone());
+                }
+                // Mark highlight if replying to us.
                 if my_event_ids.contains(reply_to) {
                     msg.is_highlight = true;
                 }

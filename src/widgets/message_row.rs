@@ -401,18 +401,23 @@ impl MessageRow {
         imp.sender_text.replace(sender.clone());
         imp.body_text.replace(body.clone());
 
-        // Reply indicator — extract original sender from reply fallback.
+        // Reply indicator — show who they're replying to.
         if !reply_to.is_empty() {
-            // Try to extract the sender from reply fallback format: "> <@user:server>"
-            let reply_sender = body.lines()
-                .find(|l| l.starts_with("> <@"))
-                .and_then(|l| l.strip_prefix("> <"))
-                .and_then(|l| l.split('>').next())
-                .and_then(|uid| uid.strip_prefix('@'))
-                .and_then(|uid| uid.split(':').next())
-                .map(|local| format!("Replying to {local}"))
-                .unwrap_or_else(|| "Reply to message".to_string());
-            imp.reply_label.set_label(&reply_sender);
+            let reply_sender_name = msg.reply_to_sender();
+            let label = if !reply_sender_name.is_empty() {
+                format!("Replying to {reply_sender_name}")
+            } else {
+                // Fallback: try to extract from body quote format.
+                body.lines()
+                    .find(|l| l.starts_with("> <@"))
+                    .and_then(|l| l.strip_prefix("> <"))
+                    .and_then(|l| l.split('>').next())
+                    .and_then(|uid| uid.strip_prefix('@'))
+                    .and_then(|uid| uid.split(':').next())
+                    .map(|local| format!("Replying to {local}"))
+                    .unwrap_or_else(|| "Reply".to_string())
+            };
+            imp.reply_label.set_label(&label);
             imp.reply_box.set_visible(true);
         } else {
             imp.reply_box.set_visible(false);

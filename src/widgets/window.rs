@@ -417,6 +417,7 @@ impl MxWindow {
                     timestamp: now,
                     event_id: String::new(),
                     reply_to: reply_to.clone(),
+                    reply_to_sender: None,
                     thread_root: None,
                     reactions: Vec::new(),
                     media: None,
@@ -493,6 +494,7 @@ impl MxWindow {
                     event_id: String::new(),
                     reply_to: None,
                     thread_root: None,
+                    reply_to_sender: None,
                     reactions: Vec::new(),
                     media: Some(crate::matrix::MediaInfo {
                         kind,

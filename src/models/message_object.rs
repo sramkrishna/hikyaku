@@ -31,6 +31,10 @@ mod imp {
         #[property(get, set)]
         reply_to: RefCell<String>,
 
+        /// Display name of who this message replies to.
+        #[property(get, set)]
+        reply_to_sender: RefCell<String>,
+
         /// Thread root event ID (empty if not in a thread).
         #[property(get, set)]
         thread_root: RefCell<String>,

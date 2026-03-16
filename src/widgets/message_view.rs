@@ -770,6 +770,9 @@ impl MessageView {
             &media_json,
         );
         obj.set_is_highlight(m.is_highlight);
+        if let Some(ref name) = m.reply_to_sender {
+            obj.set_reply_to_sender(name.clone());
+        }
         obj
     }
 
