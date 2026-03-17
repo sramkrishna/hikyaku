@@ -601,6 +601,23 @@ impl MxWindow {
             });
         });
 
+        // DM button — open or create DM with a user.
+        let cmd_tx_dm = command_tx.clone();
+        let toast_dm = imp.toast_overlay.clone();
+        imp.message_view.connect_dm(move |user_id| {
+            let tx = cmd_tx_dm.clone();
+            let uid = user_id.clone();
+            let toast = toast_dm.clone();
+            let t = adw::Toast::builder()
+                .title(&format!("Opening DM with {user_id}..."))
+                .timeout(3)
+                .build();
+            toast.add_toast(t);
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
+            });
+        });
+
         // Event loop.
         let toast_overlay = imp.toast_overlay.clone();
         let login_page = imp.login_page.clone();
@@ -658,6 +675,12 @@ impl MxWindow {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             window.imp().current_room_meta.replace(Some(room_meta.clone()));
+                            // Check if this room is a DM by looking at the registry.
+                            let is_dm = {
+                                let reg = room_list_view.imp().room_registry.borrow();
+                                reg.get(&room_id).map(|o| o.kind() == "dm").unwrap_or(false)
+                            };
+                            message_view.set_is_dm_room(is_dm);
                             message_view.set_room_meta(&room_meta);
                             // Update bookmark button icon.
                             if let Some(btn) = window.imp().bookmark_button.get() {
@@ -834,6 +857,22 @@ impl MxWindow {
                     }
                     MatrixEvent::LeaveFailed { error } => {
                         toast_error(&toast_overlay, "Failed to leave", &error);
+                    }
+                    MatrixEvent::DmReady { user_id: _, room_id, room_name } => {
+                        // Navigate to the DM room — same as clicking it in the sidebar.
+                        window.imp().current_room_id.replace(Some(room_id.clone()));
+                        if let Some(page) = window.imp().content_page.get() {
+                            page.set_title(&room_name);
+                        }
+                        message_view.clear();
+                        let tx = window.imp().command_tx.get().unwrap().clone();
+                        let rid = room_id.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
+                        });
+                    }
+                    MatrixEvent::DmFailed { error } => {
+                        toast_error(&toast_overlay, "Failed to open DM", &error);
                     }
                 }
             }
@@ -1533,24 +1572,57 @@ impl MxWindow {
                 .build();
             container.append(&members_header);
 
+            let my_id = imp.user_id.borrow().clone();
             for (uid, name) in meta.members.iter().take(50) {
                 let row = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(1)
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
                     .margin_top(2)
                     .margin_bottom(2)
                     .build();
-                row.append(&gtk::Label::builder()
+                let info = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(1)
+                    .hexpand(true)
+                    .build();
+                info.append(&gtk::Label::builder()
                     .label(name)
                     .halign(gtk::Align::Start)
                     .css_classes(["caption"])
                     .build());
-                row.append(&gtk::Label::builder()
+                info.append(&gtk::Label::builder()
                     .label(uid)
                     .halign(gtk::Align::Start)
                     .css_classes(["caption", "dim-label"])
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .build());
+                row.append(&info);
+                // DM button — hidden for self.
+                if *uid != my_id {
+                    let dm_btn = gtk::Button::builder()
+                        .icon_name("avatar-default-symbolic")
+                        .tooltip_text("Direct Message")
+                        .valign(gtk::Align::Center)
+                        .build();
+                    dm_btn.add_css_class("flat");
+                    dm_btn.add_css_class("circular");
+                    let tx = imp.command_tx.get().unwrap().clone();
+                    let uid_for_dm = uid.clone();
+                    let toast = imp.toast_overlay.clone();
+                    dm_btn.connect_clicked(move |_| {
+                        let t = adw::Toast::builder()
+                            .title(&format!("Opening DM..."))
+                            .timeout(3)
+                            .build();
+                        toast.add_toast(t);
+                        let tx = tx.clone();
+                        let uid = uid_for_dm.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
+                        });
+                    });
+                    row.append(&dm_btn);
+                }
                 container.append(&row);
             }
             if meta.members.len() > 50 {

@@ -28,6 +28,10 @@ mod imp {
         pub on_jump_to_reply: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Current reply-to event ID — updated on each bind.
         pub reply_to: std::rc::Rc<std::cell::RefCell<String>>,
+        /// Callback: DM clicked → (sender_id).
+        pub on_dm: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Sender's Matrix user ID (e.g. @user:server).
+        pub sender_id_text: std::rc::Rc<std::cell::RefCell<String>>,
         /// Callback: media click → (mxc_url, filename, source_json).
         pub on_media_click: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, String)>>>>,
         /// Current media URL, filename, and source JSON.
@@ -36,9 +40,10 @@ mod imp {
         pub media_source_json: std::rc::Rc<std::cell::RefCell<String>>,
         /// Cached local file path after download.
         pub media_cached_path: std::rc::Rc<std::cell::RefCell<Option<String>>>,
-        /// Edit and delete buttons — visibility toggled per message.
+        /// Edit, delete, and DM buttons — visibility toggled per message.
         pub edit_button: std::cell::RefCell<Option<gtk::Button>>,
         pub delete_button: std::cell::RefCell<Option<gtk::Button>>,
+        pub dm_button: std::cell::RefCell<Option<gtk::Button>>,
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -110,14 +115,23 @@ mod imp {
             delete_button.add_css_class("flat");
             delete_button.add_css_class("circular");
 
+            let dm_button = gtk::Button::builder()
+                .icon_name("avatar-default-symbolic")
+                .tooltip_text("Direct Message")
+                .build();
+            dm_button.add_css_class("flat");
+            dm_button.add_css_class("circular");
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
+            self.action_bar.append(&dm_button);
             self.action_bar.append(&self.react_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
             self.edit_button.replace(Some(edit_button.clone()));
             self.delete_button.replace(Some(delete_button.clone()));
+            self.dm_button.replace(Some(dm_button.clone()));
 
             // Add action bar inside the vertical content box, below the
             // message body. Uses CSS class toggle for gentle fade on hover.
@@ -150,11 +164,37 @@ mod imp {
                 let eid = event_id.borrow().clone();
                 let sender = sender_text.borrow().clone();
                 let body = body_text.borrow().clone();
-                // Read callback at call time, not capture time.
                 if let Some(ref cb) = *on_reply_ref.borrow() {
                     cb(eid, sender, body);
                 }
             });
+
+            // DM button — open/create DM with message sender.
+            let sender_id = self.sender_id_text.clone();
+            let on_dm_ref = self.on_dm.clone();
+            dm_button.connect_clicked(move |_| {
+                let uid = sender_id.borrow().clone();
+                if !uid.is_empty() {
+                    if let Some(ref cb) = *on_dm_ref.borrow() {
+                        cb(uid);
+                    }
+                }
+            });
+
+            // Click sender name to start DM.
+            let sender_id = self.sender_id_text.clone();
+            let on_dm_ref = self.on_dm.clone();
+            let sender_click = gtk::GestureClick::new();
+            sender_click.connect_released(move |_, _, _, _| {
+                let uid = sender_id.borrow().clone();
+                if !uid.is_empty() {
+                    if let Some(ref cb) = *on_dm_ref.borrow() {
+                        cb(uid);
+                    }
+                }
+            });
+            self.sender_label.add_controller(sender_click);
+            self.sender_label.set_cursor_from_name(Some("pointer"));
 
             // React button — use a MenuButton with the EmojiChooser as popover.
             let react_menu_btn = gtk::MenuButton::builder()
@@ -428,12 +468,17 @@ impl MessageRow {
         self.imp().on_media_click.borrow_mut().replace(Box::new(f));
     }
 
+    pub fn set_on_dm<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_dm.borrow_mut().replace(Box::new(f));
+    }
+
     /// Bind a MessageObject to this row — sets all visual elements.
     pub fn bind_message_object(
         &self,
         msg: &crate::models::MessageObject,
         highlight_names: &[String],
         my_user_id: &str,
+        is_dm_room: bool,
     ) {
         let sender = msg.sender();
         let body = msg.body();
@@ -446,6 +491,7 @@ impl MessageRow {
         // Store current message data for action buttons.
         imp.event_id.replace(msg.event_id());
         imp.sender_text.replace(sender.clone());
+        imp.sender_id_text.replace(msg.sender_id());
         imp.body_text.replace(body.clone());
         imp.reply_to.replace(reply_to.clone());
 
@@ -485,6 +531,10 @@ impl MessageRow {
         }
         if let Some(ref btn) = *imp.delete_button.borrow() {
             btn.set_visible(is_own);
+        }
+        // Hide DM button on own messages and in DM rooms (already a DM).
+        if let Some(ref btn) = *imp.dm_button.borrow() {
+            btn.set_visible(!is_own && !is_dm_room);
         }
 
         // Media attachment.

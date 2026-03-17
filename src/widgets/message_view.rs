@@ -68,6 +68,8 @@ mod imp {
         pub on_media_click: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         /// Callback for sending a file: (file_path).
         pub on_attach: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback for DM: (user_id).
+        pub on_dm: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
@@ -77,6 +79,8 @@ mod imp {
         pub highlight_names: RefCell<Vec<String>>,
         /// Current user's Matrix ID for showing edit/delete on own messages.
         pub user_id: RefCell<String>,
+        /// Whether the current room is a DM (hides DM button on messages).
+        pub is_dm_room: Cell<bool>,
         /// Room members for nick completion: (lowercase_name, display_name, user_id).
         /// Sorted by lowercase_name for binary search prefix matching.
         pub room_members: RefCell<Vec<(String, String, String)>>,
@@ -116,6 +120,8 @@ mod imp {
                 on_delete: RefCell::new(None),
                 on_media_click: RefCell::new(None),
                 on_attach: RefCell::new(None),
+                on_dm: RefCell::new(None),
+                is_dm_room: Cell::new(false),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
@@ -220,6 +226,15 @@ mod imp {
                             }
                         }
                     });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_dm(move |user_id| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_dm.borrow() {
+                                cb(user_id);
+                            }
+                        }
+                    });
                 }
 
                 list_item.set_child(Some(&row));
@@ -246,10 +261,14 @@ mod imp {
                 let my_id = view.as_ref()
                     .map(|o| o.imp().user_id.borrow().clone())
                     .unwrap_or_default();
+                let is_dm = view.as_ref()
+                    .map(|o| o.imp().is_dm_room.get())
+                    .unwrap_or(false);
                 row.bind_message_object(
                     &msg_obj,
                     &names,
                     &my_id,
+                    is_dm,
                 );
             });
 
@@ -610,8 +629,16 @@ impl MessageView {
         self.imp().user_id.replace(user_id.to_string());
     }
 
+    pub fn set_is_dm_room(&self, is_dm: bool) {
+        self.imp().is_dm_room.set(is_dm);
+    }
+
     pub fn connect_attach<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_attach.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_dm<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_dm.replace(Some(Box::new(f)));
     }
 
     pub fn connect_media_click<F: Fn(String, String, String) + 'static>(&self, f: F) {
@@ -644,7 +671,7 @@ impl MessageView {
                         if let Some(row) = Self::find_message_row(widget) {
                             let names = imp.highlight_names.borrow().clone();
                             let my_id = imp.user_id.borrow().clone();
-                            row.bind_message_object(&msg, &names, &my_id);
+                            row.bind_message_object(&msg, &names, &my_id, imp.is_dm_room.get());
                         }
                         break;
                     }

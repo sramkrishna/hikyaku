@@ -218,6 +218,10 @@ pub enum MatrixEvent {
     RoomLeft { room_id: String },
     /// Failed to leave a room.
     LeaveFailed { error: String },
+    /// DM room is ready — navigate to it.
+    DmReady { user_id: String, room_id: String, room_name: String },
+    /// Failed to create/find DM.
+    DmFailed { error: String },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.
@@ -280,6 +284,8 @@ pub enum MatrixCommand {
     LeaveRoom { room_id: String },
     /// Send read receipt for the latest message in a room.
     MarkRead { room_id: String },
+    /// Open or create a DM with a user. Finds existing DM room or creates one.
+    CreateDm { user_id: String },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -583,6 +589,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::MarkRead { room_id }) => {
                         handle_mark_read(&client, &room_id).await;
+                    }
+                    Ok(MatrixCommand::CreateDm { user_id }) => {
+                        handle_create_dm(&client, &event_tx, &user_id).await;
                     }
                     Err(_) => break,
                 }
@@ -2774,6 +2783,69 @@ async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room
 }
 
 /// Send a read receipt for the latest event in a room.
+/// Find an existing DM room with a user, or create a new one.
+async fn handle_create_dm(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    user_id: &str,
+) {
+    let Ok(target_uid) = <&matrix_sdk::ruma::UserId>::try_from(user_id) else {
+        let _ = event_tx.send(MatrixEvent::DmFailed {
+            error: format!("Invalid user ID: {user_id}"),
+        }).await;
+        return;
+    };
+
+    // Check for an existing DM room with this user.
+    for room in client.joined_rooms() {
+        if !room.is_direct().await.unwrap_or(false) {
+            continue;
+        }
+        // Check if the target user is a member of this DM room.
+        if let Ok(Some(_member)) = room.get_member_no_sync(target_uid).await {
+            let room_id = room.room_id().to_string();
+            let name = room.display_name().await
+                .ok()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| user_id.to_string());
+            tracing::info!("Found existing DM with {user_id}: {room_id}");
+            let _ = event_tx.send(MatrixEvent::DmReady {
+                user_id: user_id.to_string(),
+                room_id,
+                room_name: name,
+            }).await;
+            return;
+        }
+    }
+
+    // No existing DM — create one.
+    tracing::info!("Creating new DM room with {user_id}");
+    use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
+    let mut request = CreateRoomRequest::new();
+    request.is_direct = true;
+    request.invite = vec![target_uid.to_owned()];
+    request.preset = Some(matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset::TrustedPrivateChat);
+
+    match client.create_room(request).await {
+        Ok(response) => {
+            let room_id = response.room_id().to_string();
+            let name = user_id.to_string();
+            tracing::info!("Created DM room {room_id} with {user_id}");
+            let _ = event_tx.send(MatrixEvent::DmReady {
+                user_id: user_id.to_string(),
+                room_id,
+                room_name: name,
+            }).await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to create DM with {user_id}: {e}");
+            let _ = event_tx.send(MatrixEvent::DmFailed {
+                error: e.to_string(),
+            }).await;
+        }
+    }
+}
+
 async fn handle_mark_read(client: &Client, room_id: &str) {
     let Ok(rid) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&rid) else { return };
