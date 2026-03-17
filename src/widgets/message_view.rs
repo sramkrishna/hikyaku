@@ -70,6 +70,8 @@ mod imp {
         pub on_attach: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for DM: (user_id).
         pub on_dm: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback for opening a thread: (thread_root_event_id).
+        pub on_open_thread: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
@@ -121,6 +123,7 @@ mod imp {
                 on_media_click: RefCell::new(None),
                 on_attach: RefCell::new(None),
                 on_dm: RefCell::new(None),
+                on_open_thread: RefCell::new(None),
                 is_dm_room: Cell::new(false),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
@@ -232,6 +235,15 @@ mod imp {
                         if let Some(v) = view_weak.upgrade() {
                             if let Some(ref cb) = *v.imp().on_dm.borrow() {
                                 cb(user_id);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_open_thread(move |thread_root_id| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_open_thread.borrow() {
+                                cb(thread_root_id);
                             }
                         }
                     });
@@ -639,6 +651,10 @@ impl MessageView {
 
     pub fn connect_dm<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_dm.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_open_thread<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_open_thread.replace(Some(Box::new(f)));
     }
 
     pub fn connect_media_click<F: Fn(String, String, String) + 'static>(&self, f: F) {

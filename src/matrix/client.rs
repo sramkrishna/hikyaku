@@ -220,6 +220,13 @@ pub enum MatrixEvent {
     LeaveFailed { error: String },
     /// DM room is ready — navigate to it.
     DmReady { user_id: String, room_id: String, room_name: String },
+    /// Thread replies fetched — display in sidebar.
+    ThreadReplies {
+        room_id: String,
+        thread_root_id: String,
+        root_message: Option<MessageInfo>,
+        replies: Vec<MessageInfo>,
+    },
     /// Failed to create/find DM.
     DmFailed { error: String },
 }
@@ -286,6 +293,8 @@ pub enum MatrixCommand {
     MarkRead { room_id: String },
     /// Open or create a DM with a user. Finds existing DM room or creates one.
     CreateDm { user_id: String },
+    /// Fetch thread replies for a message.
+    FetchThreadReplies { room_id: String, thread_root_id: String },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -592,6 +601,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::CreateDm { user_id }) => {
                         handle_create_dm(&client, &event_tx, &user_id).await;
+                    }
+                    Ok(MatrixCommand::FetchThreadReplies { room_id, thread_root_id }) => {
+                        handle_fetch_thread(&client, &event_tx, &room_id, &thread_root_id).await;
                     }
                     Err(_) => break,
                 }
@@ -2783,6 +2795,93 @@ async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room
 }
 
 /// Send a read receipt for the latest event in a room.
+/// Fetch thread replies for a root event.
+async fn handle_fetch_thread(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    thread_root_id: &str,
+) {
+    let Ok(rid) = RoomId::parse(room_id) else { return };
+    let Ok(root_eid) = matrix_sdk::ruma::EventId::parse(thread_root_id) else { return };
+    let Some(room) = client.get_room(&rid) else { return };
+
+    // Fetch the root message first.
+    let root_message = match room.event(&root_eid, None).await {
+        Ok(ev) => {
+            let chunk = vec![ev];
+            let mut msgs = extract_messages(&room, &chunk, false, client.user_id()).await;
+            msgs.pop()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch thread root {thread_root_id}: {e}");
+            None
+        }
+    };
+
+    // Fetch thread replies via the relations API.
+    use matrix_sdk::ruma::api::client::relations::get_relating_events_with_rel_type::v1::Request;
+    use matrix_sdk::ruma::events::relation::RelationType;
+
+    let mut request = Request::new(rid.clone(), root_eid.to_owned(), RelationType::Thread);
+    request.limit = Some(matrix_sdk::ruma::UInt::from(50u32));
+
+    let replies = match client.send(request).await {
+        Ok(response) => {
+            // Parse the raw events into MessageInfo.
+            let mut msgs = Vec::new();
+            for raw_event in &response.chunk {
+                if let Ok(ev) = raw_event.deserialize() {
+                    // Extract sender, body, timestamp from the event.
+                    if let matrix_sdk::ruma::events::AnyMessageLikeEvent::RoomMessage(
+                        matrix_sdk::ruma::events::MessageLikeEvent::Original(msg),
+                    ) = ev
+                    {
+                        let Some((body, media)) = extract_message_content(&msg.content.msgtype) else {
+                            continue;
+                        };
+                        let sender_id = msg.sender.to_string();
+                        let display_name = resolve_display_name(&room, &msg.sender).await;
+                        msgs.push(MessageInfo {
+                            sender: display_name,
+                            sender_id,
+                            body,
+                            timestamp: msg.origin_server_ts.as_secs().into(),
+                            event_id: msg.event_id.to_string(),
+                            reply_to: None,
+                            reply_to_sender: None,
+                            thread_root: Some(thread_root_id.to_string()),
+                            reactions: Vec::new(),
+                            media,
+                            is_highlight: false,
+                        });
+                    }
+                }
+            }
+            // Sort chronologically (oldest first).
+            msgs.sort_by_key(|m| m.timestamp);
+            msgs
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch thread replies for {thread_root_id}: {e}");
+            Vec::new()
+        }
+    };
+
+    tracing::info!(
+        "Fetched thread for {thread_root_id}: root={}, {} replies",
+        root_message.is_some(),
+        replies.len()
+    );
+
+    let _ = event_tx.send(MatrixEvent::ThreadReplies {
+        room_id: room_id.to_string(),
+        thread_root_id: thread_root_id.to_string(),
+        root_message,
+        replies,
+    }).await;
+}
+
 /// Find an existing DM room with a user, or create a new one.
 async fn handle_create_dm(
     client: &Client,

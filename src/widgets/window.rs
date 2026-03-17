@@ -618,6 +618,25 @@ impl MxWindow {
             });
         });
 
+        // Thread icon click — open thread in sidebar.
+        let cmd_tx_thread = command_tx.clone();
+        let window_weak_thread = window.downgrade();
+        imp.message_view.connect_open_thread(move |thread_root_id| {
+            if let Some(win) = window_weak_thread.upgrade() {
+                let room_id = win.imp().current_room_id.borrow().clone();
+                if let Some(rid) = room_id {
+                    let tx = cmd_tx_thread.clone();
+                    let root_id = thread_root_id.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::FetchThreadReplies {
+                            room_id: rid,
+                            thread_root_id: root_id,
+                        }).await;
+                    });
+                }
+            }
+        });
+
         // Event loop.
         let toast_overlay = imp.toast_overlay.clone();
         let login_page = imp.login_page.clone();
@@ -873,6 +892,12 @@ impl MxWindow {
                     }
                     MatrixEvent::DmFailed { error } => {
                         toast_error(&toast_overlay, "Failed to open DM", &error);
+                    }
+                    MatrixEvent::ThreadReplies { room_id, thread_root_id: _, root_message, replies } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            window.show_thread_sidebar(&root_message, &replies);
+                        }
                     }
                 }
             }
@@ -1634,6 +1659,112 @@ impl MxWindow {
             }
         }
 
+    }
+
+    /// Show thread replies in the details sidebar.
+    fn show_thread_sidebar(
+        &self,
+        root_message: &Option<crate::matrix::MessageInfo>,
+        replies: &[crate::matrix::MessageInfo],
+    ) {
+        let imp = self.imp();
+        let container = &imp.details_content;
+
+        // Clear previous content.
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+
+        // Thread header.
+        container.append(&gtk::Label::builder()
+            .label("Thread")
+            .halign(gtk::Align::Start)
+            .css_classes(["title-4"])
+            .margin_bottom(4)
+            .build());
+
+        // Root message.
+        if let Some(root) = root_message {
+            let root_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(2)
+                .css_classes(["card"])
+                .margin_bottom(8)
+                .build();
+            root_box.append(&gtk::Label::builder()
+                .label(&root.sender)
+                .halign(gtk::Align::Start)
+                .css_classes(["caption-heading"])
+                .build());
+            root_box.append(&gtk::Label::builder()
+                .label(&root.body)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .css_classes(["body"])
+                .build());
+            container.append(&root_box);
+        }
+
+        if replies.is_empty() {
+            container.append(&gtk::Label::builder()
+                .label("No replies yet")
+                .halign(gtk::Align::Start)
+                .css_classes(["dim-label"])
+                .build());
+        } else {
+            container.append(&gtk::Label::builder()
+                .label(&format!("{} replies", replies.len()))
+                .halign(gtk::Align::Start)
+                .css_classes(["caption", "dim-label"])
+                .margin_bottom(4)
+                .build());
+
+            for reply in replies {
+                let msg_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(1)
+                    .margin_top(4)
+                    .margin_bottom(4)
+                    .build();
+
+                let header = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
+                header.append(&gtk::Label::builder()
+                    .label(&reply.sender)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["caption-heading"])
+                    .build());
+                let ts = crate::widgets::message_row::format_timestamp(reply.timestamp);
+                header.append(&gtk::Label::builder()
+                    .label(&ts)
+                    .halign(gtk::Align::End)
+                    .hexpand(true)
+                    .css_classes(["caption", "dim-label"])
+                    .build());
+                msg_box.append(&header);
+
+                msg_box.append(&gtk::Label::builder()
+                    .label(&reply.body)
+                    .halign(gtk::Align::Start)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .selectable(true)
+                    .css_classes(["body"])
+                    .build());
+
+                container.append(&msg_box);
+            }
+        }
+
+        // Show the sidebar.
+        if let Some(sep) = imp.details_separator.get() {
+            sep.set_visible(true);
+        }
+        imp.details_revealer.set_visible(true);
+        imp.details_revealer.set_reveal_child(true);
     }
 
     fn show_about_dialog(&self) {

@@ -30,6 +30,8 @@ mod imp {
         pub reply_to: std::rc::Rc<std::cell::RefCell<String>>,
         /// Callback: DM clicked → (sender_id).
         pub on_dm: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: open thread → (thread_root_event_id).
+        pub on_open_thread: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Sender's Matrix user ID (e.g. @user:server).
         pub sender_id_text: std::rc::Rc<std::cell::RefCell<String>>,
         /// Callback: media click → (mxc_url, filename, source_json).
@@ -195,6 +197,27 @@ mod imp {
             });
             self.sender_label.add_controller(sender_click);
             self.sender_label.set_cursor_from_name(Some("pointer"));
+
+            // Click thread icon to open thread sidebar.
+            let event_id = self.event_id.clone();
+            let reply_to = self.reply_to.clone();
+            let on_thread_ref = self.on_open_thread.clone();
+            let thread_click = gtk::GestureClick::new();
+            thread_click.connect_released(move |_, _, _, _| {
+                // The thread root is either the reply_to (for thread replies)
+                // or the event_id itself (for the thread root message).
+                let thread_root = {
+                    let rt = reply_to.borrow().clone();
+                    if rt.is_empty() { event_id.borrow().clone() } else { rt }
+                };
+                if !thread_root.is_empty() {
+                    if let Some(ref cb) = *on_thread_ref.borrow() {
+                        cb(thread_root);
+                    }
+                }
+            });
+            self.thread_icon.add_controller(thread_click);
+            self.thread_icon.set_cursor_from_name(Some("pointer"));
 
             // React button — use a MenuButton with the EmojiChooser as popover.
             let react_menu_btn = gtk::MenuButton::builder()
@@ -470,6 +493,10 @@ impl MessageRow {
 
     pub fn set_on_dm<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_dm.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_open_thread<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_open_thread.borrow_mut().replace(Box::new(f));
     }
 
     /// Bind a MessageObject to this row — sets all visual elements.
