@@ -13,19 +13,20 @@ mod imp {
     use crate::models::RoomObject;
     use crate::widgets::room_row::RoomRow;
 
-    /// Create a banner-style button with icon + label (reusable for join banners etc.).
+    /// Create a subtle join button with icon + label.
     fn create_banner_button(icon_name: &str, label: &str, css_class: &str) -> gtk::Button {
         let button = gtk::Button::new();
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(6)
             .halign(gtk::Align::Center)
-            .margin_top(10)
-            .margin_bottom(10)
             .build();
         content.append(&gtk::Image::from_icon_name(icon_name));
-        content.append(&gtk::Label::new(Some(label)));
+        let lbl = gtk::Label::new(Some(label));
+        lbl.add_css_class("caption");
+        content.append(&lbl);
         button.set_child(Some(&content));
+        button.add_css_class("flat");
         button.add_css_class(css_class);
         button
     }
@@ -58,6 +59,15 @@ mod imp {
             row.bind_room(&room_obj);
             list_item.set_selectable(!room_obj.is_header());
             list_item.set_activatable(!room_obj.is_header());
+        });
+
+        factory.connect_unbind(|_factory, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("ListItem expected");
+            if let Some(row) = list_item.child().and_downcast::<RoomRow>() {
+                row.unbind_room();
+            }
         });
 
         let selection = gtk::SingleSelection::new(Some(store.clone()));
@@ -108,10 +118,17 @@ mod imp {
         pub cached_rooms: RefCell<Vec<crate::matrix::RoomInfo>>,
         /// Pre-indexed space children: space_name → Vec<index into cached_rooms>.
         pub space_children_index: RefCell<std::collections::HashMap<String, Vec<usize>>>,
-        /// room_id → RoomObject for O(1) badge updates.
-        pub room_obj_map: RefCell<std::collections::HashMap<String, crate::models::RoomObject>>,
-        /// Bookmarks tab page — for badge updates.
+        /// Central room registry: room_id → single shared RoomObject.
+        /// All ListStores hold clones (shared references) of these GObjects.
+        pub room_registry: RefCell<std::collections::HashMap<String, crate::models::RoomObject>>,
+        /// Room IDs locally marked as read — suppresses server unread counts
+        /// until the server confirms (reports unread_count == 0).
+        pub locally_read: RefCell<std::collections::HashSet<String>>,
+        /// Tab pages — for badge updates.
+        pub dm_page: std::cell::OnceCell<adw::ViewStackPage>,
+        pub room_page: std::cell::OnceCell<adw::ViewStackPage>,
         pub fav_page: std::cell::OnceCell<adw::ViewStackPage>,
+        pub space_page: std::cell::OnceCell<adw::ViewStackPage>,
     }
 
     impl Default for RoomListView {
@@ -228,10 +245,26 @@ mod imp {
                 on_browse_rooms: RefCell::new(None),
                 cached_rooms: RefCell::new(Vec::new()),
                 space_children_index: RefCell::new(std::collections::HashMap::new()),
-                room_obj_map: RefCell::new(std::collections::HashMap::new()),
+                room_registry: RefCell::new(std::collections::HashMap::new()),
+                locally_read: RefCell::new(std::collections::HashSet::new()),
+                dm_page: {
+                    let cell = std::cell::OnceCell::new();
+                    let _ = cell.set(dm_page);
+                    cell
+                },
+                room_page: {
+                    let cell = std::cell::OnceCell::new();
+                    let _ = cell.set(room_page);
+                    cell
+                },
                 fav_page: {
                     let cell = std::cell::OnceCell::new();
                     let _ = cell.set(fav_page_ref);
+                    cell
+                },
+                space_page: {
+                    let cell = std::cell::OnceCell::new();
+                    let _ = cell.set(space_page);
                     cell
                 },
             }
@@ -373,40 +406,31 @@ impl RoomListView {
     }
 
     /// Clear unread/highlight badges for a room immediately in the UI.
-    /// O(1) lookup via room_obj_map.
+    /// O(1) lookup via room_registry — the GObject is shared across all stores.
+    /// The RoomRow's connect_notify_local on unread-count/highlight-count
+    /// automatically updates the badge widget when these properties change.
     pub fn clear_unread(&self, room_id: &str) {
         let imp = self.imp();
-        let map = imp.room_obj_map.borrow();
-        if let Some(obj) = map.get(room_id) {
+        let registry = imp.room_registry.borrow();
+        if let Some(obj) = registry.get(room_id) {
             obj.set_unread_count(0);
             obj.set_highlight_count(0);
         }
+        drop(registry);
+        // Track locally-read so the next sync doesn't overwrite our zero.
+        imp.locally_read.borrow_mut().insert(room_id.to_string());
     }
 
     /// Increment unread count for a room (when a message arrives for a
-    /// room we're not viewing). O(1) via room_obj_map.
+    /// room we're not viewing). O(1) via room_registry.
+    /// The RoomRow's connect_notify_local auto-updates the badge.
     pub fn increment_unread(&self, room_id: &str, is_highlight: bool) {
         let imp = self.imp();
-        let map = imp.room_obj_map.borrow();
-        if let Some(obj) = map.get(room_id) {
+        let registry = imp.room_registry.borrow();
+        if let Some(obj) = registry.get(room_id) {
             obj.set_unread_count(obj.unread_count() + 1);
             if is_highlight {
                 obj.set_highlight_count(obj.highlight_count() + 1);
-            }
-            // Notify the stores that this item changed to trigger row rebind.
-            use gtk::prelude::*;
-            for store in [&imp.dm_store, &imp.room_store, &imp.fav_store, &imp.space_child_store] {
-                let n = gio::prelude::ListModelExt::n_items(store);
-                for i in 0..n {
-                    if let Some(item) = gio::prelude::ListModelExt::item(store, i) {
-                        if let Ok(room_obj) = item.downcast::<crate::models::RoomObject>() {
-                            if room_obj.room_id() == room_id {
-                                gio::prelude::ListModelExt::items_changed(store, i, 1, 1);
-                                return;
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -427,65 +451,90 @@ impl RoomListView {
             imp.space_children_index.replace(idx);
         }
 
-        imp.dm_store.remove_all();
-        imp.room_store.remove_all();
-        imp.fav_store.remove_all();
-        imp.space_store.remove_all();
+        // Phase 2: Patch existing GObjects or create new ones in the registry.
+        let new_ids: std::collections::HashSet<String> =
+            rooms.iter().map(|r| r.room_id.clone()).collect();
+        {
+            let mut registry = imp.room_registry.borrow_mut();
+            for r in rooms {
+                if let Some(obj) = registry.get(&r.room_id) {
+                    let server_unread = r.unread_count as u32;
+                    let server_hl = r.highlight_count as u32;
 
-        let mut obj_map = std::collections::HashMap::new();
-        let mut add_room = |store: &gio::ListStore, r: &RoomInfo| {
-            let obj = Self::room_to_obj(r);
-            obj_map.insert(r.room_id.clone(), obj.clone());
-            store.append(&obj);
+                    // Use max(server, local) for unread counts so local increments
+                    // aren't wiped by a stale server count (e.g. another client
+                    // marking rooms as read). locally_read override handles the
+                    // opposite case (zeroing after we've read the room).
+                    let new_unread = server_unread.max(obj.unread_count());
+                    let new_hl = server_hl.max(obj.highlight_count());
+
+                    obj.set_name(r.name.as_str());
+                    obj.set_unread_count(new_unread);
+                    obj.set_highlight_count(new_hl);
+                    obj.set_is_pinned(r.is_pinned);
+                    obj.set_is_admin(r.is_admin);
+                    obj.set_is_tombstoned(r.is_tombstoned);
+                    obj.set_is_favourite(r.is_favourite);
+                    obj.set_last_activity_ts(r.last_activity_ts);
+                } else {
+                    registry.insert(r.room_id.clone(), Self::room_to_obj(r));
+                }
+            }
+            // Remove rooms we've left.
+            registry.retain(|id, _| new_ids.contains(id));
+
+            // Apply locally-read overrides: zero out unread for rooms we've
+            // marked as read locally but the server hasn't confirmed yet.
+            let mut locally_read = imp.locally_read.borrow_mut();
+            locally_read.retain(|rid| {
+                if let Some(obj) = registry.get(rid) {
+                    if obj.unread_count() > 0 || obj.highlight_count() > 0 {
+                        // Server still says unread — override locally.
+                        // Setting properties triggers connect_notify_local
+                        // on any bound RoomRow, updating the badge automatically.
+                        obj.set_unread_count(0);
+                        obj.set_highlight_count(0);
+                        true // keep in set
+                    } else {
+                        false // server confirmed, remove from set
+                    }
+                } else {
+                    false // room gone, remove from set
+                }
+            });
+        }
+
+        // Rebuild ListStores from registry (clones of shared GObjects).
+        // Badge updates are handled automatically by GObject property
+        // notifications (connect_notify_local in RoomRow::bind_room).
+        self.rebuild_stores(rooms);
+    }
+
+    /// Rebuild all ListStores from the registry, using shared GObject clones.
+    /// Phase 5 optimization: skip ListStore manipulation when the sorted
+    /// room_id sequence hasn't changed (most common case during incremental sync).
+    fn rebuild_stores(&self, rooms: &[RoomInfo]) {
+        let imp = self.imp();
+        let registry = imp.room_registry.borrow();
+
+        let lookup = |r: &RoomInfo| -> RoomObject {
+            registry.get(&r.room_id).unwrap().clone()
         };
 
         let (dms, _by_space, ungrouped, cleanup) = group_and_sort_rooms(rooms);
 
-        // Messages tab — DMs only, flat list.
-        for r in &dms {
-            add_room(&imp.dm_store, r);
-        }
-
-        // Rooms tab — only ungrouped rooms (no space-child rooms).
-        for r in &ungrouped {
-            add_room(&imp.room_store, r);
-        }
-        if !cleanup.is_empty() {
-            imp.room_store.append(&RoomObject::new_header("Suggested Cleanup"));
-            for r in &cleanup {
-                add_room(&imp.room_store, r);
-            }
-        }
-
-        // Bookmarks tab — all rooms with m.favourite tag, sorted by activity.
+        // Bookmarks — computed separately since they cut across all categories.
         let mut favourites: Vec<&RoomInfo> = rooms
             .iter()
             .filter(|r| r.is_favourite)
             .collect();
         favourites.sort_by(|a, b| b.last_activity_ts.cmp(&a.last_activity_ts));
-        let mut fav_unread: u32 = 0;
-        let mut fav_has_highlight = false;
-        for r in &favourites {
-            add_room(&imp.fav_store, r);
-            fav_unread += r.unread_count as u32 + r.highlight_count as u32;
-            if r.highlight_count > 0 {
-                fav_has_highlight = true;
-            }
-        }
-        // Update bookmarks tab badge with total unread from favourited rooms.
-        if let Some(page) = imp.fav_page.get() {
-            use adw::prelude::*;
-            page.set_badge_number(fav_unread);
-            page.set_needs_attention(fav_has_highlight);
-        }
 
-        // Spaces tab — sort by most recent child room activity so active
-        // spaces float to the top instead of dead conference spaces.
+        // Spaces — sorted by child activity.
         let mut spaces: Vec<&RoomInfo> = rooms
             .iter()
             .filter(|r| r.kind == RoomKind::Space)
             .collect();
-        // Build a map of space_name → max child activity timestamp.
         let mut space_activity: std::collections::HashMap<&str, u64> =
             std::collections::HashMap::new();
         for r in rooms {
@@ -503,11 +552,158 @@ impl RoomListView {
                 .unwrap_or(b.last_activity_ts);
             b_ts.cmp(&a_ts)
         });
-        for r in &spaces {
-            add_room(&imp.space_store, r);
+
+        // Helper: compare store contents against new id sequence.
+        // If identical, skip rebuild — properties are already patched on the
+        // shared GObjects, so the UI is up-to-date without ListStore churn.
+        let store_matches = |store: &gio::ListStore, ids: &[&str]| -> bool {
+            use gtk::prelude::Cast;
+            let n = gio::prelude::ListModelExt::n_items(store) as usize;
+            if n != ids.len() { return false; }
+            for (i, &expected_id) in ids.iter().enumerate() {
+                let Some(item) = gio::prelude::ListModelExt::item(store, i as u32) else { return false };
+                let Some(obj) = item.downcast_ref::<crate::models::RoomObject>() else { return false };
+                if obj.room_id() != expected_id { return false; }
+            }
+            true
+        };
+
+        // DMs tab.
+        let dm_ids: Vec<&str> = dms.iter().map(|r| r.room_id.as_str()).collect();
+        if !store_matches(&imp.dm_store, &dm_ids) {
+            imp.dm_store.remove_all();
+            for r in &dms {
+                imp.dm_store.append(&lookup(r));
+            }
+        }
+        // DMs tab — dot indicator only when there are unread messages.
+        {
+            let mut has_unread = false;
+            let mut has_hl = false;
+            for r in &dms {
+                if let Some(obj) = registry.get(&r.room_id) {
+                    if obj.unread_count() > 0 { has_unread = true; }
+                    if obj.highlight_count() > 0 { has_hl = true; }
+                }
+            }
+            if let Some(page) = imp.dm_page.get() {
+                use adw::prelude::*;
+                page.set_needs_attention(has_unread || has_hl);
+            }
         }
 
-        imp.room_obj_map.replace(obj_map);
+        // Rooms tab (ungrouped + cleanup section).
+        let mut room_ids: Vec<&str> = ungrouped.iter().map(|r| r.room_id.as_str()).collect();
+        if !cleanup.is_empty() {
+            room_ids.push("__header__");
+            room_ids.extend(cleanup.iter().map(|r| r.room_id.as_str()));
+        }
+        let room_store_ids: Vec<String> = {
+            let n = gio::prelude::ListModelExt::n_items(&imp.room_store);
+            (0..n).filter_map(|i| {
+                use gtk::prelude::Cast;
+                let item = gio::prelude::ListModelExt::item(&imp.room_store, i)?;
+                let obj = item.downcast_ref::<crate::models::RoomObject>()?;
+                if obj.is_header() { Some("__header__".to_string()) }
+                else { Some(obj.room_id()) }
+            }).collect()
+        };
+        let room_ids_owned: Vec<String> = room_ids.iter().map(|s| s.to_string()).collect();
+        if room_store_ids != room_ids_owned {
+            imp.room_store.remove_all();
+            for r in &ungrouped {
+                imp.room_store.append(&lookup(r));
+            }
+            if !cleanup.is_empty() {
+                imp.room_store.append(&RoomObject::new_header("Suggested Cleanup"));
+                for r in &cleanup {
+                    imp.room_store.append(&lookup(r));
+                }
+            }
+        }
+        // Rooms tab — dot indicator only.
+        {
+            let mut has_unread = false;
+            let mut has_hl = false;
+            for r in &ungrouped {
+                if let Some(obj) = registry.get(&r.room_id) {
+                    if obj.unread_count() > 0 { has_unread = true; }
+                    if obj.highlight_count() > 0 { has_hl = true; }
+                }
+            }
+            if let Some(page) = imp.room_page.get() {
+                use adw::prelude::*;
+                page.set_needs_attention(has_unread || has_hl);
+            }
+        }
+
+        // Bookmarks tab.
+        let fav_ids: Vec<&str> = favourites.iter().map(|r| r.room_id.as_str()).collect();
+        if !store_matches(&imp.fav_store, &fav_ids) {
+            imp.fav_store.remove_all();
+            for r in &favourites {
+                imp.fav_store.append(&lookup(r));
+            }
+        }
+        // Bookmarks tab — dot indicator only.
+        {
+            let mut has_unread = false;
+            let mut has_hl = false;
+            for r in &favourites {
+                if let Some(obj) = registry.get(&r.room_id) {
+                    if obj.unread_count() > 0 { has_unread = true; }
+                    if obj.highlight_count() > 0 { has_hl = true; }
+                }
+            }
+            if let Some(page) = imp.fav_page.get() {
+                use adw::prelude::*;
+                page.set_needs_attention(has_unread || has_hl);
+            }
+        }
+
+        // Spaces tab: aggregate child room unread onto each space's RoomObject
+        // and compute total for the tab badge + per-space tooltip.
+        let index = imp.space_children_index.borrow();
+        let cached = imp.cached_rooms.borrow();
+        let mut total_space_unread: u32 = 0;
+        let mut space_has_hl = false;
+        for r in &spaces {
+            let mut child_unread: u32 = 0;
+            let mut child_hl: u32 = 0;
+            if let Some(indices) = index.get(&r.name) {
+                for &i in indices {
+                    if let Some(child) = cached.get(i) {
+                        if let Some(obj) = registry.get(&child.room_id) {
+                            child_unread += obj.unread_count();
+                            child_hl += obj.highlight_count();
+                        }
+                    }
+                }
+            }
+            // Set aggregated unread on the space's own RoomObject so the
+            // badge renders on the space row in the Spaces tab.
+            if let Some(obj) = registry.get(&r.room_id) {
+                obj.set_unread_count(child_unread);
+                obj.set_highlight_count(child_hl);
+            }
+            total_space_unread += child_unread;
+            if child_hl > 0 { space_has_hl = true; }
+        }
+        drop(index);
+        drop(cached);
+
+        let space_ids: Vec<&str> = spaces.iter().map(|r| r.room_id.as_str()).collect();
+        if !store_matches(&imp.space_store, &space_ids) {
+            imp.space_store.remove_all();
+            for r in &spaces {
+                imp.space_store.append(&lookup(r));
+            }
+        }
+        // Spaces tab — dot indicator only.
+        if let Some(page) = imp.space_page.get() {
+            use adw::prelude::*;
+            page.set_needs_attention(total_space_unread > 0 || space_has_hl);
+        }
     }
 
     /// Drill into a space: show its child rooms in the space child view.
@@ -518,6 +714,7 @@ impl RoomListView {
 
         let rooms = imp.cached_rooms.borrow();
         let index = imp.space_children_index.borrow();
+        let registry = imp.room_registry.borrow();
         // O(1) lookup by space name instead of O(n) filter.
         let mut children: Vec<&RoomInfo> = index
             .get(space_name)
@@ -531,7 +728,10 @@ impl RoomListView {
         });
 
         for r in &children {
-            imp.space_child_store.append(&Self::room_to_obj(r));
+            // Use shared GObject from registry so badge updates propagate.
+            if let Some(obj) = registry.get(&r.room_id) {
+                imp.space_child_store.append(&obj.clone());
+            }
         }
 
         imp.space_nav_stack.set_visible_child_name("space-children");
@@ -552,11 +752,14 @@ impl RoomListView {
             r.is_pinned,
             r.is_admin,
             r.is_tombstoned,
+            r.is_favourite,
         );
         obj.set_unread_count(r.unread_count as u32);
         obj.set_highlight_count(r.highlight_count as u32);
+        obj.set_last_activity_ts(r.last_activity_ts);
         obj
     }
+
 }
 
 /// Group rooms into sections and sort within each section.

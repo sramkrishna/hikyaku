@@ -8,6 +8,7 @@ mod imp {
     use gtk::glib;
     use gtk::subclass::prelude::*;
     use gtk::CompositeTemplate;
+    use std::cell::RefCell;
 
     #[derive(CompositeTemplate, Default)]
     #[template(file = "src/widgets/room_row.blp")]
@@ -26,6 +27,9 @@ mod imp {
         pub tombstone_icon: TemplateChild<gtk::Image>,
         #[template_child]
         pub lock_icon: TemplateChild<gtk::Image>,
+        /// Signal handler IDs for property notifications on the bound RoomObject.
+        /// Disconnected in unbind_room to prevent stale callbacks.
+        pub signal_handlers: RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>,
     }
 
     #[glib::object_subclass]
@@ -65,12 +69,25 @@ impl RoomRow {
         glib::Object::builder().build()
     }
 
+    /// Disconnect any active property signal handlers from the previous bind.
+    pub fn unbind_room(&self) {
+        let imp = self.imp();
+        let handlers = imp.signal_handlers.take();
+        for (obj, id) in handlers {
+            obj.disconnect(id);
+        }
+    }
+
     /// Bind a RoomObject's properties to this row's widgets.
+    /// Sets up GObject property notifications so the badge updates
+    /// automatically when `unread_count` or `highlight_count` change.
     pub fn bind_room(&self, room: &RoomObject) {
+        // Disconnect previous handlers first.
+        self.unbind_room();
+
         let imp = self.imp();
 
         if room.is_header() {
-            // Section header: show bold label, hide everything else.
             imp.name_label.set_label(&room.name());
             imp.name_label.add_css_class("heading");
             imp.kind_icon.set_visible(false);
@@ -79,64 +96,84 @@ impl RoomRow {
             imp.unread_badge.set_visible(false);
             imp.admin_icon.set_visible(false);
             imp.tombstone_icon.set_visible(false);
+            return;
+        }
+
+        // Normal room row — set static properties.
+        imp.name_label.set_label(&room.name());
+        imp.name_label.remove_css_class("heading");
+        imp.kind_icon.set_visible(true);
+
+        use std::sync::LazyLock;
+        static KIND_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
+            LazyLock::new(|| {
+                [
+                    ("dm", "avatar-default-symbolic"),
+                    ("room", "system-users-symbolic"),
+                    ("space", "view-grid-symbolic"),
+                ]
+                .into_iter()
+                .collect()
+            });
+        let icon_name = KIND_ICONS
+            .get(room.kind().as_str())
+            .unwrap_or(&"system-users-symbolic");
+        imp.kind_icon.set_icon_name(Some(icon_name));
+        imp.lock_icon.set_visible(room.is_encrypted());
+        imp.admin_icon.set_visible(room.is_admin());
+        imp.tombstone_icon.set_visible(room.is_tombstoned());
+        if room.is_tombstoned() {
+            imp.name_label.add_css_class("dim-label");
         } else {
-            // Normal room row.
-            imp.name_label.set_label(&room.name());
-            imp.name_label.remove_css_class("heading");
-            imp.kind_icon.set_visible(true);
+            imp.name_label.remove_css_class("dim-label");
+        }
 
-            use std::sync::LazyLock;
-            static KIND_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
-                LazyLock::new(|| {
-                    [
-                        ("dm", "avatar-default-symbolic"),
-                        ("room", "system-users-symbolic"),
-                        ("space", "view-grid-symbolic"),
-                    ]
-                    .into_iter()
-                    .collect()
-                });
-            let icon_name = KIND_ICONS
-                .get(room.kind().as_str())
-                .unwrap_or(&"system-users-symbolic");
-            imp.kind_icon.set_icon_name(Some(icon_name));
+        // Set badge from current values.
+        Self::update_badge(imp, room);
 
-            imp.lock_icon.set_visible(room.is_encrypted());
-
-            // Mention icon — show @ when you've been mentioned.
-            let highlights = room.highlight_count();
-            imp.mention_icon.set_visible(highlights > 0);
-
-            // Unread badge — show count.
-            let unread = room.unread_count();
-            if unread > 0 || highlights > 0 {
-                let count = if highlights > 0 { highlights } else { unread };
-                let label = if count > 99 { "99+".to_string() } else { count.to_string() };
-                imp.unread_badge.set_label(&label);
-                imp.unread_badge.set_visible(true);
-                if highlights > 0 {
-                    imp.unread_badge.add_css_class("highlight-badge");
-                    imp.unread_badge.remove_css_class("unread-badge");
-                } else {
-                    imp.unread_badge.add_css_class("unread-badge");
-                    imp.unread_badge.remove_css_class("highlight-badge");
-                }
-            } else {
-                imp.unread_badge.set_visible(false);
+        // Watch for changes on unread_count and highlight_count.
+        let row_weak = self.downgrade();
+        let room_for_unread = room.clone();
+        let h1 = room.connect_notify_local(Some("unread-count"), move |_, _| {
+            if let Some(row) = row_weak.upgrade() {
+                Self::update_badge(row.imp(), &room_for_unread);
             }
+        });
 
-            // Admin star.
-            imp.admin_icon.set_visible(room.is_admin());
-
-            // Tombstone indicator.
-            imp.tombstone_icon.set_visible(room.is_tombstoned());
-
-            // Dim tombstoned room names.
-            if room.is_tombstoned() {
-                imp.name_label.add_css_class("dim-label");
-            } else {
-                imp.name_label.remove_css_class("dim-label");
+        let row_weak = self.downgrade();
+        let room_for_hl = room.clone();
+        let h2 = room.connect_notify_local(Some("highlight-count"), move |_, _| {
+            if let Some(row) = row_weak.upgrade() {
+                Self::update_badge(row.imp(), &room_for_hl);
             }
+        });
+
+        let obj = room.clone().upcast::<glib::Object>();
+        imp.signal_handlers.borrow_mut().push((obj.clone(), h1));
+        imp.signal_handlers.borrow_mut().push((obj, h2));
+    }
+
+    /// Update badge visibility and label from current RoomObject values.
+    fn update_badge(imp: &imp::RoomRow, room: &RoomObject) {
+        let highlights = room.highlight_count();
+        let unread = room.unread_count();
+
+        imp.mention_icon.set_visible(highlights > 0);
+
+        if unread > 0 || highlights > 0 {
+            let count = if highlights > 0 { highlights } else { unread };
+            let label = if count > 99 { "99+".to_string() } else { count.to_string() };
+            imp.unread_badge.set_label(&label);
+            imp.unread_badge.set_visible(true);
+            if highlights > 0 {
+                imp.unread_badge.add_css_class("highlight-badge");
+                imp.unread_badge.remove_css_class("unread-badge");
+            } else {
+                imp.unread_badge.add_css_class("unread-badge");
+                imp.unread_badge.remove_css_class("highlight-badge");
+            }
+        } else {
+            imp.unread_badge.set_visible(false);
         }
     }
 }

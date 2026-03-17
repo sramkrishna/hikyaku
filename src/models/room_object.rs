@@ -64,6 +64,10 @@ mod imp {
         /// Number of highlight notifications (mentions).
         #[property(get, set)]
         highlight_count: Cell<u32>,
+
+        /// Whether this room is bookmarked (m.favourite tag).
+        #[property(get, set)]
+        is_favourite: Cell<bool>,
     }
 
     // These trait impls register our type with GObject's type system.
@@ -98,6 +102,7 @@ impl RoomObject {
         is_pinned: bool,
         is_admin: bool,
         is_tombstoned: bool,
+        is_favourite: bool,
     ) -> Self {
         Object::builder()
             .property("room-id", room_id)
@@ -108,6 +113,7 @@ impl RoomObject {
             .property("is-pinned", is_pinned)
             .property("is-admin", is_admin)
             .property("is-tombstoned", is_tombstoned)
+            .property("is-favourite", is_favourite)
             .build()
     }
 

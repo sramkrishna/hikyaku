@@ -24,7 +24,11 @@ mod imp {
         pub on_edit: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Callback: delete clicked → (event_id).
         pub on_delete: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
-        /// Callback: media hover → (mxc_url, filename, callback for file path).
+        /// Callback: jump to replied-to message → (event_id).
+        pub on_jump_to_reply: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Current reply-to event ID — updated on each bind.
+        pub reply_to: std::rc::Rc<std::cell::RefCell<String>>,
+        /// Callback: media click → (mxc_url, filename, source_json).
         pub on_media_click: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, String)>>>>,
         /// Current media URL, filename, and source JSON.
         pub media_url: std::rc::Rc<std::cell::RefCell<String>>,
@@ -221,6 +225,22 @@ mod imp {
             });
             self.reactions_box.add_controller(gesture);
 
+            // Reply box click — jump to the original message.
+            let reply_to = self.reply_to.clone();
+            let on_jump = self.on_jump_to_reply.clone();
+            let reply_gesture = gtk::GestureClick::new();
+            reply_gesture.connect_released(move |_, _, _, _| {
+                let target = reply_to.borrow().clone();
+                if !target.is_empty() {
+                    if let Some(ref cb) = *on_jump.borrow() {
+                        cb(target);
+                    }
+                }
+            });
+            self.reply_box.add_controller(reply_gesture);
+            // Make reply box look clickable.
+            self.reply_box.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
+
             // Media button click — download and show preview.
             let media_url = self.media_url.clone();
             let media_filename = self.media_filename.clone();
@@ -277,6 +297,29 @@ pub(crate) fn format_timestamp(ts: u64) -> String {
     dt.format(fmt)
         .map(|s: glib::GString| s.to_string())
         .unwrap_or_default()
+}
+
+/// Strip Matrix reply fallback lines from message body.
+/// These are lines starting with "> " at the beginning of the body,
+/// followed by an optional blank line.
+pub fn strip_reply_fallback(body: &str) -> String {
+    let mut lines = body.lines().peekable();
+    // Skip all leading "> " lines.
+    while let Some(line) = lines.peek() {
+        if line.starts_with("> ") {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    // Skip one blank line after the quote block.
+    if let Some(line) = lines.peek() {
+        if line.is_empty() {
+            lines.next();
+        }
+    }
+    let result: String = lines.collect::<Vec<_>>().join("\n");
+    if result.is_empty() { body.to_string() } else { result }
 }
 
 /// Extract an image/gif URL from message body text, if present.
@@ -377,6 +420,10 @@ impl MessageRow {
         self.imp().on_delete.borrow_mut().replace(Box::new(f));
     }
 
+    pub fn set_on_jump_to_reply<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_jump_to_reply.borrow_mut().replace(Box::new(f));
+    }
+
     pub fn set_on_media_click<F: Fn(String, String, String) + 'static>(&self, f: F) {
         self.imp().on_media_click.borrow_mut().replace(Box::new(f));
     }
@@ -400,6 +447,7 @@ impl MessageRow {
         imp.event_id.replace(msg.event_id());
         imp.sender_text.replace(sender.clone());
         imp.body_text.replace(body.clone());
+        imp.reply_to.replace(reply_to.clone());
 
         // Reply indicator — show who they're replying to.
         if !reply_to.is_empty() {
@@ -527,7 +575,7 @@ impl MessageRow {
         }
 
         // Delegate to text rendering with highlights.
-        // Also highlight if the message is marked as a reply-to-us.
+        // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
         self.render_body(&sender, &body, timestamp, highlight_names, force_highlight);
     }

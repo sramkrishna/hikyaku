@@ -202,6 +202,14 @@ pub enum MatrixEvent {
     },
     /// Media downloaded to a temp file — show preview.
     MediaReady { url: String, path: String },
+    /// A message we sent has been confirmed by the server with a real event_id.
+    MessageSent { room_id: String, echo_body: String, event_id: String },
+    /// Reactions on a message were updated.
+    ReactionUpdate { room_id: String, event_id: String, reactions: Vec<(String, u64, Vec<String>)> },
+    /// A message was edited.
+    MessageEdited { room_id: String, event_id: String, new_body: String },
+    /// A message was redacted (deleted).
+    MessageRedacted { room_id: String, event_id: String },
     /// Successfully joined a room.
     RoomJoined { room_id: String, room_name: String },
     /// Failed to join a room.
@@ -270,6 +278,8 @@ pub enum MatrixCommand {
     SetFavourite { room_id: String, is_favourite: bool },
     /// Leave a room.
     LeaveRoom { room_id: String },
+    /// Send read receipt for the latest message in a room.
+    MarkRead { room_id: String },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -441,6 +451,13 @@ async fn matrix_task(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
+    // In-memory timeline cache: room_id → (messages, prev_batch, room_meta).
+    // Enables instant room switching — show cached data immediately, then
+    // refresh from the network in the background.
+    let timeline_cache: std::sync::Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
+    >> = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Process commands while sync runs in the background.
     let mut shutdown_rx = shutdown_rx;
     loop {
@@ -451,10 +468,42 @@ async fn matrix_task(
                         tracing::warn!("Already logged in, ignoring duplicate login command");
                     }
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
-                        handle_select_room(&client, &event_tx, &room_id, &mut rooms_with_keys).await;
+                        // Check cache first — show instantly if available.
+                        let cached = {
+                            let cache = timeline_cache.lock().await;
+                            cache.get(&room_id).cloned()
+                        };
+                        if let Some((msgs, prev_batch, meta)) = cached {
+                            let _ = event_tx.send(MatrixEvent::RoomMessages {
+                                room_id: room_id.clone(),
+                                messages: msgs,
+                                prev_batch_token: prev_batch,
+                                room_meta: meta,
+                            }).await;
+                        }
+                        // Fetch fresh data in background — don't block the command loop.
+                        // This means subsequent room switches aren't queued behind a 1s fetch.
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        let bg_cache = timeline_cache.clone();
+                        // Pre-check key fetch status so we don't need &mut in the spawned task.
+                        let needs_keys = !rooms_with_keys.contains(&room_id);
+                        if needs_keys {
+                            rooms_with_keys.insert(room_id.clone());
+                            // Persist to disk.
+                            if let Ok(json) = serde_json::to_string(&rooms_with_keys) {
+                                let _ = std::fs::write(&key_cache_path, &json);
+                            }
+                        }
+                        let bg_room_id = room_id.clone();
+                        tokio::spawn(async move {
+                            handle_select_room_bg(
+                                &bg_client, &bg_tx, &bg_room_id, needs_keys, bg_cache,
+                            ).await;
+                        });
                     }
                     Ok(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }) => {
-                        handle_send_message(&client, &room_id, &body, reply_to.as_deref(), quote_text.as_ref()).await;
+                        handle_send_message(&client, &event_tx, &room_id, &body, reply_to.as_deref(), quote_text.as_ref()).await;
                     }
                     Ok(MatrixCommand::SendReaction { room_id, event_id, emoji }) => {
                         handle_send_reaction(&client, &room_id, &event_id, &emoji).await;
@@ -531,6 +580,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::LeaveRoom { room_id }) => {
                         handle_leave_room(&client, &event_tx, &room_id).await;
+                    }
+                    Ok(MatrixCommand::MarkRead { room_id }) => {
+                        handle_mark_read(&client, &room_id).await;
                     }
                     Err(_) => break,
                 }
@@ -1433,6 +1485,42 @@ async fn start_sync(
                     .unwrap_or_default();
 
                 let sender_id = event.sender.to_string();
+
+                // Extract reply/thread relations.
+                use matrix_sdk::ruma::events::room::message::Relation;
+                let (reply_to, thread_root) = match &event.content.relates_to {
+                    Some(Relation::Reply { in_reply_to }) => {
+                        (Some(in_reply_to.event_id.to_string()), None)
+                    }
+                    Some(Relation::Thread(thread)) => {
+                        let reply = thread.in_reply_to.as_ref()
+                            .map(|r| r.event_id.to_string());
+                        (reply, Some(thread.event_id.to_string()))
+                    }
+                    _ => (None, None),
+                };
+
+                // Resolve reply-to sender name.
+                let reply_to_sender = if let Some(ref rt_eid) = reply_to {
+                    use matrix_sdk::ruma::OwnedEventId;
+                    if let Ok(eid) = rt_eid.parse::<OwnedEventId>() {
+                        if let Ok(ev) = room.event(&eid, None).await {
+                            if let Ok(parsed) = ev.raw().deserialize() {
+                                let sender = parsed.sender().to_owned();
+                                Some(resolve_display_name(&room, &sender).await)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
                         room_id: room.room_id().to_string(),
@@ -1444,9 +1532,9 @@ async fn start_sync(
                             body,
                             timestamp,
                             event_id: event.event_id.to_string(),
-                            reply_to: None,
-                            reply_to_sender: None,
-                            thread_root: None,
+                            reply_to,
+                            reply_to_sender,
+                            thread_root,
                             reactions: Vec::new(),
                             media,
                             is_highlight: false,
@@ -1500,6 +1588,57 @@ async fn start_sync(
             }
         },
     );
+
+    // Handler for reaction events — update reaction aggregations live.
+    {
+        use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
+        let react_tx = event_tx.clone();
+        let react_client = client.clone();
+        client.add_event_handler(
+            move |event: OriginalSyncReactionEvent,
+                  room: matrix_sdk::room::Room| {
+                let tx = react_tx.clone();
+                let client = react_client.clone();
+                async move {
+                    let target_event_id = event.content.relates_to.event_id.to_string();
+                    let emoji = event.content.relates_to.key.clone();
+                    let sender_name = resolve_display_name(&room, &event.sender).await;
+                    // Check if sender is us.
+                    let display = if client.user_id().map_or(false, |uid| uid == &event.sender) {
+                        "You".to_string()
+                    } else {
+                        sender_name
+                    };
+                    let _ = tx.send(MatrixEvent::ReactionUpdate {
+                        room_id: room.room_id().to_string(),
+                        event_id: target_event_id,
+                        reactions: vec![(emoji, 1, vec![display])],
+                    }).await;
+                }
+            },
+        );
+    }
+
+    // Handler for redaction events.
+    {
+        use matrix_sdk::ruma::events::room::redaction::OriginalSyncRoomRedactionEvent;
+        let redact_tx = event_tx.clone();
+        client.add_event_handler(
+            move |event: OriginalSyncRoomRedactionEvent,
+                  room: matrix_sdk::room::Room| {
+                let tx = redact_tx.clone();
+                async move {
+                    // content.redacts is the standard field for the redacted event ID.
+                    if let Some(ref redacts) = event.content.redacts {
+                        let _ = tx.send(MatrixEvent::MessageRedacted {
+                            room_id: room.room_id().to_string(),
+                            event_id: redacts.to_string(),
+                        }).await;
+                    }
+                }
+            },
+        );
+    }
 
     // Sync loop with retry.
     // Send full room list only on the first sync response (initial sync),
@@ -1665,25 +1804,22 @@ async fn extract_messages(
     reverse: bool,
     my_user_id: Option<&matrix_sdk::ruma::UserId>,
 ) -> Vec<MessageInfo> {
-    use matrix_sdk::ruma::events::room::message::MessageType;
-
     let mut messages = Vec::new();
-    let iter: Box<dyn Iterator<Item = &matrix_sdk::deserialized_responses::TimelineEvent>> =
+    let iter: Box<dyn Iterator<Item = &matrix_sdk::deserialized_responses::TimelineEvent> + Send> =
         if reverse {
             Box::new(chunk.iter().rev())
         } else {
             Box::new(chunk.iter())
         };
 
-    // First pass: collect reactions and replacements (edits).
-    // reaction_map: target_event_id → Vec<(emoji, sender_id)>
+    // First pass: collect reactions, replacements, and unique sender IDs.
     let mut reaction_map: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
-    // Map of original_event_id → (latest replacement body, replacement event_id).
     let mut replacement_map: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
-    // Set of event_ids that are replacement events (to skip in main loop).
     let mut replacement_event_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut sender_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
     for timeline_event in chunk {
@@ -1697,6 +1833,7 @@ async fn extract_messages(
                     let target = reaction.content.relates_to.event_id.to_string();
                     let emoji = reaction.content.relates_to.key.clone();
                     let sender = reaction.sender.to_string();
+                    sender_ids.insert(sender.clone());
                     reaction_map.entry(target).or_default().push((emoji, sender));
                 }
                 matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
@@ -1704,7 +1841,7 @@ async fn extract_messages(
                         matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(msg),
                     ),
                 ) => {
-                    // Check if this is a replacement (edit) event.
+                    sender_ids.insert(msg.sender.to_string());
                     use matrix_sdk::ruma::events::room::message::Relation;
                     if let Some(Relation::Replacement(replacement)) = &msg.content.relates_to {
                         let original_id = replacement.event_id.to_string();
@@ -1715,19 +1852,32 @@ async fn extract_messages(
                         replacement_event_ids.insert(msg.event_id.to_string());
                     }
                 }
+                matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomEncrypted(
+                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(enc),
+                    ),
+                ) => {
+                    sender_ids.insert(enc.sender.to_string());
+                }
                 _ => {}
             }
+        }
+    }
+
+    // Batch-resolve display names: one lookup per unique sender instead of per message.
+    let mut display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for uid_str in &sender_ids {
+        if let Ok(uid) = <&matrix_sdk::ruma::UserId>::try_from(uid_str.as_str()) {
+            let name = resolve_display_name(room, uid).await;
+            display_names.insert(uid_str.clone(), name);
         }
     }
 
     for timeline_event in iter {
         let event = match timeline_event.raw().deserialize() {
             Ok(ev) => ev,
-            Err(_) => {
-                // Skip events that can't be deserialized (redacted,
-                // unknown types, or corrupted). Don't show blank rows.
-                continue;
-            }
+            Err(_) => continue,
         };
         match event {
             matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
@@ -1739,13 +1889,10 @@ async fn extract_messages(
                 };
                 let event_id = msg_event.event_id.to_string();
 
-                // Skip replacement events — they're edits displayed
-                // via the original message with updated body.
                 if replacement_event_ids.contains(&event_id) {
                     continue;
                 }
 
-                // Skip events that are replacements (relates_to = Replacement).
                 use matrix_sdk::ruma::events::room::message::Relation;
                 if matches!(&msg_event.content.relates_to, Some(Relation::Replacement(_))) {
                     continue;
@@ -1755,12 +1902,14 @@ async fn extract_messages(
                     continue;
                 };
 
-                // Apply the latest edit if this message was replaced.
                 if let Some((new_body, _)) = replacement_map.get(&event_id) {
                     body = new_body.clone();
                 }
 
-                let display_name = resolve_display_name(room, &msg_event.sender).await;
+                let sender_id = msg_event.sender.to_string();
+                let display_name = display_names.get(&sender_id)
+                    .cloned()
+                    .unwrap_or_else(|| sender_id.clone());
 
                 let (reply_to, thread_root) = match &msg_event.content.relates_to {
                     Some(Relation::Reply { in_reply_to }) => {
@@ -1774,17 +1923,16 @@ async fn extract_messages(
                     _ => (None, None),
                 };
 
-                // Aggregate reactions for this event.
                 let reactions = aggregate_reactions(reaction_map.get(&event_id));
 
                 messages.push(MessageInfo {
                     sender: display_name,
-                    sender_id: msg_event.sender.to_string(),
+                    sender_id,
                     body,
                     timestamp: msg_event.origin_server_ts.as_secs().into(),
                     event_id,
                     reply_to,
-                    reply_to_sender: None, // Populated in post-processing.
+                    reply_to_sender: None,
                     thread_root,
                     reactions,
                     media,
@@ -1800,12 +1948,9 @@ async fn extract_messages(
                     }
                     _ => continue,
                 };
-                // Skip replacement events, redacted events, and encrypted
-                // events that are edits (check raw JSON for m.relates_to).
                 if replacement_event_ids.contains(&event_id) || event_id.is_empty() {
                     continue;
                 }
-                // Check raw JSON for replacement relation (encrypted edits).
                 let raw = timeline_event.raw().json().get();
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
                     if let Some(rel_type) = v.get("content")
@@ -1818,8 +1963,11 @@ async fn extract_messages(
                         }
                     }
                 }
+                let display_name = display_names.get(&sender)
+                    .cloned()
+                    .unwrap_or_else(|| sender.clone());
                 messages.push(MessageInfo {
-                    sender: sender.clone(),
+                    sender: display_name,
                     sender_id: sender,
                     body: "\u{1f512} Unable to decrypt message".to_string(),
                     timestamp: 0,
@@ -1837,7 +1985,6 @@ async fn extract_messages(
     }
     // Post-process: populate reply_to_sender and mark highlights.
     {
-        // Build event_id → sender_name map for the batch.
         let sender_map: std::collections::HashMap<String, String> = messages
             .iter()
             .filter(|m| !m.event_id.is_empty())
@@ -1855,11 +2002,9 @@ async fn extract_messages(
 
         for msg in &mut messages {
             if let Some(ref reply_to) = msg.reply_to {
-                // Set reply_to_sender from the batch map.
                 if let Some(name) = sender_map.get(reply_to) {
                     msg.reply_to_sender = Some(name.clone());
                 }
-                // Mark highlight if replying to us.
                 if my_event_ids.contains(reply_to) {
                     msg.is_highlight = true;
                 }
@@ -1879,11 +2024,16 @@ async fn extract_messages(
 /// `key_fetched_rooms` tracks room IDs for which we've already triggered a
 /// key download from backup this session (to avoid redundant network calls).
 /// This set contains only room ID strings, NOT encryption keys.
-async fn handle_select_room(
+/// Background room select — fetches messages and metadata, updates cache + UI.
+/// Runs in a spawned task so it doesn't block the command loop.
+async fn handle_select_room_bg(
     client: &Client,
     event_tx: &Sender<MatrixEvent>,
     room_id: &str,
-    key_fetched_rooms: &mut std::collections::HashSet<String>,
+    needs_keys: bool,
+    timeline_cache: std::sync::Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
+    >>,
 ) {
     use matrix_sdk::ruma::UInt;
 
@@ -1899,32 +2049,18 @@ async fn handle_select_room(
 
     // If the room is encrypted and we haven't fetched keys this session,
     // download room keys from backup so we can decrypt messages.
-    if room.is_encrypted().await.unwrap_or(false)
-        && !key_fetched_rooms.contains(&room_id.to_string())
-    {
+    if needs_keys && room.is_encrypted().await.unwrap_or(false) {
         let backups = client.encryption().backups();
         match backups.download_room_keys_for_room(&room_id).await {
             Ok(()) => tracing::debug!("Downloaded room keys for {room_id}"),
             Err(e) => tracing::debug!("Could not download room keys for {room_id}: {e}"),
         }
-        key_fetched_rooms.insert(room_id.to_string());
-        // Persist to disk.
-        let path = {
-            let mut p = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-            p.push("matx");
-            p.push("key_fetched_rooms.json");
-            p
-        };
-        if let Ok(json) = serde_json::to_string(key_fetched_rooms as &std::collections::HashSet<String>) {
-            let _ = std::fs::write(&path, json);
-        }
     }
 
+    let start = std::time::Instant::now();
     tracing::debug!("Fetching messages for {room_id}");
 
-    // Filter the /messages API to only return message-like events, skipping
-    // state events (membership churn) server-side. This avoids paginating
-    // through hundreds of m.room.member events to find actual messages.
+    // Run message fetch, metadata, and member list in parallel.
     use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
     let mut msg_filter = RoomEventFilter::default();
     msg_filter.types = Some(vec![
@@ -1932,139 +2068,138 @@ async fn handle_select_room(
         "m.room.encrypted".to_string(),
         "m.reaction".to_string(),
     ]);
-
     let mut options = matrix_sdk::room::MessagesOptions::backward();
     options.limit = UInt::from(50u32);
     options.filter = msg_filter;
 
-    let (all_messages, prev_batch_token) = match room.messages(options).await {
-        Ok(response) => {
-            tracing::debug!("Got {} events for {room_id}", response.chunk.len());
-            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
-            let token = response.end.map(|t| t.to_string());
-
-            // Send a read receipt for the most recent event to clear unread count.
-            if let Some(latest) = response.chunk.first() {
-                if let Ok(ev) = latest.raw().deserialize() {
-                    let event_id = ev.event_id().to_owned();
-                    if let Err(e) = room
-                        .send_single_receipt(
-                            matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
-                            matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
-                            event_id,
-                        )
-                        .await
-                    {
-                        tracing::debug!("Failed to send read receipt: {e}");
+    // Fork: messages, tombstone, pinned, members — all independent.
+    let msg_room = room.clone();
+    let msg_client = client.clone();
+    let msg_future = async {
+        match msg_room.messages(options).await {
+            Ok(response) => {
+                let msgs = extract_messages(&msg_room, &response.chunk, true, msg_client.user_id()).await;
+                let token = response.end.map(|t| t.to_string());
+                // Send read receipt in background — don't block on it.
+                if let Some(latest) = response.chunk.first() {
+                    if let Ok(ev) = latest.raw().deserialize() {
+                        let eid = ev.event_id().to_owned();
+                        let r = msg_room.clone();
+                        tokio::spawn(async move {
+                            let _ = r.send_single_receipt(
+                                matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
+                                matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
+                                eid,
+                            ).await;
+                        });
                     }
                 }
+                (msgs, token)
             }
-
-            (msgs, token)
-        }
-        Err(e) => {
-            tracing::error!("Failed to fetch messages for {room_id}: {e}");
-            (Vec::new(), None)
+            Err(e) => {
+                tracing::error!("Failed to fetch messages for {}: {e}", msg_room.room_id());
+                (Vec::new(), None)
+            }
         }
     };
 
-    // Collect room metadata for the content header.
-    let topic = room
-        .topic()
-        .unwrap_or_default();
-
-    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
-    let member_count = room.joined_members_count();
-
-    // Check tombstone status.
-    use matrix_sdk::ruma::events::room::tombstone::RoomTombstoneEventContent;
-    let tombstone = room
-        .get_state_event_static::<RoomTombstoneEventContent>()
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.deserialize().ok())
-        .and_then(|ev| {
-            if let matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
-                matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
-            ) = ev
-            {
-                Some(orig.content)
-            } else {
-                None
+    let tombstone_room = room.clone();
+    let tombstone_client = client.clone();
+    let tombstone_future = async {
+        use matrix_sdk::ruma::events::room::tombstone::RoomTombstoneEventContent;
+        let tombstone = tombstone_room
+            .get_state_event_static::<RoomTombstoneEventContent>()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.deserialize().ok())
+            .and_then(|ev| {
+                if let matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
+                    matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
+                ) = ev
+                {
+                    Some(orig.content)
+                } else {
+                    None
+                }
+            });
+        match tombstone {
+            Some(content) => {
+                let rid = content.replacement_room.to_string();
+                let name = tombstone_client
+                    .get_room(&content.replacement_room)
+                    .and_then(|r| r.cached_display_name().map(|n| n.to_string()));
+                (true, Some(rid), name)
             }
-        });
-
-    let (is_tombstoned, replacement_room, replacement_room_name) = match tombstone {
-        Some(content) => {
-            let rid = content.replacement_room.to_string();
-            // Try to resolve the human-readable name from joined rooms.
-            let name = client
-                .get_room(&content.replacement_room)
-                .and_then(|r| {
-                    // Use cached display name (no network call).
-                    r.cached_display_name().map(|n| n.to_string())
-                });
-            (true, Some(rid), name)
+            None => (false, None, None),
         }
-        None => (false, None, None),
     };
 
-    // Fetch pinned messages.
-    use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
-    let pinned_messages = match room
-        .get_state_event_static::<RoomPinnedEventsEventContent>()
-        .await
-    {
-        Ok(Some(raw)) => {
-            if let Ok(ev) = raw.deserialize() {
-                let pinned_ids = match ev {
-                    matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
-                        matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
-                    ) => orig.content.pinned,
-                    _ => vec![],
-                };
-                // Fetch the actual event content for each pinned event (up to 5).
-                let mut entries = Vec::new();
-                for event_id in pinned_ids.iter().take(5) {
-                    if let Ok(ev) = room.event(event_id, None).await {
-                        if let Ok(timeline_ev) = ev.raw().deserialize() {
-                            if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
-                                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(
-                                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(msg),
-                                ),
-                            ) = timeline_ev
-                            {
-                                let Some((body, _media)) = extract_message_content(&msg.content.msgtype) else {
-                                    continue;
-                                };
-                                let sender = resolve_display_name(&room, &msg.sender).await;
-                                entries.push((sender, body));
+    let pinned_room = room.clone();
+    let pinned_future = async {
+        use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
+        match pinned_room
+            .get_state_event_static::<RoomPinnedEventsEventContent>()
+            .await
+        {
+            Ok(Some(raw)) => {
+                if let Ok(ev) = raw.deserialize() {
+                    let pinned_ids = match ev {
+                        matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(
+                            matrix_sdk::ruma::events::SyncStateEvent::Original(orig),
+                        ) => orig.content.pinned,
+                        _ => vec![],
+                    };
+                    let mut entries = Vec::new();
+                    for event_id in pinned_ids.iter().take(5) {
+                        if let Ok(ev) = pinned_room.event(event_id, None).await {
+                            if let Ok(timeline_ev) = ev.raw().deserialize() {
+                                if let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(
+                                        matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(msg),
+                                    ),
+                                ) = timeline_ev
+                                {
+                                    let Some((body, _media)) = extract_message_content(&msg.content.msgtype) else {
+                                        continue;
+                                    };
+                                    let sender = resolve_display_name(&pinned_room, &msg.sender).await;
+                                    entries.push((sender, body));
+                                }
                             }
                         }
                     }
+                    entries
+                } else {
+                    vec![]
                 }
-                entries
-            } else {
-                vec![]
             }
+            _ => vec![],
         }
-        _ => vec![],
     };
 
-    // Fetch room members for nick completion (lazy-loaded, so this
-    // may only return members we've seen in timeline events).
-    let members: Vec<(String, String)> = room
-        .members_no_sync(matrix_sdk::RoomMemberships::ACTIVE)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| {
-            let uid = m.user_id().to_string();
-            let name = m.display_name().map(|n| n.to_string()).unwrap_or_else(|| uid.clone());
-            (uid, name)
-        })
-        .collect();
+    let member_room = room.clone();
+    let member_future = async {
+        member_room
+            .members_no_sync(matrix_sdk::RoomMemberships::ACTIVE)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| {
+                let uid = m.user_id().to_string();
+                let name = m.display_name().map(|n| n.to_string()).unwrap_or_else(|| uid.clone());
+                (uid, name)
+            })
+            .collect::<Vec<(String, String)>>()
+    };
+
+    // Run all four in parallel.
+    let ((all_messages, prev_batch_token), (is_tombstoned, replacement_room, replacement_room_name), pinned_messages, members) =
+        tokio::join!(msg_future, tombstone_future, pinned_future, member_future);
+
+    let topic = room.topic().unwrap_or_default();
+    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
+    let member_count = room.joined_members_count();
 
     let room_meta = RoomMeta {
         topic,
@@ -2078,7 +2213,20 @@ async fn handle_select_room(
         members,
     };
 
-    tracing::debug!("Sending {} messages to UI for {room_id}", all_messages.len());
+    tracing::info!(
+        "Room select for {} took {:?} ({} messages)",
+        room_id, start.elapsed(), all_messages.len()
+    );
+
+    // Update the timeline cache for instant switching next time.
+    {
+        let mut cache = timeline_cache.lock().await;
+        cache.insert(
+            room_id.to_string(),
+            (all_messages.clone(), prev_batch_token.clone(), room_meta.clone()),
+        );
+    }
+
     let _ = event_tx
         .send(MatrixEvent::RoomMessages {
             room_id: room_id.to_string(),
@@ -2307,6 +2455,7 @@ async fn handle_download_media(
 
 async fn handle_send_message(
     client: &Client,
+    event_tx: &Sender<MatrixEvent>,
     room_id: &str,
     body: &str,
     reply_to: Option<&str>,
@@ -2349,8 +2498,17 @@ async fn handle_send_message(
         }
     }
 
-    if let Err(e) = room.send(content).await {
-        tracing::error!("Failed to send message to {room_id}: {e}");
+    match room.send(content).await {
+        Ok(response) => {
+            let _ = event_tx.send(MatrixEvent::MessageSent {
+                room_id: room_id.to_string(),
+                echo_body: body.to_string(),
+                event_id: response.event_id.to_string(),
+            }).await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to send message to {room_id}: {e}");
+        }
     }
 }
 
@@ -2612,5 +2770,23 @@ async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room
                 })
                 .await;
         }
+    }
+}
+
+/// Send a read receipt for the latest event in a room.
+async fn handle_mark_read(client: &Client, room_id: &str) {
+    let Ok(rid) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&rid) else { return };
+
+    // Use latest_event() to get the most recent event ID.
+    let Some(ev) = room.latest_event() else { return };
+    let Some(eid) = ev.event_id() else { return };
+
+    if let Err(e) = room.send_single_receipt(
+        matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
+        matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
+        eid.to_owned(),
+    ).await {
+        tracing::warn!("Failed to send read receipt for {room_id}: {e}");
     }
 }

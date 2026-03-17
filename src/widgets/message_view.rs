@@ -204,6 +204,13 @@ mod imp {
                     });
 
                     let view_weak = setup_view_weak.clone();
+                    row.set_on_jump_to_reply(move |event_id| {
+                        if let Some(v) = view_weak.upgrade() {
+                            v.scroll_to_event(&event_id);
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
                     row.set_on_react(move |eid, emoji| {
                         if let Some(v) = view_weak.upgrade() {
                             let has_cb = v.imp().on_react.borrow().is_some();
@@ -677,6 +684,26 @@ impl MessageView {
         });
     }
 
+    /// Add a reaction from a specific sender (used for live sync updates).
+    pub fn add_reaction(&self, event_id: &str, emoji: &str, sender: &str) {
+        let emoji = emoji.to_string();
+        let sender = sender.to_string();
+        self.update_message_in_place(event_id, |msg| {
+            let mut reactions: Vec<(String, u64, Vec<String>)> =
+                serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
+            if let Some(entry) = reactions.iter_mut().find(|(e, _, _)| *e == emoji) {
+                // Don't add duplicate sender.
+                if !entry.2.iter().any(|n| n == &sender) {
+                    entry.1 += 1;
+                    entry.2.push(sender);
+                }
+            } else {
+                reactions.push((emoji, 1, vec![sender]));
+            }
+            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+        });
+    }
+
     /// Remove an emoji reaction from a message (decrement count).
     pub fn remove_reaction(&self, event_id: &str, emoji: &str) {
         let emoji = emoji.to_string();
@@ -700,6 +727,46 @@ impl MessageView {
         self.update_message_in_place(event_id, |msg| {
             msg.set_body(new_body);
         });
+    }
+
+    /// Scroll to a message by event_id. Returns true if found.
+    pub fn scroll_to_event(&self, event_id: &str) -> bool {
+        if event_id.is_empty() { return false; }
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        for i in 0..n {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.event_id() == event_id {
+                // Scroll the ListView to this position.
+                imp.list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
+                // Briefly highlight the target row.
+                let list_view = &imp.list_view;
+                let mut child = list_view.first_child();
+                let mut idx = 0u32;
+                while let Some(ref widget) = child {
+                    if idx == i {
+                        if let Some(row) = Self::find_message_row(widget) {
+                            row.add_css_class("flash-highlight");
+                            let row_weak = row.downgrade();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_secs(2),
+                                move || {
+                                    if let Some(r) = row_weak.upgrade() {
+                                        r.remove_css_class("flash-highlight");
+                                    }
+                                },
+                            );
+                        }
+                        break;
+                    }
+                    child = widget.next_sibling();
+                    idx += 1;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Remove a message from the timeline (for deletes).
@@ -730,10 +797,11 @@ impl MessageView {
     /// Replace all messages (used when switching rooms).
     pub fn set_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
-        imp.list_store.remove_all();
-        for m in messages {
-            imp.list_store.append(&Self::info_to_obj(m));
-        }
+        // Build all MessageObjects first, then splice in one shot to avoid
+        // N individual items_changed signals triggering N factory binds.
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        imp.list_store.splice(0, n, &objs);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
         imp.view_stack.set_visible_child_name("messages");
@@ -743,9 +811,8 @@ impl MessageView {
     /// Prepend older messages at the top (pagination).
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
-        for (i, m) in messages.iter().enumerate() {
-            imp.list_store.insert(i as u32, &Self::info_to_obj(m));
-        }
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+        imp.list_store.splice(0, 0, &objs);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
     }
@@ -770,10 +837,17 @@ impl MessageView {
         let media_json = m.media.as_ref()
             .and_then(|media| serde_json::to_string(media).ok())
             .unwrap_or_default();
+        // Strip Matrix reply fallback ("> <@user> ..." lines) from body
+        // since we show "Replying to {name}" as a visual indicator.
+        let body = if m.reply_to.is_some() {
+            crate::widgets::message_row::strip_reply_fallback(&m.body)
+        } else {
+            m.body.clone()
+        };
         let obj = MessageObject::new(
             &m.sender,
             &m.sender_id,
-            &m.body,
+            &body,
             m.timestamp,
             &m.event_id,
             m.reply_to.as_deref().unwrap_or(""),
@@ -906,6 +980,38 @@ impl MessageView {
             .list_store
             .append(&Self::info_to_obj(msg));
         self.scroll_to_bottom();
+    }
+
+    /// Patch the event_id on a local echo message once the server confirms it.
+    /// Searches backwards for a MessageObject with empty event_id and matching body.
+    pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) {
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        // Search backwards — local echo is near the end.
+        for i in (0..n).rev() {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.event_id().is_empty() && msg.body() == echo_body {
+                msg.set_event_id(event_id.to_string());
+                return;
+            }
+        }
+    }
+
+    /// Check if a message with the given event_id already exists in the timeline.
+    pub fn has_event(&self, event_id: &str) -> bool {
+        if event_id.is_empty() { return false; }
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        // Search backwards — recent messages are more likely to match.
+        for i in (0..n).rev() {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.event_id() == event_id {
+                return true;
+            }
+        }
+        false
     }
 
     fn scroll_to_bottom(&self) {

@@ -39,6 +39,8 @@ mod imp {
         /// Right sidebar for room details.
         pub details_revealer: gtk::Revealer,
         pub details_content: gtk::Box,
+        /// Separator between message view and details sidebar.
+        pub details_separator: OnceCell<gtk::Separator>,
         /// Info button in the content header (shown only when a room is selected).
         pub info_button: OnceCell<gtk::Button>,
         /// Bookmark toggle button.
@@ -51,6 +53,10 @@ mod imp {
         pub media_preview_anchor: RefCell<Option<gtk::Widget>>,
         /// Shared media preview popover — reused across hovers.
         pub media_popover: gtk::Popover,
+        /// Timer for delayed read receipt + badge clear (15s after entering room).
+        /// Stores (SourceId, fired flag). The flag is set by the callback so
+        /// we know not to call .remove() on an already-fired one-shot timer.
+        pub read_timer: RefCell<Option<(glib::SourceId, std::rc::Rc<std::cell::Cell<bool>>)>>,
     }
 
     impl Default for MxWindow {
@@ -78,11 +84,13 @@ mod imp {
                 details_revealer: gtk::Revealer::builder()
                     .transition_type(gtk::RevealerTransitionType::None)
                     .reveal_child(false)
+                    .visible(false)
                     .build(),
                 details_content: gtk::Box::builder()
                     .orientation(gtk::Orientation::Vertical)
                     .width_request(200)
                     .build(),
+                details_separator: OnceCell::new(),
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
                 user_id: RefCell::new(String::new()),
@@ -94,6 +102,7 @@ mod imp {
                     p.set_has_arrow(true);
                     p
                 },
+                read_timer: RefCell::new(None),
             }
         }
     }
@@ -285,9 +294,58 @@ impl MxWindow {
                 // Hide details sidebar when switching rooms.
                 window.imp().details_revealer.set_reveal_child(false);
                 window.imp().details_revealer.set_visible(false);
+                if let Some(sep) = window.imp().details_separator.get() {
+                    sep.set_visible(false);
+                }
             }
-            // Clear unread badge immediately — don't wait for server round-trip.
+            // Suppress server unread counts immediately — add to locally_read
+            // so sync cycles don't overwrite the badge while we're in the room.
+            // The actual read receipt + badge clear happens after 15 seconds.
             room_list.clear_unread(&room_id);
+
+            // Delay sending read receipt by 15 seconds.
+            // This ensures the user actually stays in the room before telling the server.
+            if let Some(window) = window_weak.upgrade() {
+                let imp = window.imp();
+                // Cancel any previous timer (switched rooms before it fired).
+                // timeout_add_local_once auto-removes the source after firing,
+                // so only call .remove() if the callback hasn't fired yet.
+                if let Some((old_id, fired)) = imp.read_timer.borrow_mut().take() {
+                    if !fired.get() {
+                        old_id.remove();
+                    }
+                }
+                let room_list_timer = room_list.clone();
+                let rid_timer = room_id.clone();
+                let cmd_tx_timer = cmd_tx.clone();
+                let win_weak_timer = window.downgrade();
+                let fired_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+                let fired_for_cb = fired_flag.clone();
+                let source = glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(15),
+                    move || {
+                        // Mark as fired so cancellation won't call .remove().
+                        fired_for_cb.set(true);
+                        // Only clear if we're still in the same room.
+                        let current = win_weak_timer.upgrade()
+                            .and_then(|w| w.imp().current_room_id.borrow().clone());
+                        let still_here = current.as_deref() == Some(rid_timer.as_str());
+                        tracing::info!(
+                            "Read timer fired for {}, still_here={}, current={:?}",
+                            rid_timer, still_here, current
+                        );
+                        if still_here {
+                            room_list_timer.clear_unread(&rid_timer);
+                            let tx = cmd_tx_timer.clone();
+                            let rid = rid_timer.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::MarkRead { room_id: rid }).await;
+                            });
+                        }
+                    },
+                );
+                imp.read_timer.replace(Some((source, fired_flag)));
+            }
             // Clear old messages while we fetch the new room's messages.
             msg_view.clear();
             let tx = cmd_tx.clone();
@@ -413,7 +471,7 @@ impl MxWindow {
                     timestamp: now,
                     event_id: String::new(),
                     reply_to: reply_to.clone(),
-                    reply_to_sender: None,
+                    reply_to_sender: quote_text.as_ref().map(|(sender, _)| sender.clone()),
                     thread_root: None,
                     reactions: Vec::new(),
                     media: None,
@@ -623,18 +681,33 @@ impl MxWindow {
                             message_view.prepend_messages(&messages, prev_batch_token);
                         }
                     }
+                    MatrixEvent::MessageSent { room_id, echo_body, event_id } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.patch_echo_event_id(&echo_body, &event_id);
+                        }
+                    }
                     MatrixEvent::NewMessage { room_id, room_name, sender_id, message, is_mention } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         let my_id = window.imp().user_id.borrow().clone();
-                        // Skip our own messages — already shown as local echo.
                         let is_self = sender_id == my_id;
                         let is_current_room = current.as_deref() == Some(&room_id);
+                        // Skip our own messages if already shown (local echo with patched event_id).
                         if is_current_room && !is_self {
+                            message_view.append_message(&message);
+                        } else if is_current_room && is_self && !message_view.has_event(&message.event_id) {
+                            // Our message but not yet in timeline (e.g. sent from another device).
                             message_view.append_message(&message);
                         }
 
                         // Update unread badge on rooms we're NOT viewing.
-                        if !is_current_room && !is_self {
+                        // Include self-messages from other devices — they indicate
+                        // activity in rooms we should be aware of.
+                        if !is_current_room {
+                            tracing::info!(
+                                "NewMessage: incrementing unread for {} (sender={}, is_mention={}, is_self={})",
+                                room_id, sender_id, is_mention, is_self
+                            );
                             room_list_view.increment_unread(&room_id, is_mention);
                         }
 
@@ -661,6 +734,28 @@ impl MxWindow {
                                 Some(&format!("mention-{}", room_id)),
                                 &notif,
                             );
+                        }
+                    }
+                    MatrixEvent::ReactionUpdate { room_id, event_id, reactions } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            for (emoji, _count, senders) in &reactions {
+                                for sender in senders {
+                                    message_view.add_reaction(&event_id, emoji, sender);
+                                }
+                            }
+                        }
+                    }
+                    MatrixEvent::MessageEdited { room_id, event_id, new_body } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.update_message_body(&event_id, &new_body);
+                        }
+                    }
+                    MatrixEvent::MessageRedacted { room_id, event_id } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.remove_message(&event_id);
                         }
                     }
                     MatrixEvent::VerificationRequest {
@@ -861,8 +956,14 @@ impl MxWindow {
             if currently_visible {
                 imp.details_revealer.set_reveal_child(false);
                 imp.details_revealer.set_visible(false);
+                if let Some(sep) = imp.details_separator.get() {
+                    sep.set_visible(false);
+                }
             } else {
                 window.show_room_details();
+                if let Some(sep) = imp.details_separator.get() {
+                    sep.set_visible(true);
+                }
                 imp.details_revealer.set_visible(true);
                 imp.details_revealer.set_reveal_child(true);
             }
@@ -911,9 +1012,13 @@ impl MxWindow {
             .margin_bottom(4)
             .build();
         let revealer_for_close = imp.details_revealer.clone();
+        let sep_cell_for_close = imp.details_separator.clone();
         details_close_btn.connect_clicked(move |_| {
             revealer_for_close.set_reveal_child(false);
             revealer_for_close.set_visible(false);
+            if let Some(sep) = sep_cell_for_close.get() {
+                sep.set_visible(false);
+            }
         });
         let details_wrapper = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -927,8 +1032,13 @@ impl MxWindow {
         let content_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .build();
+        let details_separator = gtk::Separator::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        imp.details_separator.set(details_separator.clone()).ok();
         content_box.append(&imp.message_view);
-        content_box.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        content_box.append(&details_separator);
         content_box.append(&imp.details_revealer);
         // Make message view expand, sidebar stays fixed width.
         imp.message_view.set_hexpand(true);
@@ -946,9 +1056,9 @@ impl MxWindow {
         let split_view = adw::NavigationSplitView::new();
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));
-        split_view.set_min_sidebar_width(160.0);
-        split_view.set_max_sidebar_width(240.0);
-        split_view.set_sidebar_width_fraction(0.25);
+        split_view.set_min_sidebar_width(290.0);
+        split_view.set_max_sidebar_width(400.0);
+        split_view.set_sidebar_width_fraction(0.32);
 
         // Wire up the banner's Verify button.
         let tx = imp.command_tx.get().unwrap().clone();
@@ -1079,6 +1189,10 @@ impl MxWindow {
                 border-radius: 12px;
                 padding: 4px 8px;
                 font-size: 14px;
+            }
+            .flash-highlight {
+                background: alpha(@accent_bg_color, 0.25);
+                transition: background 500ms ease-out;
             }
             .mention-row {
                 background: alpha(@accent_bg_color, 0.12);
