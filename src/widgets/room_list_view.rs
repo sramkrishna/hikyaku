@@ -306,6 +306,8 @@ mod imp {
                             }
                         }
                     }
+                    // Reset selection so the same room can be clicked again.
+                    sel.set_selected(gtk::INVALID_LIST_POSITION);
                 });
             }
 
@@ -328,6 +330,8 @@ mod imp {
                         }
                     }
                 }
+                // Reset so the same space can be re-entered after going back.
+                sel.set_selected(gtk::INVALID_LIST_POSITION);
             });
 
             // Back button in the space child header.
