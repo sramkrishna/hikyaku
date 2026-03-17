@@ -27,9 +27,8 @@ mod imp {
         pub tombstone_icon: TemplateChild<gtk::Image>,
         #[template_child]
         pub lock_icon: TemplateChild<gtk::Image>,
-        /// Signal handler IDs for property notifications on the bound RoomObject.
-        /// Disconnected in unbind_room to prevent stale callbacks.
-        pub signal_handlers: RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>,
+        /// GObject property bindings — auto-disconnect on unbind.
+        pub signal_handlers: RefCell<Vec<glib::Binding>>,
     }
 
     #[glib::object_subclass]
@@ -71,21 +70,20 @@ impl RoomRow {
 
     /// Disconnect any active property signal handlers from the previous bind.
     pub fn unbind_room(&self) {
-        let imp = self.imp();
-        let handlers = imp.signal_handlers.take();
-        for (obj, id) in handlers {
-            obj.disconnect(id);
-        }
+        // No-op — we no longer use connect_notify_local.
+        // Badge updates happen via GObject property bindings instead.
     }
 
     /// Bind a RoomObject's properties to this row's widgets.
-    /// Sets up GObject property notifications so the badge updates
-    /// automatically when `unread_count` or `highlight_count` change.
+    /// Uses GObject property bindings for automatic badge updates.
     pub fn bind_room(&self, room: &RoomObject) {
-        // Disconnect previous handlers first.
-        self.unbind_room();
-
         let imp = self.imp();
+
+        // Disconnect old bindings.
+        let old = imp.signal_handlers.take();
+        for binding in old {
+            binding.unbind();
+        }
 
         if room.is_header() {
             imp.name_label.set_label(&room.name());
@@ -128,52 +126,27 @@ impl RoomRow {
             imp.name_label.remove_css_class("dim-label");
         }
 
-        // Set badge from current values.
-        Self::update_badge(imp, room);
+        // Bind unread_count → badge label + visibility using GObject
+        // property bindings. These auto-update and auto-disconnect.
+        let badge_widget: gtk::Label = imp.unread_badge.get();
+        let mention_widget: gtk::Image = imp.mention_icon.get();
+        let b1 = room.bind_property("unread-count", &badge_widget, "visible")
+            .transform_to(|_, count: u32| Some(count > 0))
+            .sync_create()
+            .build();
+        let b2 = room.bind_property("unread-count", &badge_widget, "label")
+            .transform_to(|_, count: u32| {
+                Some(if count > 99 { "99+".to_string() } else { count.to_string() })
+            })
+            .sync_create()
+            .build();
+        let b3 = room.bind_property("highlight-count", &mention_widget, "visible")
+            .transform_to(|_, count: u32| Some(count > 0))
+            .sync_create()
+            .build();
 
-        // Watch for changes on unread_count and highlight_count.
-        let row_weak = self.downgrade();
-        let room_for_unread = room.clone();
-        let h1 = room.connect_notify_local(Some("unread-count"), move |_, _| {
-            if let Some(row) = row_weak.upgrade() {
-                Self::update_badge(row.imp(), &room_for_unread);
-            }
-        });
-
-        let row_weak = self.downgrade();
-        let room_for_hl = room.clone();
-        let h2 = room.connect_notify_local(Some("highlight-count"), move |_, _| {
-            if let Some(row) = row_weak.upgrade() {
-                Self::update_badge(row.imp(), &room_for_hl);
-            }
-        });
-
-        let obj = room.clone().upcast::<glib::Object>();
-        imp.signal_handlers.borrow_mut().push((obj.clone(), h1));
-        imp.signal_handlers.borrow_mut().push((obj, h2));
-    }
-
-    /// Update badge visibility and label from current RoomObject values.
-    fn update_badge(imp: &imp::RoomRow, room: &RoomObject) {
-        let highlights = room.highlight_count();
-        let unread = room.unread_count();
-
-        imp.mention_icon.set_visible(highlights > 0);
-
-        if unread > 0 || highlights > 0 {
-            let count = if highlights > 0 { highlights } else { unread };
-            let label = if count > 99 { "99+".to_string() } else { count.to_string() };
-            imp.unread_badge.set_label(&label);
-            imp.unread_badge.set_visible(true);
-            if highlights > 0 {
-                imp.unread_badge.add_css_class("highlight-badge");
-                imp.unread_badge.remove_css_class("unread-badge");
-            } else {
-                imp.unread_badge.add_css_class("unread-badge");
-                imp.unread_badge.remove_css_class("highlight-badge");
-            }
-        } else {
-            imp.unread_badge.set_visible(false);
-        }
+        imp.signal_handlers.borrow_mut().push(b1);
+        imp.signal_handlers.borrow_mut().push(b2);
+        imp.signal_handlers.borrow_mut().push(b3);
     }
 }

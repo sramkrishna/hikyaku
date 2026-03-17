@@ -411,7 +411,7 @@ impl RoomListView {
 
     /// Clear unread/highlight badges for a room immediately in the UI.
     /// O(1) lookup via room_registry — the GObject is shared across all stores.
-    /// The RoomRow's connect_notify_local on unread-count/highlight-count
+    /// The RoomRow's bind_property on unread-count/highlight-count
     /// automatically updates the badge widget when these properties change.
     pub fn clear_unread(&self, room_id: &str) {
         let imp = self.imp();
@@ -427,7 +427,7 @@ impl RoomListView {
 
     /// Increment unread count for a room (when a message arrives for a
     /// room we're not viewing). O(1) via room_registry.
-    /// The RoomRow's connect_notify_local auto-updates the badge.
+    /// The RoomRow's property bindings auto-update the badge.
     pub fn increment_unread(&self, room_id: &str, is_highlight: bool) {
         let imp = self.imp();
         let registry = imp.room_registry.borrow();
@@ -456,21 +456,12 @@ impl RoomListView {
         }
 
         // Phase 2: Patch existing GObjects or create new ones in the registry.
-        // Freeze notifications during patching + rebuild to prevent
-        // connect_notify_local callbacks from firing on partially-updated
-        // widget trees (which causes double-free crashes).
+        // Property bindings on RoomRow auto-update badges when GObject
+        // properties change — no manual notification needed.
         let new_ids: std::collections::HashSet<String> =
             rooms.iter().map(|r| r.room_id.clone()).collect();
-        let mut freeze_guards: Vec<glib::object::PropertyNotificationFreezeGuard> = Vec::new();
         {
             let mut registry = imp.room_registry.borrow_mut();
-
-            // Freeze all existing GObjects before patching.
-            for obj in registry.values() {
-                use glib::object::ObjectExt;
-                freeze_guards.push(obj.freeze_notify());
-            }
-
             for r in rooms {
                 if let Some(obj) = registry.get(&r.room_id) {
                     let server_unread = r.unread_count as u32;
@@ -510,9 +501,6 @@ impl RoomListView {
 
         // Rebuild ListStores from registry (clones of shared GObjects).
         self.rebuild_stores(rooms);
-
-        // Thaw all notifications — callbacks fire now with stable widget state.
-        drop(freeze_guards);
     }
 
     /// Rebuild all ListStores from the registry, using shared GObject clones.

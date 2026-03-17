@@ -2097,14 +2097,13 @@ async fn handle_select_room_bg(
         }
     }
 
-    // Try loading from the event cache first — instant, no network.
+    // Try loading from the SDK event cache first — instant, no network.
     if let Ok((cache, _handles)) = room.event_cache().await {
         if let Ok((cached_events, _receiver)) = cache.subscribe().await {
             if !cached_events.is_empty() {
                 let cache_start = std::time::Instant::now();
                 let msgs = extract_messages(&room, &cached_events, false, client.user_id()).await;
                 if !msgs.is_empty() {
-                    // Build minimal RoomMeta for the cached response.
                     let topic = room.topic().unwrap_or_default();
                     let is_encrypted = room.is_encrypted().await.unwrap_or(false);
                     use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
@@ -2134,6 +2133,8 @@ async fn handle_select_room_bg(
             }
         }
     }
+
+
 
     let start = std::time::Instant::now();
     tracing::debug!("Fetching messages for {room_id}");
