@@ -456,19 +456,25 @@ impl RoomListView {
         }
 
         // Phase 2: Patch existing GObjects or create new ones in the registry.
+        // Freeze notifications during patching + rebuild to prevent
+        // connect_notify_local callbacks from firing on partially-updated
+        // widget trees (which causes double-free crashes).
         let new_ids: std::collections::HashSet<String> =
             rooms.iter().map(|r| r.room_id.clone()).collect();
+        let mut freeze_guards: Vec<glib::object::PropertyNotificationFreezeGuard> = Vec::new();
         {
             let mut registry = imp.room_registry.borrow_mut();
+
+            // Freeze all existing GObjects before patching.
+            for obj in registry.values() {
+                use glib::object::ObjectExt;
+                freeze_guards.push(obj.freeze_notify());
+            }
+
             for r in rooms {
                 if let Some(obj) = registry.get(&r.room_id) {
                     let server_unread = r.unread_count as u32;
                     let server_hl = r.highlight_count as u32;
-
-                    // Use max(server, local) for unread counts so local increments
-                    // aren't wiped by a stale server count (e.g. another client
-                    // marking rooms as read). locally_read override handles the
-                    // opposite case (zeroing after we've read the room).
                     let new_unread = server_unread.max(obj.unread_count());
                     let new_hl = server_hl.max(obj.highlight_count());
 
@@ -484,34 +490,29 @@ impl RoomListView {
                     registry.insert(r.room_id.clone(), Self::room_to_obj(r));
                 }
             }
-            // Remove rooms we've left.
             registry.retain(|id, _| new_ids.contains(id));
 
-            // Apply locally-read overrides: zero out unread for rooms we've
-            // marked as read locally but the server hasn't confirmed yet.
             let mut locally_read = imp.locally_read.borrow_mut();
             locally_read.retain(|rid| {
                 if let Some(obj) = registry.get(rid) {
                     if obj.unread_count() > 0 || obj.highlight_count() > 0 {
-                        // Server still says unread — override locally.
-                        // Setting properties triggers connect_notify_local
-                        // on any bound RoomRow, updating the badge automatically.
                         obj.set_unread_count(0);
                         obj.set_highlight_count(0);
-                        true // keep in set
+                        true
                     } else {
-                        false // server confirmed, remove from set
+                        false
                     }
                 } else {
-                    false // room gone, remove from set
+                    false
                 }
             });
         }
 
         // Rebuild ListStores from registry (clones of shared GObjects).
-        // Badge updates are handled automatically by GObject property
-        // notifications (connect_notify_local in RoomRow::bind_room).
         self.rebuild_stores(rooms);
+
+        // Thaw all notifications — callbacks fire now with stable widget state.
+        drop(freeze_guards);
     }
 
     /// Rebuild all ListStores from the registry, using shared GObject clones.

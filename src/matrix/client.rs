@@ -445,6 +445,15 @@ async fn matrix_task(
     // Set up E2E encryption: bootstrap cross-signing and enable key backup.
     setup_encryption(&client, &event_tx).await;
 
+    // Enable the event cache so rooms can load timeline from local store
+    // instantly, without waiting for network /messages calls.
+    if let Err(e) = client.event_cache().enable_storage() {
+        tracing::warn!("Failed to enable event cache storage: {e}");
+    }
+    if let Err(e) = client.event_cache().subscribe() {
+        tracing::warn!("Failed to subscribe event cache: {e}");
+    }
+
     // Spawn sync in a separate task so we can keep processing commands.
     let sync_event_tx = event_tx.clone();
     let sync_client = client.clone();
@@ -485,39 +494,47 @@ async fn matrix_task(
                         tracing::warn!("Already logged in, ignoring duplicate login command");
                     }
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
-                        // Check cache first — show instantly if available.
-                        let cached = {
+                        // Check in-memory cache first — show instantly if available.
+                        let select_start = std::time::Instant::now();
+                        let has_cache = {
                             let cache = timeline_cache.lock().await;
-                            cache.get(&room_id).cloned()
-                        };
-                        if let Some((msgs, prev_batch, meta)) = cached {
-                            let _ = event_tx.send(MatrixEvent::RoomMessages {
-                                room_id: room_id.clone(),
-                                messages: msgs,
-                                prev_batch_token: prev_batch,
-                                room_meta: meta,
-                            }).await;
-                        }
-                        // Fetch fresh data in background — don't block the command loop.
-                        // This means subsequent room switches aren't queued behind a 1s fetch.
-                        let bg_client = client.clone();
-                        let bg_tx = event_tx.clone();
-                        let bg_cache = timeline_cache.clone();
-                        // Pre-check key fetch status so we don't need &mut in the spawned task.
-                        let needs_keys = !rooms_with_keys.contains(&room_id);
-                        if needs_keys {
-                            rooms_with_keys.insert(room_id.clone());
-                            // Persist to disk.
-                            if let Ok(json) = serde_json::to_string(&rooms_with_keys) {
-                                let _ = std::fs::write(&key_cache_path, &json);
+                            if let Some((msgs, prev_batch, meta)) = cache.get(&room_id).cloned() {
+                                tracing::info!(
+                                    "In-memory cache hit for {}: {} messages in {:?}",
+                                    room_id, msgs.len(), select_start.elapsed()
+                                );
+                                let _ = event_tx.send(MatrixEvent::RoomMessages {
+                                    room_id: room_id.clone(),
+                                    messages: msgs,
+                                    prev_batch_token: prev_batch,
+                                    room_meta: meta,
+                                }).await;
+                                true
+                            } else {
+                                tracing::info!("In-memory cache miss for {}", room_id);
+                                false
                             }
+                        };
+                        // Only fetch from network if no cache hit. The sync handler
+                        // delivers new messages live, so cached data stays current.
+                        if !has_cache {
+                            let bg_client = client.clone();
+                            let bg_tx = event_tx.clone();
+                            let bg_cache = timeline_cache.clone();
+                            let needs_keys = !rooms_with_keys.contains(&room_id);
+                            if needs_keys {
+                                rooms_with_keys.insert(room_id.clone());
+                                if let Ok(json) = serde_json::to_string(&rooms_with_keys) {
+                                    let _ = std::fs::write(&key_cache_path, &json);
+                                }
+                            }
+                            let bg_room_id = room_id.clone();
+                            tokio::spawn(async move {
+                                handle_select_room_bg(
+                                    &bg_client, &bg_tx, &bg_room_id, needs_keys, bg_cache,
+                                ).await;
+                            });
                         }
-                        let bg_room_id = room_id.clone();
-                        tokio::spawn(async move {
-                            handle_select_room_bg(
-                                &bg_client, &bg_tx, &bg_room_id, needs_keys, bg_cache,
-                            ).await;
-                        });
                     }
                     Ok(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }) => {
                         handle_send_message(&client, &event_tx, &room_id, &body, reply_to.as_deref(), quote_text.as_ref()).await;
@@ -2077,6 +2094,44 @@ async fn handle_select_room_bg(
         match backups.download_room_keys_for_room(&room_id).await {
             Ok(()) => tracing::debug!("Downloaded room keys for {room_id}"),
             Err(e) => tracing::debug!("Could not download room keys for {room_id}: {e}"),
+        }
+    }
+
+    // Try loading from the event cache first — instant, no network.
+    if let Ok((cache, _handles)) = room.event_cache().await {
+        if let Ok((cached_events, _receiver)) = cache.subscribe().await {
+            if !cached_events.is_empty() {
+                let cache_start = std::time::Instant::now();
+                let msgs = extract_messages(&room, &cached_events, false, client.user_id()).await;
+                if !msgs.is_empty() {
+                    // Build minimal RoomMeta for the cached response.
+                    let topic = room.topic().unwrap_or_default();
+                    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
+                    use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
+                    let fully_read_event_id = room.account_data_static::<FullyReadEventContent>()
+                        .await.ok().flatten()
+                        .and_then(|raw| raw.deserialize().ok())
+                        .map(|ev| ev.content.event_id.to_string());
+                    let meta = RoomMeta {
+                        topic,
+                        is_encrypted,
+                        member_count: room.joined_members_count(),
+                        is_favourite: room.is_favourite(),
+                        fully_read_event_id,
+                        ..Default::default()
+                    };
+                    tracing::info!(
+                        "Event cache hit for {}: {} messages in {:?}",
+                        room_id, msgs.len(), cache_start.elapsed()
+                    );
+                    let _ = event_tx.send(MatrixEvent::RoomMessages {
+                        room_id: room_id.to_string(),
+                        messages: msgs,
+                        prev_batch_token: None,
+                        room_meta: meta,
+                    }).await;
+                }
+            }
         }
     }
 
