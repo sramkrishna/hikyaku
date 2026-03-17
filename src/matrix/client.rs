@@ -120,6 +120,8 @@ pub struct RoomMeta {
     pub is_favourite: bool,
     /// Room member display names (for nick completion).
     pub members: Vec<(String, String)>, // (user_id, display_name)
+    /// The m.fully_read marker — event ID where the user last stopped reading.
+    pub fully_read_event_id: Option<String>,
 }
 
 /// A room entry from a space directory listing.
@@ -2222,6 +2224,17 @@ async fn handle_select_room_bg(
     let is_encrypted = room.is_encrypted().await.unwrap_or(false);
     let member_count = room.joined_members_count();
 
+    // Read the m.fully_read marker — where the user last stopped reading.
+    let fully_read_event_id = {
+        use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
+        room.account_data_static::<FullyReadEventContent>()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.deserialize().ok())
+            .map(|ev| ev.content.event_id.to_string())
+    };
+
     let room_meta = RoomMeta {
         topic,
         is_tombstoned,
@@ -2232,6 +2245,7 @@ async fn handle_select_room_bg(
         member_count,
         is_favourite: room.is_favourite(),
         members,
+        fully_read_event_id,
     };
 
     tracing::info!(
@@ -2494,21 +2508,12 @@ async fn handle_send_message(
         return;
     };
 
-    // Build body with quote fallback if replying.
-    let full_body = if let Some((quote_sender, quote_body)) = quote_text {
-        // Matrix fallback format: "> <sender> original\n\nreply"
-        let quoted_lines: String = quote_body
-            .lines()
-            .map(|l| format!("> {l}\n"))
-            .collect();
-        format!("> <{quote_sender}>\n{quoted_lines}\n{body}")
-    } else {
-        body.to_string()
-    };
+    // Build the message content. For replies, just send the reply text
+    // with the m.relates_to relation — no manual quote fallback, which
+    // causes double-quoting in clients like Element that render both
+    // the fallback text and their own visual reply preview.
+    let mut content = RoomMessageEventContent::text_plain(body);
 
-    let mut content = RoomMessageEventContent::text_plain(&full_body);
-
-    // If replying, set the in_reply_to relation.
     if let Some(reply_event_id) = reply_to {
         if let Ok(eid) = matrix_sdk::ruma::EventId::parse(reply_event_id) {
             content.relates_to = Some(
@@ -2949,15 +2954,17 @@ async fn handle_mark_read(client: &Client, room_id: &str) {
     let Ok(rid) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&rid) else { return };
 
-    // Use latest_event() to get the most recent event ID.
     let Some(ev) = room.latest_event() else { return };
     let Some(eid) = ev.event_id() else { return };
 
-    if let Err(e) = room.send_single_receipt(
-        matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
-        matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
-        eid.to_owned(),
-    ).await {
-        tracing::warn!("Failed to send read receipt for {room_id}: {e}");
+    // Set both m.fully_read (timeline position bookmark) and m.read
+    // (public read receipt for unread count) in a single request.
+    use matrix_sdk::room::Receipts;
+    let receipts = Receipts::new()
+        .fully_read_marker(eid.to_owned())
+        .public_read_receipt(eid.to_owned());
+
+    if let Err(e) = room.send_multiple_receipts(receipts).await {
+        tracing::warn!("Failed to send read receipts for {room_id}: {e}");
     }
 }

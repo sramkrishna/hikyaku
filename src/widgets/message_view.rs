@@ -83,6 +83,8 @@ mod imp {
         pub user_id: RefCell<String>,
         /// Whether the current room is a DM (hides DM button on messages).
         pub is_dm_room: Cell<bool>,
+        /// The m.fully_read event ID — where to scroll on room entry.
+        pub fully_read_event_id: RefCell<Option<String>>,
         /// Room members for nick completion: (lowercase_name, display_name, user_id).
         /// Sorted by lowercase_name for binary search prefix matching.
         pub room_members: RefCell<Vec<(String, String, String)>>,
@@ -125,6 +127,7 @@ mod imp {
                 on_dm: RefCell::new(None),
                 on_open_thread: RefCell::new(None),
                 is_dm_room: Cell::new(false),
+                fully_read_event_id: RefCell::new(None),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
@@ -838,17 +841,26 @@ impl MessageView {
     }
 
     /// Replace all messages (used when switching rooms).
+    /// Scrolls to the m.fully_read marker if set, otherwise to the bottom.
     pub fn set_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
-        // Build all MessageObjects first, then splice in one shot to avoid
-        // N individual items_changed signals triggering N factory binds.
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
         imp.list_store.splice(0, n, &objs);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
         imp.view_stack.set_visible_child_name("messages");
-        self.scroll_to_bottom();
+
+        // Scroll to the fully_read marker if present, otherwise to bottom.
+        let marker = imp.fully_read_event_id.borrow().clone();
+        if let Some(ref eid) = marker {
+            if !self.scroll_to_event(eid) {
+                // Marker not in this batch — scroll to bottom.
+                self.scroll_to_bottom();
+            }
+        } else {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Prepend older messages at the top (pagination).
@@ -1015,6 +1027,9 @@ impl MessageView {
             .collect();
         members.sort_by(|a, b| a.0.cmp(&b.0));
         imp.room_members.replace(members);
+
+        // Store the fully_read marker for scroll-to-position.
+        imp.fully_read_event_id.replace(meta.fully_read_event_id.clone());
     }
 
     /// Append a single new message (used for live updates).
