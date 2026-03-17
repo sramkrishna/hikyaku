@@ -675,9 +675,14 @@ impl RoomListView {
             }
             // Set aggregated unread on the space's own RoomObject so the
             // badge renders on the space row in the Spaces tab.
+            // Only set if changed to avoid unnecessary notify storms.
             if let Some(obj) = registry.get(&r.room_id) {
-                obj.set_unread_count(child_unread);
-                obj.set_highlight_count(child_hl);
+                if obj.unread_count() != child_unread {
+                    obj.set_unread_count(child_unread);
+                }
+                if obj.highlight_count() != child_hl {
+                    obj.set_highlight_count(child_hl);
+                }
             }
             total_space_unread += child_unread;
             if child_hl > 0 { space_has_hl = true; }

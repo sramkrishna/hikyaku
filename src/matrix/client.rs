@@ -1758,14 +1758,16 @@ async fn start_sync(
                 let last_update = last_update_flag.clone();
                 let timestamps = ts_ref.clone();
                 async move {
-                    // Refresh room list on initial sync and periodically after
-                    // (throttled to at most once every 10 seconds to avoid lag).
+                    // Refresh room list on initial sync and periodically after.
+                    // Throttled to once every 60 seconds — collect_room_info is
+                    // expensive (~1-2s for 295 rooms) and we don't need frequent
+                    // full refreshes since NewMessage events update badges live.
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     let prev = last_update.load(std::sync::atomic::Ordering::Relaxed);
-                    let should_update = is_first || (now_secs - prev >= 10);
+                    let should_update = is_first || (now_secs - prev >= 60);
 
                     if should_update {
                         if is_first {

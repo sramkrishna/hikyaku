@@ -68,10 +68,12 @@ impl RoomRow {
         glib::Object::builder().build()
     }
 
-    /// Disconnect any active property signal handlers from the previous bind.
+    /// Disconnect property bindings from the previous bind.
     pub fn unbind_room(&self) {
-        // No-op — we no longer use connect_notify_local.
-        // Badge updates happen via GObject property bindings instead.
+        let old = self.imp().signal_handlers.take();
+        for binding in old {
+            binding.unbind();
+        }
     }
 
     /// Bind a RoomObject's properties to this row's widgets.
