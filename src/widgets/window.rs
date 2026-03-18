@@ -643,15 +643,17 @@ impl MxWindow {
         // Focus change handler — clear unseen counter when window regains focus.
         let window_weak_focus = window.downgrade();
         let room_list_focus = imp.room_list_view.clone();
+        let msg_view_focus = imp.message_view.clone();
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
                 let count = win.imp().unseen_while_unfocused.get();
                 if count > 0 {
                     win.imp().unseen_while_unfocused.set(0);
-                    // Clear the badge we added while unfocused.
+                    // Clear the badge and remove divider lines.
                     if let Some(rid) = win.imp().current_room_id.borrow().clone() {
                         room_list_focus.clear_unread(&rid);
                     }
+                    msg_view_focus.remove_dividers();
                 }
             }
         });

@@ -1076,8 +1076,24 @@ impl MessageView {
         imp.fully_read_event_id.replace(meta.fully_read_event_id.clone());
     }
 
+    /// Remove all "New messages" divider lines from the timeline.
+    pub fn remove_dividers(&self) {
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        // Iterate in reverse so removal indices stay valid.
+        for i in (0..n).rev() {
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.sender().is_empty() && msg.event_id().is_empty() && msg.body().contains("──") {
+                imp.list_store.remove(i);
+            }
+        }
+    }
+
     /// Insert a "New messages" divider line in the timeline.
+    /// Removes any existing dividers first to avoid duplicates.
     pub fn insert_divider(&self) {
+        self.remove_dividers();
         let divider = MessageObject::new(
             "",    // sender
             "",    // sender_id
