@@ -220,6 +220,31 @@ fn toast_error(overlay: &adw::ToastOverlay, prefix: &str, error: &str) {
     overlay.add_toast(adw::Toast::new(&format!("{prefix}: {error}")));
 }
 
+/// Apply background tint via a CSS provider on the default display.
+fn apply_tint_css(settings: &AppearanceSettings) {
+    let css = if settings.tint_color.is_empty() {
+        ".mx-tinted-bg { }".to_string()
+    } else {
+        // Parse hex color and apply with the user's opacity.
+        let opacity = settings.tint_opacity.clamp(0.0, 0.5);
+        format!(
+            ".mx-tinted-bg {{ background: alpha({}, {}); }}",
+            settings.tint_color, opacity
+        )
+    };
+
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+    }
+}
+
 /// Apply font settings via a CSS provider on the default display.
 fn apply_font_css(settings: &AppearanceSettings) {
     let css = if settings.font_family.is_empty() {
@@ -1254,8 +1279,9 @@ impl MxWindow {
             theme.add_search_path("data/icons");
         }
 
-        // Apply font settings from config.
+        // Apply font and tint settings from config.
         apply_font_css(&crate::config::settings().appearance);
+        apply_tint_css(&crate::config::settings().appearance);
 
         // Badge styles for room rows.
         let badge_css = gtk::CssProvider::new();
@@ -1924,7 +1950,7 @@ impl MxWindow {
         // --- Appearance group ---
         let appearance_group = adw::PreferencesGroup::builder()
             .title("Appearance")
-            .description("Font settings for message text")
+            .description("Customize the look of the message view")
             .build();
 
         // Build a label showing the current font.
@@ -2000,6 +2026,98 @@ impl MxWindow {
                 );
             }
         ));
+
+        // Background tint row.
+        let tint_row = adw::ActionRow::builder()
+            .title("Background Tint")
+            .subtitle(if cfg.appearance.tint_color.is_empty() {
+                "None".to_string()
+            } else {
+                format!("{} at {}%", cfg.appearance.tint_color,
+                    (cfg.appearance.tint_opacity * 100.0).round())
+            })
+            .build();
+
+        let color_btn = gtk::ColorDialogButton::builder()
+            .valign(gtk::Align::Center)
+            .build();
+        color_btn.set_dialog(&gtk::ColorDialog::new());
+        // Set initial color from config.
+        if !cfg.appearance.tint_color.is_empty() {
+            if let Ok(true) = gtk::gdk::RGBA::parse(&cfg.appearance.tint_color).map(|c| {
+                color_btn.set_rgba(&c);
+                true
+            }) {}
+        }
+
+        let opacity_scale = gtk::Scale::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .adjustment(&gtk::Adjustment::new(
+                cfg.appearance.tint_opacity * 100.0, 0.0, 50.0, 1.0, 5.0, 0.0,
+            ))
+            .width_request(120)
+            .valign(gtk::Align::Center)
+            .draw_value(false)
+            .build();
+
+        let clear_btn = gtk::Button::builder()
+            .icon_name("edit-clear-symbolic")
+            .tooltip_text("Remove tint")
+            .valign(gtk::Align::Center)
+            .build();
+        clear_btn.add_css_class("flat");
+
+        tint_row.add_suffix(&color_btn);
+        tint_row.add_suffix(&opacity_scale);
+        tint_row.add_suffix(&clear_btn);
+        appearance_group.add(&tint_row);
+
+        // Wire color/opacity changes.
+        let tint_row_for_color = tint_row.clone();
+        let scale_for_color = opacity_scale.clone();
+        color_btn.connect_rgba_notify(move |btn| {
+            let rgba = btn.rgba();
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (rgba.red() * 255.0) as u8,
+                (rgba.green() * 255.0) as u8,
+                (rgba.blue() * 255.0) as u8,
+            );
+            let opacity = scale_for_color.value() / 100.0;
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.tint_color = hex.clone();
+            new_cfg.appearance.tint_opacity = opacity;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            tint_row_for_color.set_subtitle(&format!("{hex} at {}%", (opacity * 100.0).round()));
+        });
+
+        let tint_row_for_scale = tint_row.clone();
+        let color_btn_for_scale = color_btn.clone();
+        opacity_scale.connect_value_changed(move |scale| {
+            let rgba = color_btn_for_scale.rgba();
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (rgba.red() * 255.0) as u8,
+                (rgba.green() * 255.0) as u8,
+                (rgba.blue() * 255.0) as u8,
+            );
+            let opacity = scale.value() / 100.0;
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.tint_color = hex.clone();
+            new_cfg.appearance.tint_opacity = opacity;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            tint_row_for_scale.set_subtitle(&format!("{hex} at {}%", (opacity * 100.0).round()));
+        });
+
+        let tint_row_for_clear = tint_row.clone();
+        clear_btn.connect_clicked(move |_| {
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.tint_color = String::new();
+            new_cfg.appearance.tint_opacity = 0.05;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            tint_row_for_clear.set_subtitle("None");
+        });
 
         // --- Info group ---
         let info_group = adw::PreferencesGroup::builder()

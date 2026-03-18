@@ -35,6 +35,10 @@ pub struct AppearanceSettings {
     pub font_family: String,
     /// Font size in points for message text.
     pub font_size: u32,
+    /// Background tint color as CSS hex (e.g. "#3584e4"). Empty = no tint.
+    pub tint_color: String,
+    /// Background tint opacity (0.0 = invisible, 1.0 = solid). Default 0.05.
+    pub tint_opacity: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +55,8 @@ impl Default for AppearanceSettings {
         Self {
             font_family: String::new(), // empty = system default
             font_size: 11,
+            tint_color: String::new(),  // empty = no tint
+            tint_opacity: 0.05,
         }
     }
 }
@@ -161,6 +167,8 @@ mod tests {
             appearance: AppearanceSettings {
                 font_family: "Monospace".into(),
                 font_size: 14,
+                tint_color: "#3584e4".into(),
+                tint_opacity: 0.1,
             },
         };
         let toml_str = toml::to_string_pretty(&original).unwrap();
