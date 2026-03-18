@@ -222,6 +222,8 @@ pub enum MatrixEvent {
     LeaveFailed { error: String },
     /// DM room is ready — navigate to it.
     DmReady { user_id: String, room_id: String, room_name: String },
+    /// Users currently typing in a room.
+    TypingUsers { room_id: String, names: Vec<String> },
     /// Thread replies fetched — display in sidebar.
     ThreadReplies {
         room_id: String,
@@ -295,6 +297,8 @@ pub enum MatrixCommand {
     MarkRead { room_id: String },
     /// Open or create a DM with a user. Finds existing DM room or creates one.
     CreateDm { user_id: String },
+    /// Send typing indicator to the current room.
+    TypingNotice { room_id: String, typing: bool },
     /// Fetch thread replies for a message.
     FetchThreadReplies { room_id: String, thread_root_id: String },
 }
@@ -626,6 +630,13 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::CreateDm { user_id }) => {
                         handle_create_dm(&client, &event_tx, &user_id).await;
+                    }
+                    Ok(MatrixCommand::TypingNotice { room_id, typing }) => {
+                        if let Ok(rid) = RoomId::parse(&room_id) {
+                            if let Some(room) = client.get_room(&rid) {
+                                let _ = room.typing_notice(typing).await;
+                            }
+                        }
                     }
                     Ok(MatrixCommand::FetchThreadReplies { room_id, thread_root_id }) => {
                         handle_fetch_thread(&client, &event_tx, &room_id, &thread_root_id).await;
@@ -2105,9 +2116,28 @@ async fn handle_select_room_bg(
         }
     }
 
-    // Note: SDK event cache (room.event_cache()) was tried but only returns
-    // 1-3 events with no metadata — not useful. First visits rely on the
-    // network fetch (~1s). Revisits use the in-memory timeline cache (instant).
+    // Subscribe to typing notifications for this room.
+    {
+        let (guard, mut typing_rx) = room.subscribe_to_typing_notifications();
+        let typing_tx = event_tx.clone();
+        let typing_room = room.clone();
+        let typing_rid = room_id.to_string();
+        tokio::spawn(async move {
+            let _guard = guard; // Keep alive while task runs.
+            while let Ok(user_ids) = typing_rx.recv().await {
+                // Resolve user IDs to display names.
+                let mut names = Vec::new();
+                for uid in &user_ids {
+                    let name = resolve_display_name(&typing_room, uid).await;
+                    names.push(name);
+                }
+                let _ = typing_tx.send(MatrixEvent::TypingUsers {
+                    room_id: typing_rid.clone(),
+                    names,
+                }).await;
+            }
+        });
+    }
 
 
 

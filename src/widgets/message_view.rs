@@ -47,6 +47,8 @@ mod imp {
         #[template_child]
         pub pinned_box: TemplateChild<gtk::Box>,
         #[template_child]
+        pub typing_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub reply_preview: TemplateChild<gtk::Box>,
         #[template_child]
         pub reply_preview_label: TemplateChild<gtk::Label>,
@@ -72,6 +74,8 @@ mod imp {
         pub on_dm: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for opening a thread: (thread_root_event_id).
         pub on_open_thread: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback for typing notice: (typing: bool).
+        pub on_typing: RefCell<Option<Box<dyn Fn(bool)>>>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
@@ -126,6 +130,8 @@ mod imp {
                 on_attach: RefCell::new(None),
                 on_dm: RefCell::new(None),
                 on_open_thread: RefCell::new(None),
+                on_typing: RefCell::new(None),
+                typing_label: Default::default(),
                 is_dm_room: Cell::new(false),
                 fully_read_event_id: RefCell::new(None),
                 on_reply: RefCell::new(None),
@@ -576,6 +582,16 @@ mod imp {
                 entry_for_emoji.set_position(pos + emoji.len() as i32);
                 entry_for_emoji.grab_focus();
             });
+
+            // Typing indicator — fire callback when input text changes.
+            let view_for_typing = obj.clone();
+            self.input_entry.connect_changed(move |entry| {
+                let is_typing = !entry.text().is_empty();
+                let imp = view_for_typing.imp();
+                if let Some(ref cb) = *imp.on_typing.borrow() {
+                    cb(is_typing);
+                }
+            });
         }
     }
 
@@ -658,6 +674,26 @@ impl MessageView {
 
     pub fn connect_open_thread<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_open_thread.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_typing<F: Fn(bool) + 'static>(&self, f: F) {
+        self.imp().on_typing.replace(Some(Box::new(f)));
+    }
+
+    /// Update the typing indicator label.
+    pub fn set_typing_users(&self, names: &[String]) {
+        let imp = self.imp();
+        if names.is_empty() {
+            imp.typing_label.set_visible(false);
+        } else {
+            let text = match names.len() {
+                1 => format!("{} is typing…", names[0]),
+                2 => format!("{} and {} are typing…", names[0], names[1]),
+                n => format!("{}, {} and {} others are typing…", names[0], names[1], n - 2),
+            };
+            imp.typing_label.set_label(&text);
+            imp.typing_label.set_visible(true);
+        }
     }
 
     pub fn connect_media_click<F: Fn(String, String, String) + 'static>(&self, f: F) {
@@ -939,6 +975,7 @@ impl MessageView {
         imp.reply_to_event.replace(None);
         imp.reply_quote.replace(None);
         imp.reply_preview.set_visible(false);
+        imp.typing_label.set_visible(false);
     }
 
     /// Connect a callback for when the user scrolls to the top (load older messages).

@@ -623,6 +623,23 @@ impl MxWindow {
             });
         });
 
+        // Typing indicator — send typing notice when user types in the input.
+        let cmd_tx_typing = command_tx.clone();
+        let window_weak_typing = window.downgrade();
+        imp.message_view.connect_typing(move |typing| {
+            if let Some(win) = window_weak_typing.upgrade() {
+                if let Some(rid) = win.imp().current_room_id.borrow().clone() {
+                    let tx = cmd_tx_typing.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::TypingNotice {
+                            room_id: rid,
+                            typing,
+                        }).await;
+                    });
+                }
+            }
+        });
+
         // Focus change handler — clear unseen counter when window regains focus.
         let window_weak_focus = window.downgrade();
         let room_list_focus = imp.room_list_view.clone();
@@ -918,6 +935,12 @@ impl MxWindow {
                     }
                     MatrixEvent::DmFailed { error } => {
                         toast_error(&toast_overlay, "Failed to open DM", &error);
+                    }
+                    MatrixEvent::TypingUsers { room_id, names } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.set_typing_users(&names);
+                        }
                     }
                     MatrixEvent::ThreadReplies { room_id, thread_root_id: _, root_message, replies } => {
                         let current = window.imp().current_room_id.borrow().clone();

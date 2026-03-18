@@ -94,6 +94,16 @@ template $MxMessageView : Gtk.Box {
           orientation: horizontal;
         }
 
+        // Typing indicator — shows who is typing.
+        Gtk.Label typing_label {
+          halign: start;
+          margin-start: 12;
+          margin-top: 2;
+          margin-bottom: 2;
+          visible: false;
+          styles ["caption", "dim-label"]
+        }
+
         // Reply preview bar — shown when replying to a message.
         Gtk.Box reply_preview {
           orientation: horizontal;
