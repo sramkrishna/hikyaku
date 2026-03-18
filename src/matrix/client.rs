@@ -1063,16 +1063,39 @@ fn aggregate_reactions(
 }
 
 /// Resolve a user's display name from room membership, falling back to user ID.
+/// Global display name cache — avoids re-resolving the same user across rooms.
+/// Uses a tokio Mutex since it's accessed from async contexts.
+static DISPLAY_NAME_CACHE: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
 async fn resolve_display_name(
     room: &matrix_sdk::room::Room,
     user_id: &matrix_sdk::ruma::UserId,
 ) -> String {
-    room.get_member_no_sync(user_id)
+    let uid_str = user_id.to_string();
+
+    // Check cache first.
+    {
+        let cache = DISPLAY_NAME_CACHE.lock().await;
+        if let Some(name) = cache.get(&uid_str) {
+            return name.clone();
+        }
+    }
+
+    let name = room.get_member_no_sync(user_id)
         .await
         .ok()
         .flatten()
         .and_then(|m| m.display_name().map(|s| s.to_string()))
-        .unwrap_or_else(|| user_id.to_string())
+        .unwrap_or_else(|| uid_str.clone());
+
+    // Cache it.
+    {
+        let mut cache = DISPLAY_NAME_CACHE.lock().await;
+        cache.insert(uid_str, name.clone());
+    }
+
+    name
 }
 
 
@@ -2163,7 +2186,7 @@ async fn prefetch_room_timeline(
         "m.reaction".to_string(),
     ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(50u32);
+    options.limit = UInt::from(25u32);
     options.filter = msg_filter;
 
     let (msgs, token) = match room.messages(options).await {
@@ -2248,16 +2271,22 @@ async fn handle_select_room_bg(
         "m.reaction".to_string(),
     ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(50u32);
+    options.limit = UInt::from(25u32);
     options.filter = msg_filter;
 
     // Fork: messages, tombstone, pinned, members — all independent.
     let msg_room = room.clone();
     let msg_client = client.clone();
     let msg_future = async {
+        let t0 = std::time::Instant::now();
         match msg_room.messages(options).await {
             Ok(response) => {
+                let t_net = t0.elapsed();
                 let msgs = extract_messages(&msg_room, &response.chunk, true, msg_client.user_id()).await;
+                tracing::info!(
+                    "Messages: network={:?}, extract={:?}, {} events → {} msgs",
+                    t_net, t0.elapsed() - t_net, response.chunk.len(), msgs.len()
+                );
                 let token = response.end.map(|t| t.to_string());
                 // Send read receipt in background — don't block on it.
                 if let Some(latest) = response.chunk.first() {
@@ -2452,7 +2481,7 @@ async fn handle_fetch_older(
         "m.reaction".to_string(),
     ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(50u32);
+    options.limit = UInt::from(25u32);
     options.from = Some(from_token.to_string());
     options.filter = msg_filter;
 
