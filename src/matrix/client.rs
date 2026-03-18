@@ -2297,7 +2297,7 @@ async fn handle_select_room_bg(
         "m.reaction".to_string(),
     ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(25u32);
+    options.limit = UInt::from(50u32);
     options.filter = msg_filter;
 
     // Fork: messages, tombstone, pinned, members — all independent.
