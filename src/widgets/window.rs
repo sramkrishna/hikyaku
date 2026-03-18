@@ -445,7 +445,11 @@ impl MxWindow {
                 if let Some(ref rt) = reply_to {
                     if let Some(event_id) = rt.strip_prefix("edit:") {
                         // Update locally immediately.
-                        tracing::info!("Editing message {} with new body: {}", event_id, &body[..body.len().min(50)]);
+                        let edit_preview = match body.char_indices().nth(50) {
+                            Some((i, _)) => &body[..i],
+                            None => &body,
+                        };
+                        tracing::info!("Editing message {} with new body: {}", event_id, edit_preview);
                         msg_view_for_send.update_message_body(event_id, &body);
 
                         let tx = cmd_tx_edit2.clone();
