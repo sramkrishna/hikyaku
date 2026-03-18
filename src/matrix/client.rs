@@ -506,7 +506,7 @@ async fn matrix_task(
                     Ok(MatrixCommand::SelectRoom { room_id }) => {
                         // Check in-memory cache first — show instantly if available.
                         let select_start = std::time::Instant::now();
-                        let has_cache = {
+                        {
                             let cache = timeline_cache.lock().await;
                             if let Some((msgs, prev_batch, meta)) = cache.get(&room_id).cloned() {
                                 tracing::info!(
@@ -519,15 +519,16 @@ async fn matrix_task(
                                     prev_batch_token: prev_batch,
                                     room_meta: meta,
                                 }).await;
-                                true
                             } else {
                                 tracing::info!("In-memory cache miss for {}", room_id);
-                                false
                             }
-                        };
-                        // Only fetch from network if no cache hit. The sync handler
-                        // delivers new messages live, so cached data stays current.
-                        if !has_cache {
+                        }
+                        // Always refresh from network in the background.
+                        // The cache provides instant display; the refresh ensures
+                        // we have the latest messages (cache may be stale if the
+                        // user left and returned after receiving NewMessage events
+                        // that were appended to the timeline but not cached).
+                        {
                             let bg_client = client.clone();
                             let bg_tx = event_tx.clone();
                             let bg_cache = timeline_cache.clone();

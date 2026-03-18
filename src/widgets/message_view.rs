@@ -512,7 +512,7 @@ mod imp {
                     return glib::Propagation::Proceed;
                 };
                 let prefix = &before_cursor[at_pos + 1..];
-                if prefix.is_empty() || prefix.contains(' ') {
+                if prefix.is_empty() {
                     return glib::Propagation::Proceed;
                 }
 
