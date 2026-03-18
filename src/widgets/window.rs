@@ -802,8 +802,11 @@ impl MxWindow {
                         if is_mention && !is_self {
                             // In-app toast with room name. Escape markup chars
                             // since Toast interprets title as Pango markup.
+                            let toast_end = message.body.char_indices()
+                                .nth(60).map(|(i, _)| i)
+                                .unwrap_or(message.body.len());
                             let preview = glib::markup_escape_text(
-                                &message.body[..message.body.len().min(60)]
+                                &message.body[..toast_end]
                             );
                             let sender = glib::markup_escape_text(&message.sender);
                             let rname = glib::markup_escape_text(&room_name);
@@ -818,8 +821,12 @@ impl MxWindow {
                             let notif = gio::Notification::new(&format!(
                                 "Mentioned in {}", room_name
                             ));
+                            let body_preview = match message.body.char_indices().nth(100) {
+                                Some((idx, _)) => &message.body[..idx],
+                                None => &message.body,
+                            };
                             notif.set_body(Some(&format!(
-                                "{}: {}", message.sender, &message.body[..message.body.len().min(100)]
+                                "{}: {}", message.sender, body_preview
                             )));
                             notif.set_priority(gio::NotificationPriority::High);
                             app.send_notification(
