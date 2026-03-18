@@ -798,10 +798,15 @@ impl MxWindow {
 
                         // In-app toast + desktop notification for mentions and DMs.
                         if is_mention && !is_self {
-                            // In-app toast with room name.
-                            let preview = &message.body[..message.body.len().min(60)];
+                            // In-app toast with room name. Escape markup chars
+                            // since Toast interprets title as Pango markup.
+                            let preview = glib::markup_escape_text(
+                                &message.body[..message.body.len().min(60)]
+                            );
+                            let sender = glib::markup_escape_text(&message.sender);
+                            let rname = glib::markup_escape_text(&room_name);
                             let toast_msg = adw::Toast::builder()
-                                .title(&format!("{} in {}: {preview}", message.sender, room_name))
+                                .title(&format!("{sender} in {rname}: {preview}"))
                                 .timeout(5)
                                 .build();
                             toast_overlay.add_toast(toast_msg);
@@ -935,6 +940,19 @@ impl MxWindow {
                     }
                     MatrixEvent::DmFailed { error } => {
                         toast_error(&toast_overlay, "Failed to open DM", &error);
+                    }
+                    MatrixEvent::SyncGap { room_id } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            // Re-fetch the current room's timeline to fill the gap.
+                            tracing::info!("Sync gap in current room {room_id}, re-fetching");
+                            message_view.clear();
+                            let tx = window.imp().command_tx.get().unwrap().clone();
+                            let rid = room_id.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
+                            });
+                        }
                     }
                     MatrixEvent::TypingUsers { room_id, names } => {
                         let current = window.imp().current_room_id.borrow().clone();

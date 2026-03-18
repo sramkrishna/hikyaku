@@ -224,6 +224,9 @@ pub enum MatrixEvent {
     DmReady { user_id: String, room_id: String, room_name: String },
     /// Users currently typing in a room.
     TypingUsers { room_id: String, names: Vec<String> },
+    /// A sync gap was detected — the room's timeline was limited.
+    /// The UI should re-fetch messages for this room if it's currently selected.
+    SyncGap { room_id: String },
     /// Thread replies fetched — display in sidebar.
     ThreadReplies {
         room_id: String,
@@ -1780,6 +1783,7 @@ async fn start_sync(
         let tx = event_tx.clone();
         let sync_client = client.clone();
         let sync_shutdown = shutdown_rx.clone();
+        let timeline_cache_for_sync = timeline_cache.clone();
         let initial_sync_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let initial_flag = initial_sync_done.clone();
         let last_room_update = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1818,7 +1822,13 @@ async fn start_sync(
                 // Extract timestamps from the sync response for every room
                 // that had timeline events. Only count real user messages,
                 // not state events or bot notices.
+                // Detect sync gaps — rooms where the timeline was limited
+                // (server dropped events between last sync and now).
+                let mut gap_rooms: Vec<String> = Vec::new();
                 for (room_id, joined_room) in &response.rooms.join {
+                    if joined_room.timeline.limited {
+                        gap_rooms.push(room_id.to_string());
+                    }
                     // Only extract timestamps from real activity events.
                     let events = &joined_room.timeline.events;
                     let activity_event = events.iter().rev().find(|ev| {
@@ -1850,7 +1860,22 @@ async fn start_sync(
                 let is_first = !initial_flag.swap(true, std::sync::atomic::Ordering::Relaxed);
                 let last_update = last_update_flag.clone();
                 let timestamps = ts_ref.clone();
+                let gap_cache = timeline_cache_for_sync.clone();
                 async move {
+                    // Notify UI about sync gaps so it can re-fetch affected rooms.
+                    if !gap_rooms.is_empty() {
+                        tracing::info!("Sync gap detected for {} rooms", gap_rooms.len());
+                        // Invalidate timeline cache for gapped rooms.
+                        {
+                            let mut cache = gap_cache.lock().await;
+                            for rid in &gap_rooms {
+                                cache.remove(rid);
+                            }
+                        }
+                        for rid in gap_rooms {
+                            let _ = tx.send(MatrixEvent::SyncGap { room_id: rid }).await;
+                        }
+                    }
                     // Refresh room list on initial sync and periodically after.
                     // Throttled to once every 60 seconds — collect_room_info is
                     // expensive (~1-2s for 295 rooms) and we don't need frequent
