@@ -421,8 +421,8 @@ impl RoomListView {
             obj.set_highlight_count(0);
         }
         drop(registry);
-        // Track locally-read so the next sync doesn't overwrite our zero.
         imp.locally_read.borrow_mut().insert(room_id.to_string());
+        self.update_parent_space_badge(room_id);
     }
 
     /// Increment unread count for a room (when a message arrives for a
@@ -435,6 +435,54 @@ impl RoomListView {
             obj.set_unread_count(obj.unread_count() + 1);
             if is_highlight {
                 obj.set_highlight_count(obj.highlight_count() + 1);
+            }
+        }
+        drop(registry);
+        self.update_parent_space_badge(room_id);
+    }
+
+    /// Recalculate the parent space's aggregated unread badge after a
+    /// child room's count changes. Finds the parent space via cached_rooms,
+    /// then sums all children's unread from the registry.
+    fn update_parent_space_badge(&self, room_id: &str) {
+        let imp = self.imp();
+        // Find which space this room belongs to.
+        let parent_space = {
+            let rooms = imp.cached_rooms.borrow();
+            rooms.iter()
+                .find(|r| r.room_id == room_id)
+                .and_then(|r| r.parent_space.clone())
+        };
+        let Some(space_name) = parent_space else { return };
+
+        // Sum children's unread for this space.
+        let index = imp.space_children_index.borrow();
+        let rooms = imp.cached_rooms.borrow();
+        let registry = imp.room_registry.borrow();
+        let mut total_unread: u32 = 0;
+        let mut total_hl: u32 = 0;
+        if let Some(indices) = index.get(&space_name) {
+            for &i in indices {
+                if let Some(child) = rooms.get(i) {
+                    if let Some(obj) = registry.get(&child.room_id) {
+                        total_unread += obj.unread_count();
+                        total_hl += obj.highlight_count();
+                    }
+                }
+            }
+        }
+        // Find the space's RoomObject and update if changed.
+        for r in rooms.iter() {
+            if r.kind == crate::matrix::RoomKind::Space && r.name == space_name {
+                if let Some(space_obj) = registry.get(&r.room_id) {
+                    if space_obj.unread_count() != total_unread {
+                        space_obj.set_unread_count(total_unread);
+                    }
+                    if space_obj.highlight_count() != total_hl {
+                        space_obj.set_highlight_count(total_hl);
+                    }
+                }
+                break;
             }
         }
     }
