@@ -9,7 +9,7 @@ mod imp {
     use gtk::glib;
 
     use async_channel::{Receiver, Sender};
-    use std::cell::{OnceCell, RefCell};
+    use std::cell::{Cell, OnceCell, RefCell};
 
     use crate::matrix::{MatrixCommand, MatrixEvent};
     use crate::widgets::LoginPage;
@@ -57,6 +57,8 @@ mod imp {
         /// Stores (SourceId, fired flag). The flag is set by the callback so
         /// we know not to call .remove() on an already-fired one-shot timer.
         pub read_timer: RefCell<Option<(glib::SourceId, std::rc::Rc<std::cell::Cell<bool>>)>>,
+        /// Count of messages received in the current room while window is unfocused.
+        pub unseen_while_unfocused: Cell<u32>,
     }
 
     impl Default for MxWindow {
@@ -103,6 +105,7 @@ mod imp {
                     p
                 },
                 read_timer: RefCell::new(None),
+                unseen_while_unfocused: Cell::new(0),
             }
         }
     }
@@ -442,14 +445,16 @@ impl MxWindow {
                 if let Some(ref rt) = reply_to {
                     if let Some(event_id) = rt.strip_prefix("edit:") {
                         // Update locally immediately.
+                        tracing::info!("Editing message {} with new body: {}", event_id, &body[..body.len().min(50)]);
                         msg_view_for_send.update_message_body(event_id, &body);
 
                         let tx = cmd_tx_edit2.clone();
                         let eid = event_id.to_string();
                         let new_body = body.clone();
+                        let rid = room_id.clone();
                         glib::spawn_future_local(async move {
                             let _ = tx.send(MatrixCommand::EditMessage {
-                                room_id, event_id: eid, new_body,
+                                room_id: rid, event_id: eid, new_body,
                             }).await;
                         });
                         return;
@@ -618,6 +623,22 @@ impl MxWindow {
             });
         });
 
+        // Focus change handler — clear unseen counter when window regains focus.
+        let window_weak_focus = window.downgrade();
+        let room_list_focus = imp.room_list_view.clone();
+        window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                let count = win.imp().unseen_while_unfocused.get();
+                if count > 0 {
+                    win.imp().unseen_while_unfocused.set(0);
+                    // Clear the badge we added while unfocused.
+                    if let Some(rid) = win.imp().current_room_id.borrow().clone() {
+                        room_list_focus.clear_unread(&rid);
+                    }
+                }
+            }
+        });
+
         // Thread icon click — open thread in sidebar.
         let cmd_tx_thread = command_tx.clone();
         let window_weak_thread = window.downgrade();
@@ -734,22 +755,27 @@ impl MxWindow {
                         let my_id = window.imp().user_id.borrow().clone();
                         let is_self = sender_id == my_id;
                         let is_current_room = current.as_deref() == Some(&room_id);
-                        // Skip our own messages if already shown (local echo with patched event_id).
+                        let window_focused = window.is_active();
+
                         if is_current_room && !is_self {
+                            // Insert a "New messages" divider before the first
+                            // unseen message when the window is unfocused.
+                            if !window_focused && window.imp().unseen_while_unfocused.get() == 0 {
+                                message_view.insert_divider();
+                            }
                             message_view.append_message(&message);
+                            if !window_focused {
+                                let count = window.imp().unseen_while_unfocused.get() + 1;
+                                window.imp().unseen_while_unfocused.set(count);
+                                // Also show unread badge since user hasn't seen these.
+                                room_list_view.increment_unread(&room_id, is_mention);
+                            }
                         } else if is_current_room && is_self && !message_view.has_event(&message.event_id) {
-                            // Our message but not yet in timeline (e.g. sent from another device).
                             message_view.append_message(&message);
                         }
 
                         // Update unread badge on rooms we're NOT viewing.
-                        // Include self-messages from other devices — they indicate
-                        // activity in rooms we should be aware of.
                         if !is_current_room {
-                            tracing::info!(
-                                "NewMessage: incrementing unread for {} (sender={}, is_mention={}, is_self={})",
-                                room_id, sender_id, is_mention, is_self
-                            );
                             room_list_view.increment_unread(&room_id, is_mention);
                         }
 

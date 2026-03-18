@@ -579,6 +579,8 @@ async fn matrix_task(
                                 if let Err(e) = room.redact(&eid, None, None).await {
                                     tracing::error!("Failed to redact: {e}");
                                 }
+                                let mut cache = timeline_cache.lock().await;
+                                cache.remove(&room_id);
                             }
                         }
                     }
@@ -594,6 +596,10 @@ async fn matrix_task(
                                 if let Err(e) = room.send(content).await {
                                     tracing::error!("Failed to edit message: {e}");
                                 }
+                                // Invalidate timeline cache so re-entry fetches fresh data
+                                // with the edited message body.
+                                let mut cache = timeline_cache.lock().await;
+                                cache.remove(&room_id);
                             }
                         }
                     }
@@ -2099,42 +2105,9 @@ async fn handle_select_room_bg(
         }
     }
 
-    // Try loading from the SDK event cache first — instant, no network.
-    if let Ok((cache, _handles)) = room.event_cache().await {
-        if let Ok((cached_events, _receiver)) = cache.subscribe().await {
-            if !cached_events.is_empty() {
-                let cache_start = std::time::Instant::now();
-                let msgs = extract_messages(&room, &cached_events, false, client.user_id()).await;
-                if !msgs.is_empty() {
-                    let topic = room.topic().unwrap_or_default();
-                    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
-                    use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
-                    let fully_read_event_id = room.account_data_static::<FullyReadEventContent>()
-                        .await.ok().flatten()
-                        .and_then(|raw| raw.deserialize().ok())
-                        .map(|ev| ev.content.event_id.to_string());
-                    let meta = RoomMeta {
-                        topic,
-                        is_encrypted,
-                        member_count: room.joined_members_count(),
-                        is_favourite: room.is_favourite(),
-                        fully_read_event_id,
-                        ..Default::default()
-                    };
-                    tracing::info!(
-                        "Event cache hit for {}: {} messages in {:?}",
-                        room_id, msgs.len(), cache_start.elapsed()
-                    );
-                    let _ = event_tx.send(MatrixEvent::RoomMessages {
-                        room_id: room_id.to_string(),
-                        messages: msgs,
-                        prev_batch_token: None,
-                        room_meta: meta,
-                    }).await;
-                }
-            }
-        }
-    }
+    // Note: SDK event cache (room.event_cache()) was tried but only returns
+    // 1-3 events with no metadata — not useful. First visits rely on the
+    // network fetch (~1s). Revisits use the in-memory timeline cache (instant).
 
 
 

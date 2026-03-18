@@ -1032,6 +1032,24 @@ impl MessageView {
         imp.fully_read_event_id.replace(meta.fully_read_event_id.clone());
     }
 
+    /// Insert a "New messages" divider line in the timeline.
+    pub fn insert_divider(&self) {
+        let divider = MessageObject::new(
+            "",    // sender
+            "",    // sender_id
+            "── New messages ──",
+            0,     // timestamp
+            "",    // event_id
+            "",    // reply_to
+            "",    // thread_root
+            &[],   // reactions
+            "",    // media_json
+        );
+        divider.set_is_highlight(true); // use highlight styling for visibility
+        self.imp().list_store.append(&divider);
+        self.scroll_to_bottom();
+    }
+
     /// Append a single new message (used for live updates).
     pub fn append_message(&self, msg: &crate::matrix::MessageInfo) {
         self.imp()
