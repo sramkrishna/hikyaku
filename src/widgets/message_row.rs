@@ -515,6 +515,34 @@ impl MessageRow {
         let reactions_json = msg.reactions_json();
         let imp = self.imp();
 
+        // Divider row — "New messages" separator, not a real message.
+        if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
+            imp.sender_label.set_visible(false);
+            imp.timestamp_label.set_visible(false);
+            imp.body_label.set_label(&body);
+            imp.body_label.set_halign(gtk::Align::Center);
+            imp.body_label.set_selectable(false);
+            imp.body_label.add_css_class("dim-label");
+            imp.body_label.add_css_class("caption");
+            imp.reply_box.set_visible(false);
+            imp.thread_icon.set_visible(false);
+            imp.reactions_box.set_visible(false);
+            imp.media_button.set_visible(false);
+            imp.action_bar.set_visible(false);
+            // Add a separator line effect via CSS.
+            self.add_css_class("message-divider");
+            return;
+        }
+        // Reset divider styling if this row was previously a divider.
+        self.remove_css_class("message-divider");
+        imp.sender_label.set_visible(true);
+        imp.timestamp_label.set_visible(true);
+        imp.body_label.set_halign(gtk::Align::Start);
+        imp.body_label.set_selectable(true);
+        imp.body_label.remove_css_class("dim-label");
+        imp.body_label.remove_css_class("caption");
+        imp.action_bar.set_visible(true);
+
         // Store current message data for action buttons.
         imp.event_id.replace(msg.event_id());
         imp.sender_text.replace(sender.clone());

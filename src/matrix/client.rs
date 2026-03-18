@@ -458,12 +458,19 @@ async fn matrix_task(
         tracing::warn!("Failed to subscribe event cache: {e}");
     }
 
+    // In-memory timeline cache: room_id → (messages, prev_batch, room_meta).
+    // Enables instant room switching — show cached data immediately.
+    let timeline_cache: std::sync::Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
+    >> = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Spawn sync in a separate task so we can keep processing commands.
     let sync_event_tx = event_tx.clone();
     let sync_client = client.clone();
     let sync_shutdown = shutdown_rx.clone();
+    let sync_cache = timeline_cache.clone();
     tokio::spawn(async move {
-        start_sync(sync_client, &sync_event_tx, sync_shutdown).await;
+        start_sync(sync_client, &sync_event_tx, sync_shutdown, sync_cache).await;
     });
 
     // Track rooms we've already downloaded encryption keys for to avoid
@@ -480,13 +487,6 @@ async fn matrix_task(
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-
-    // In-memory timeline cache: room_id → (messages, prev_batch, room_meta).
-    // Enables instant room switching — show cached data immediately, then
-    // refresh from the network in the background.
-    let timeline_cache: std::sync::Arc<tokio::sync::Mutex<
-        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
-    >> = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Active typing subscription task — cancelled when switching rooms.
     let mut typing_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1414,6 +1414,9 @@ async fn start_sync(
     client: Client,
     event_tx: &Sender<MatrixEvent>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    timeline_cache: std::sync::Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
+    >>,
 ) {
     use matrix_sdk::ruma::events::room::message::{
         MessageType, OriginalSyncRoomMessageEvent,
@@ -1443,12 +1446,32 @@ async fn start_sync(
                 }
             }
         }
+        // Pre-fetch timelines for rooms with unread messages so first visits
+        // to active rooms are instant (cache hit instead of 1s network).
+        let unread_room_ids: Vec<String> = cached_rooms.iter()
+            .filter(|r| r.unread_count > 0 || r.highlight_count > 0)
+            .take(10)
+            .map(|r| r.room_id.clone())
+            .collect();
+
         tracing::info!("Loaded {} rooms from local store", cached_rooms.len());
         let _ = event_tx
             .send(MatrixEvent::RoomListUpdated {
                 rooms: cached_rooms,
             })
             .await;
+
+        if !unread_room_ids.is_empty() {
+            tracing::info!("Pre-fetching timelines for {} unread rooms", unread_room_ids.len());
+            let prefetch_client = client.clone();
+            let prefetch_cache = timeline_cache.clone();
+            tokio::spawn(async move {
+                for rid in &unread_room_ids {
+                    prefetch_room_timeline(&prefetch_client, rid, &prefetch_cache).await;
+                }
+                tracing::info!("Pre-fetched {} room timelines", unread_room_ids.len());
+            });
+        }
 
         // Backfill timestamps in the background for rooms with ts=0.
         // Only sends an updated room list if new timestamps were found.
@@ -2113,6 +2136,63 @@ async fn extract_messages(
 /// `key_fetched_rooms` tracks room IDs for which we've already triggered a
 /// key download from backup this session (to avoid redundant network calls).
 /// This set contains only room ID strings, NOT encryption keys.
+/// Pre-fetch a room's timeline into the cache without sending to the UI.
+/// Used during startup to warm the cache for unread rooms.
+async fn prefetch_room_timeline(
+    client: &Client,
+    room_id: &str,
+    timeline_cache: &std::sync::Arc<tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
+    >>,
+) {
+    use matrix_sdk::ruma::UInt;
+
+    let Ok(room_id) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&room_id) else { return };
+
+    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
+    let mut msg_filter = RoomEventFilter::default();
+    msg_filter.types = Some(vec![
+        "m.room.message".to_string(),
+        "m.room.encrypted".to_string(),
+        "m.reaction".to_string(),
+    ]);
+    let mut options = matrix_sdk::room::MessagesOptions::backward();
+    options.limit = UInt::from(50u32);
+    options.filter = msg_filter;
+
+    let (msgs, token) = match room.messages(options).await {
+        Ok(response) => {
+            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
+            let token = response.end.map(|t| t.to_string());
+            (msgs, token)
+        }
+        Err(_) => return,
+    };
+
+    if msgs.is_empty() { return; }
+
+    let topic = room.topic().unwrap_or_default();
+    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
+    use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
+    let fully_read_event_id = room.account_data_static::<FullyReadEventContent>()
+        .await.ok().flatten()
+        .and_then(|raw| raw.deserialize().ok())
+        .map(|ev| ev.content.event_id.to_string());
+
+    let meta = RoomMeta {
+        topic,
+        is_encrypted,
+        member_count: room.joined_members_count(),
+        is_favourite: room.is_favourite(),
+        fully_read_event_id,
+        ..Default::default()
+    };
+
+    let mut cache = timeline_cache.lock().await;
+    cache.insert(room_id.to_string(), (msgs, token, meta));
+}
+
 /// Background room select — fetches messages and metadata, updates cache + UI.
 /// Runs in a spawned task so it doesn't block the command loop.
 async fn handle_select_room_bg(

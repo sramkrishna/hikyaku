@@ -1314,6 +1314,12 @@ impl MxWindow {
                 padding: 6px 10px;
                 margin: 2px 4px;
             }
+            .message-divider {
+                background: none;
+                padding: 4px 0;
+                margin: 8px 12px;
+                border-top: 1px solid alpha(@accent_bg_color, 0.5);
+            }
 ",
         );
         if let Some(display) = gtk::gdk::Display::default() {
