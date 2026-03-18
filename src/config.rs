@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub const APP_ID: &str = "com.github.matx";
-pub const APP_NAME: &str = "Matx";
+pub const APP_ID: &str = "me.ramkrishna.hikyaku";
+pub const APP_NAME: &str = "Hikyaku";
 
 /// User-facing settings loaded from ~/.config/matx/config.toml.
 ///

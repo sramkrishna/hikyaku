@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Hikyaku
+Comment=A Matrix chat client designed around activity awareness
+Exec=hikyaku
+Icon=me.ramkrishna.hikyaku
+Terminal=false
+Type=Application
+Categories=Network;Chat;InstantMessaging;
+Keywords=matrix;chat;messaging;encrypted;
+StartupNotify=true

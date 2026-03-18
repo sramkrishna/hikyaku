@@ -332,7 +332,7 @@ async fn save_session_to_keyring(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keyring = oo7::Keyring::new().await?;
     let json = serde_json::to_string(persisted)?;
-    let attributes = vec![("application", "com.github.matx")];
+    let attributes = vec![("application", "me.ramkrishna.hikyaku")];
     keyring
         .create_item(KEYRING_LABEL, &attributes, json, true)
         .await?;
@@ -343,7 +343,7 @@ async fn save_session_to_keyring(
 /// Load session from GNOME Keyring.
 async fn load_session_from_keyring() -> Option<PersistedSession> {
     let keyring = oo7::Keyring::new().await.ok()?;
-    let attributes = vec![("application", "com.github.matx")];
+    let attributes = vec![("application", "me.ramkrishna.hikyaku")];
     let items = keyring.search_items(&attributes).await.ok()?;
     let item = items.first()?;
     let secret = item.secret().await.ok()?;
@@ -354,7 +354,7 @@ async fn load_session_from_keyring() -> Option<PersistedSession> {
 /// Delete session from GNOME Keyring.
 async fn delete_session_from_keyring() {
     if let Ok(keyring) = oo7::Keyring::new().await {
-        let attributes = vec![("application", "com.github.matx")];
+        let attributes = vec![("application", "me.ramkrishna.hikyaku")];
         if let Ok(items) = keyring.search_items(&attributes).await {
             for item in items {
                 let _ = item.delete().await;

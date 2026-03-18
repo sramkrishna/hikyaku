@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3584e4"/>
+      <stop offset="100%" stop-color="#1a73e8"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square background -->
+  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="url(#bg)"/>
+
+  <!-- Brady Bunch 3x3 grid: white grid lines with colorful avatar circles -->
+  <!-- Grid lines (white dividers) -->
+  <line x1="46" y1="18" x2="46" y2="110" stroke="white" stroke-width="2" opacity="0.5"/>
+  <line x1="82" y1="18" x2="82" y2="110" stroke="white" stroke-width="2" opacity="0.5"/>
+  <line x1="18" y1="46" x2="110" y2="46" stroke="white" stroke-width="2" opacity="0.5"/>
+  <line x1="18" y1="82" x2="110" y2="82" stroke="white" stroke-width="2" opacity="0.5"/>
+
+  <!-- Row 1 -->
+  <!-- Person 1: coral -->
+  <circle cx="32" cy="28" r="8" fill="#e66100"/>
+  <circle cx="32" cy="24" r="4" fill="#ffd7ba"/>
+  <path d="M 25 33 a 7 5 0 0 1 14 0" fill="#ffd7ba"/>
+
+  <!-- Person 2: teal -->
+  <circle cx="64" cy="28" r="8" fill="#26a269"/>
+  <circle cx="64" cy="24" r="4" fill="#d5f5e3"/>
+  <path d="M 57 33 a 7 5 0 0 1 14 0" fill="#d5f5e3"/>
+
+  <!-- Person 3: purple -->
+  <circle cx="96" cy="28" r="8" fill="#9141ac"/>
+  <circle cx="96" cy="24" r="4" fill="#e8d5f5"/>
+  <path d="M 89 33 a 7 5 0 0 1 14 0" fill="#e8d5f5"/>
+
+  <!-- Row 2 -->
+  <!-- Person 4: gold -->
+  <circle cx="32" cy="64" r="8" fill="#e5a50a"/>
+  <circle cx="32" cy="60" r="4" fill="#fff3c4"/>
+  <path d="M 25 69 a 7 5 0 0 1 14 0" fill="#fff3c4"/>
+
+  <!-- Person 5 (center): bright blue — the "main character" -->
+  <circle cx="64" cy="64" r="9" fill="white"/>
+  <circle cx="64" cy="59" r="5" fill="#1a73e8"/>
+  <path d="M 56 70 a 8 6 0 0 1 16 0" fill="#1a73e8"/>
+
+  <!-- Person 6: red -->
+  <circle cx="96" cy="64" r="8" fill="#c01c28"/>
+  <circle cx="96" cy="60" r="4" fill="#f8d7da"/>
+  <path d="M 89 69 a 7 5 0 0 1 14 0" fill="#f8d7da"/>
+
+  <!-- Row 3 -->
+  <!-- Person 7: green -->
+  <circle cx="32" cy="100" r="8" fill="#2ec27e"/>
+  <circle cx="32" cy="96" r="4" fill="#d5f5e3"/>
+  <path d="M 25 105 a 7 5 0 0 1 14 0" fill="#d5f5e3"/>
+
+  <!-- Person 8: pink -->
+  <circle cx="64" cy="100" r="8" fill="#c061cb"/>
+  <circle cx="64" cy="96" r="4" fill="#f5d5f5"/>
+  <path d="M 57 105 a 7 5 0 0 1 14 0" fill="#f5d5f5"/>
+
+  <!-- Person 9: orange -->
+  <circle cx="96" cy="100" r="8" fill="#ff7800"/>
+  <circle cx="96" cy="96" r="4" fill="#ffe0b2"/>
+  <path d="M 89 105 a 7 5 0 0 1 14 0" fill="#ffe0b2"/>
+</svg>
