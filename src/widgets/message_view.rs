@@ -583,11 +583,18 @@ mod imp {
                 entry_for_emoji.grab_focus();
             });
 
-            // Typing indicator — fire callback when input text changes.
+            // Typing indicator. Also dismiss nick popover on text change
+            // (unless the change was from Tab completion itself — detected by
+            // checking if nick_completion_state was just cleared by key handler).
             let view_for_typing = obj.clone();
             self.input_entry.connect_changed(move |entry| {
-                let is_typing = !entry.text().is_empty();
                 let imp = view_for_typing.imp();
+                // Dismiss nick popover if visible and state was already cleared
+                // (meaning a non-Tab key triggered this change).
+                if imp.nick_popover.is_visible() && imp.nick_completion_state.borrow().is_none() {
+                    imp.nick_popover.popdown();
+                }
+                let is_typing = !entry.text().is_empty();
                 if let Some(ref cb) = *imp.on_typing.borrow() {
                     cb(is_typing);
                 }

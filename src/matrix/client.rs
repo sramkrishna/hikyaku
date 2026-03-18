@@ -1997,6 +1997,10 @@ async fn extract_messages(
             ) => {
                 let msg_event = match msg_event {
                     matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) => orig,
+                    matrix_sdk::ruma::events::SyncMessageLikeEvent::Redacted(_) => {
+                        tracing::debug!("Skipping redacted message event");
+                        continue;
+                    }
                     _ => continue,
                 };
                 let event_id = msg_event.event_id.to_string();
@@ -2015,6 +2019,7 @@ async fn extract_messages(
                 };
 
                 if let Some((new_body, _)) = replacement_map.get(&event_id) {
+                    tracing::info!("Applying edit to {event_id}: '{}'", &new_body[..new_body.len().min(40)]);
                     body = new_body.clone();
                 }
 
