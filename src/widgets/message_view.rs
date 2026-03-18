@@ -1113,6 +1113,22 @@ impl MessageView {
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id().is_empty() && msg.body() == echo_body {
                 msg.set_event_id(event_id.to_string());
+                // Rebind the row so the MessageRow's Rc cells (event_id etc.)
+                // get updated — otherwise edit/delete buttons read stale empty IDs.
+                let mut child = imp.list_view.first_child();
+                let mut idx = 0u32;
+                while let Some(ref widget) = child {
+                    if idx == i {
+                        if let Some(row) = Self::find_message_row(widget) {
+                            let names = imp.highlight_names.borrow().clone();
+                            let my_id = imp.user_id.borrow().clone();
+                            row.bind_message_object(msg, &names, &my_id, imp.is_dm_room.get());
+                        }
+                        break;
+                    }
+                    child = widget.next_sibling();
+                    idx += 1;
+                }
                 return;
             }
         }
