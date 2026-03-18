@@ -488,6 +488,9 @@ async fn matrix_task(
         std::collections::HashMap<String, (Vec<MessageInfo>, Option<String>, RoomMeta)>
     >> = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // Active typing subscription task — cancelled when switching rooms.
+    let mut typing_task: Option<tokio::task::JoinHandle<()>> = None;
+
     // Process commands while sync runs in the background.
     let mut shutdown_rx = shutdown_rx;
     loop {
@@ -538,6 +541,33 @@ async fn matrix_task(
                                     &bg_client, &bg_tx, &bg_room_id, needs_keys, bg_cache,
                                 ).await;
                             });
+                        }
+
+                        // Cancel previous typing subscription and start new one.
+                        if let Some(task) = typing_task.take() {
+                            task.abort();
+                        }
+                        if let Ok(rid) = RoomId::parse(&room_id) {
+                            if let Some(room) = client.get_room(&rid) {
+                                let (guard, mut typing_rx) = room.subscribe_to_typing_notifications();
+                                let typing_tx = event_tx.clone();
+                                let typing_room = room.clone();
+                                let typing_rid = room_id.clone();
+                                typing_task = Some(tokio::spawn(async move {
+                                    let _guard = guard;
+                                    while let Ok(user_ids) = typing_rx.recv().await {
+                                        let mut names = Vec::new();
+                                        for uid in &user_ids {
+                                            let name = resolve_display_name(&typing_room, uid).await;
+                                            names.push(name);
+                                        }
+                                        let _ = typing_tx.send(MatrixEvent::TypingUsers {
+                                            room_id: typing_rid.clone(),
+                                            names,
+                                        }).await;
+                                    }
+                                }));
+                            }
                         }
                     }
                     Ok(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }) => {
@@ -2116,28 +2146,8 @@ async fn handle_select_room_bg(
         }
     }
 
-    // Subscribe to typing notifications for this room.
-    {
-        let (guard, mut typing_rx) = room.subscribe_to_typing_notifications();
-        let typing_tx = event_tx.clone();
-        let typing_room = room.clone();
-        let typing_rid = room_id.to_string();
-        tokio::spawn(async move {
-            let _guard = guard; // Keep alive while task runs.
-            while let Ok(user_ids) = typing_rx.recv().await {
-                // Resolve user IDs to display names.
-                let mut names = Vec::new();
-                for uid in &user_ids {
-                    let name = resolve_display_name(&typing_room, uid).await;
-                    names.push(name);
-                }
-                let _ = typing_tx.send(MatrixEvent::TypingUsers {
-                    room_id: typing_rid.clone(),
-                    names,
-                }).await;
-            }
-        });
-    }
+    // Typing subscription is managed in the command loop (not here)
+    // to ensure only one subscription is active at a time.
 
 
 
