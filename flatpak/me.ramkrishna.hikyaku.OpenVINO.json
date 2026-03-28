@@ -3,7 +3,7 @@
   "branch": "2024.6",
   "runtime": "me.ramkrishna.hikyaku",
   "runtime-version": "stable",
-  "sdk": "org.gnome.Sdk//47",
+  "sdk": "org.gnome.Sdk//50",
   "build-extension": true,
   "separate-locales": false,
   "appstream-compose": false,
