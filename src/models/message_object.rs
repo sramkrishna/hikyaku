@@ -46,6 +46,25 @@ mod imp {
         /// Media info as JSON: {"kind":"Image","filename":"photo.jpg","size":12345,"url":"mxc://..."}
         #[property(get, set)]
         media_json: RefCell<String>,
+
+        /// HTML formatted body (Matrix formatted_body), empty if absent.
+        #[property(get, set)]
+        formatted_body: RefCell<String>,
+
+        /// Transient: set to true while the flash animation is active.
+        /// MessageRow connects notify::is-flashing to add/remove the CSS class.
+        #[property(get, set)]
+        is_flashing: Cell<bool>,
+
+        /// True for messages that arrived since the user last read this room.
+        /// Drives the configurable new-message background tint.
+        #[property(get, set)]
+        is_new_message: Cell<bool>,
+
+        /// True for system events (join/leave/invite/kick/ban) rendered as
+        /// compact inline text rather than full message bubbles.
+        #[property(get, set)]
+        is_system_event: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -70,6 +89,7 @@ impl MessageObject {
         sender: &str,
         sender_id: &str,
         body: &str,
+        formatted_body: &str,
         timestamp: u64,
         event_id: &str,
         reply_to: &str,
@@ -82,6 +102,7 @@ impl MessageObject {
             .property("sender", sender)
             .property("sender-id", sender_id)
             .property("body", body)
+            .property("formatted-body", formatted_body)
             .property("timestamp", timestamp)
             .property("event-id", event_id)
             .property("reply-to", reply_to)

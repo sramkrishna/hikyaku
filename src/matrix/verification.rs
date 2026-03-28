@@ -181,6 +181,9 @@ async fn watch_sas_state(
                     })
                     .await;
 
+                // The sync loop will automatically send pending outgoing key requests
+                // to the newly verified peer on the next sync cycle.
+
                 // Clean up.
                 let mut vs = state.lock().await;
                 vs.requests.remove(flow_id);
@@ -227,7 +230,29 @@ pub async fn confirm_verification(state: &SharedVerificationState, flow_id: &str
 }
 
 /// Cancel a verification.
+/// If `flow_id` is empty, cancels ALL pending verifications.
 pub async fn cancel_verification(state: &SharedVerificationState, flow_id: &str) {
+    if flow_id.is_empty() {
+        // Cancel every pending request and SAS session.
+        let (requests, sas_sessions) = {
+            let mut vs = state.lock().await;
+            let reqs: Vec<_> = vs.requests.drain().collect();
+            let sass: Vec<_> = vs.sas_sessions.drain().collect();
+            (reqs, sass)
+        };
+        for (_, sas) in sas_sessions {
+            if let Err(e) = sas.cancel().await {
+                tracing::warn!("Failed to cancel SAS: {e}");
+            }
+        }
+        for (_, req) in requests {
+            if let Err(e) = req.cancel().await {
+                tracing::warn!("Failed to cancel verification request: {e}");
+            }
+        }
+        return;
+    }
+
     let sas = {
         let vs = state.lock().await;
         vs.sas_sessions.get(flow_id).cloned()

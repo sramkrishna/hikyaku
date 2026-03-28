@@ -12,13 +12,16 @@ mod imp {
     use std::cell::{Cell, OnceCell, RefCell};
 
     use crate::matrix::{MatrixCommand, MatrixEvent};
+    use crate::widgets::BookmarksOverview;
     use crate::widgets::LoginPage;
     use crate::widgets::MessageView;
+    use crate::widgets::OnboardingPage;
     use crate::widgets::RoomListView;
 
     pub struct MxWindow {
         pub event_rx: OnceCell<Receiver<MatrixEvent>>,
         pub command_tx: OnceCell<Sender<MatrixCommand>>,
+        pub onboarding_page: OnboardingPage,
         pub login_page: LoginPage,
         pub room_list_view: RoomListView,
         pub message_view: MessageView,
@@ -26,6 +29,11 @@ mod imp {
         pub toolbar: adw::ToolbarView,
         pub loading_spinner: gtk::Spinner,
         pub verify_banner: adw::Banner,
+        /// Transient banner shown at the top for @mention notifications
+        /// in rooms the user is not currently viewing.
+        pub notify_banner: adw::Banner,
+        /// Centralises in-app + desktop notification logic.
+        pub notification_manager: crate::widgets::NotificationManager,
         /// Track which room is currently selected so we know where to
         /// route incoming messages and where to send outgoing ones.
         pub current_room_id: RefCell<Option<String>>,
@@ -45,20 +53,68 @@ mod imp {
         pub info_button: OnceCell<gtk::Button>,
         /// Bookmark toggle button.
         pub bookmark_button: OnceCell<gtk::Button>,
+        /// Export metrics button.
+        pub export_button: OnceCell<gtk::Button>,
         /// Current user ID for deduplicating local echo.
         pub user_id: RefCell<String>,
         /// Media cache: mxc_url → local file path.
         pub media_cache: RefCell<std::collections::HashMap<String, String>>,
+        /// Avatar cache: user_id → local file path of the downloaded thumbnail.
+        pub avatar_cache: RefCell<std::collections::HashMap<String, String>>,
         /// Widget to anchor the next media preview popover to.
         pub media_preview_anchor: RefCell<Option<gtk::Widget>>,
         /// Shared media preview popover — reused across hovers.
         pub media_popover: gtk::Popover,
         /// Timer for delayed read receipt + badge clear (15s after entering room).
-        /// Stores (SourceId, fired flag). The flag is set by the callback so
-        /// we know not to call .remove() on an already-fired one-shot timer.
-        pub read_timer: RefCell<Option<(glib::SourceId, std::rc::Rc<std::cell::Cell<bool>>)>>,
+        /// Stores (SourceId, fired flag, room_id). The flag is set by the callback
+        /// so we know not to call .remove() on an already-fired one-shot timer.
+        /// room_id lets us flush the receipt immediately on room-leave or app-close.
+        pub read_timer: RefCell<Option<(glib::SourceId, std::rc::Rc<std::cell::Cell<bool>>, String)>>,
         /// Count of messages received in the current room while window is unfocused.
         pub unseen_while_unfocused: Cell<u32>,
+        /// Popover used for AI hover summaries on the room list.
+        pub hover_popover: gtk::Popover,
+        /// Room ID for which a hover summary is in flight (to match the response).
+        pub hover_room_id: RefCell<Option<String>>,
+        /// Incremented on every new hover — lets in-flight futures detect they're stale.
+        pub hover_gen: Cell<u32>,
+        /// Accumulation buffer for streaming Ollama metrics summary chunks.
+        pub metrics_summary_buf: RefCell<String>,
+        /// Set of room IDs for which FetchRoomAvatar has already been sent this session.
+        pub requested_room_avatars: RefCell<std::collections::HashSet<String>>,
+        /// Active GLib timer that pulses the loading progress bar in the hover popover.
+        pub hover_pulse_timer: RefCell<Option<glib::SourceId>>,
+        /// Latest RoomListUpdated snapshot — written by the event loop, drained
+        /// by the 50 ms ticker.  Always holds the most recent state; older
+        /// snapshots are silently discarded.
+        pub pending_rooms: RefCell<Option<Vec<crate::matrix::RoomInfo>>>,
+        /// True while an idle callback for update_rooms() is already queued.
+        /// The ticker checks this before scheduling a new idle so that at most
+        /// one update is in-flight per timeslice — prevents stacking.
+        pub rooms_idle_pending: Cell<bool>,
+        /// Full-window bookmarks overview (Ptyxis-style card grid).
+        pub bookmarks_overview: BookmarksOverview,
+        /// Bottom sheet that slides the bookmarks overview over the main view.
+        pub bookmarks_sheet: OnceCell<adw::BottomSheet>,
+        /// Event ID to flash after the next RoomMessages load (set by bookmark navigate).
+        pub pending_flash_event_id: RefCell<Option<String>>,
+        /// Whether the inline join/DM bar is currently visible (prevents stacking).
+        pub inline_bar_active: Cell<bool>,
+        /// Currently open public room directory dialog (if any).
+        pub directory_dialog: RefCell<Option<adw::Dialog>>,
+        /// The ListBox inside the open directory dialog — updated in-place on search.
+        pub directory_list_box: RefCell<Option<gtk::ListBox>>,
+        /// Whether the open directory dialog is showing spaces (true) or rooms (false).
+        pub directory_spaces_only: Cell<bool>,
+        /// Join buttons currently in "Joining…" state, keyed by room_id.
+        /// Cleared and updated when RoomJoined / JoinFailed arrives.
+        pub directory_join_buttons: RefCell<std::collections::HashMap<String, gtk::Button>>,
+        /// GObject list model for the personal contact book (Rolodex).
+        /// Shared between the prefs page and the add/remove callbacks.
+        pub rolodex_store: gio::ListStore,
+        /// Local unread-message broker — counts every new message per room and
+        /// persists across restarts so badges survive quit/reopen.
+        pub local_unread: crate::local_unread::LocalUnreadStore,
     }
 
     impl Default for MxWindow {
@@ -72,6 +128,7 @@ mod imp {
             Self {
                 event_rx: OnceCell::new(),
                 command_tx: OnceCell::new(),
+                onboarding_page: OnboardingPage::new(),
                 login_page: LoginPage::new(),
                 room_list_view: RoomListView::new(),
                 message_view: MessageView::new(),
@@ -79,6 +136,12 @@ mod imp {
                 toolbar: adw::ToolbarView::new(),
                 loading_spinner: gtk::Spinner::new(),
                 verify_banner,
+                notify_banner: adw::Banner::builder()
+                    .revealed(false)
+                    .button_label("Jump")
+                    .css_classes(["accent"])
+                    .build(),
+                notification_manager: crate::widgets::NotificationManager::new(),
                 current_room_id: RefCell::new(None),
                 content_page: OnceCell::new(),
                 verify_dialog: RefCell::new(None),
@@ -95,8 +158,10 @@ mod imp {
                 details_separator: OnceCell::new(),
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
+                export_button: OnceCell::new(),
                 user_id: RefCell::new(String::new()),
                 media_cache: RefCell::new(std::collections::HashMap::new()),
+                avatar_cache: RefCell::new(std::collections::HashMap::new()),
                 media_preview_anchor: RefCell::new(None),
                 media_popover: {
                     let p = gtk::Popover::new();
@@ -106,6 +171,41 @@ mod imp {
                 },
                 read_timer: RefCell::new(None),
                 unseen_while_unfocused: Cell::new(0),
+                hover_popover: {
+                    let p = gtk::Popover::new();
+                    // autohide(false) so switching to another app doesn't
+                    // dismiss the summary mid-generation. The user can still
+                    // close it with Escape or by Ctrl+clicking another room.
+                    p.set_autohide(false);
+                    p.set_has_arrow(true);
+                    p
+                },
+                hover_room_id: RefCell::new(None),
+                hover_gen: Cell::new(0),
+                metrics_summary_buf: RefCell::new(String::new()),
+                requested_room_avatars: RefCell::new(std::collections::HashSet::new()),
+                hover_pulse_timer: RefCell::new(None),
+                pending_rooms: RefCell::new(None),
+                rooms_idle_pending: Cell::new(false),
+                bookmarks_overview: BookmarksOverview::new(),
+                bookmarks_sheet: OnceCell::new(),
+                pending_flash_event_id: RefCell::new(None),
+                inline_bar_active: Cell::new(false),
+                directory_dialog: RefCell::new(None),
+                directory_list_box: RefCell::new(None),
+                directory_spaces_only: Cell::new(false),
+                directory_join_buttons: RefCell::new(std::collections::HashMap::new()),
+                rolodex_store: {
+                    let store = gio::ListStore::new::<crate::models::RolodexEntryObject>();
+                    // Populate from JSON on startup.
+                    for e in crate::plugins::rolodex::load() {
+                        store.append(&crate::models::RolodexEntryObject::new(
+                            &e.user_id, &e.display_name, &e.notes, e.added_at,
+                        ));
+                    }
+                    store
+                },
+                local_unread: crate::local_unread::LocalUnreadStore::new(),
             }
         }
     }
@@ -154,52 +254,91 @@ use async_channel::{Receiver, Sender};
 use crate::config::AppearanceSettings;
 use crate::matrix::{MatrixCommand, MatrixEvent};
 
-/// Show a simple toast message.
-/// Show a media preview using a shared popover on the MxWindow.
-/// Show a media preview in-app using a dialog with gtk::Picture or gtk::Video.
+/// Build the Ollama prompt for the metrics summary feature.
+fn build_metrics_prompt(metrics_text: &str, detect_conflict: bool, detect_coc: bool) -> String {
+    let mut sections = vec![
+        "1. Interesting conversations: identify threads or exchanges that show \
+         genuine knowledge-sharing, creative problem-solving, or topics of broad \
+         community interest. Note who contributed and what made it notable.".to_string(),
+    ];
+    if detect_conflict {
+        sections.push(
+            "2. Conflict and spam signals: flag any patterns of escalating \
+             disagreement, unusually high message frequency from single users, \
+             or repetitive content that may indicate spam.".to_string(),
+        );
+    }
+    if detect_coc {
+        sections.push(
+            "3. Code-of-conduct signals: note ban/kick events, users actioned \
+             more than once, or unusual moderation activity.".to_string(),
+        );
+    }
+    format!(
+        "You are a community manager assistant analyzing Matrix room activity. \
+         Review the metrics below and provide a concise report (3-5 bullet points \
+         per section) covering:\n{}\n\nBe specific about numbers. \
+         If data is insufficient for a section, say so briefly.\n\nMetrics:\n{metrics_text}",
+        sections.join("\n")
+    )
+}
+
+/// Detect MIME type for a local file path using GIO content-type guessing.
+fn mime_for_path(path: &str) -> String {
+    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(path), &[]);
+    gio::functions::content_type_get_mime_type(&content_type)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// Show a media preview in-app for images/video; launch system default app for everything else.
 fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
-    let path_lower = path.to_lowercase();
+    let mime = mime_for_path(path);
 
-    let dialog = adw::Dialog::builder()
-        .content_width(600)
-        .content_height(500)
-        .title("Media Preview")
-        .build();
+    // Images and video: show in-app dialog.
+    if mime.starts_with("image/") || mime.starts_with("video/") {
+        let dialog = adw::Dialog::builder()
+            .content_width(600)
+            .content_height(500)
+            .title("Media Preview")
+            .build();
 
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
 
-    if path_lower.ends_with(".mp4")
-        || path_lower.ends_with(".webm")
-        || path_lower.ends_with(".mov")
-    {
-        let video = gtk::Video::for_filename(Some(path));
-        video.set_autoplay(true);
-        video.set_vexpand(true);
-        video.set_hexpand(true);
-        toolbar.set_content(Some(&video));
-    } else if path_lower.ends_with(".gif") {
-        let media_file = gtk::MediaFile::for_filename(path);
-        media_file.set_loop(true);
-        media_file.play();
-        let video = gtk::Video::new();
-        video.set_media_stream(Some(&media_file));
-        video.set_vexpand(true);
-        video.set_hexpand(true);
-        toolbar.set_content(Some(&video));
-    } else {
-        // Image — use gio::File to handle paths with spaces.
-        let file = gio::File::for_path(path);
-        let picture = gtk::Picture::for_file(&file);
-        picture.set_can_shrink(true);
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_vexpand(true);
-        picture.set_hexpand(true);
-        toolbar.set_content(Some(&picture));
+        if mime.starts_with("video/") || mime == "image/gif" {
+            let media_file = gtk::MediaFile::for_filename(path);
+            if mime == "image/gif" {
+                media_file.set_loop(true);
+            }
+            media_file.play();
+            let video = gtk::Video::new();
+            video.set_media_stream(Some(&media_file));
+            video.set_vexpand(true);
+            video.set_hexpand(true);
+            toolbar.set_content(Some(&video));
+        } else {
+            let file = gio::File::for_path(path);
+            let picture = gtk::Picture::for_file(&file);
+            picture.set_can_shrink(true);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_vexpand(true);
+            picture.set_hexpand(true);
+            toolbar.set_content(Some(&picture));
+        }
+
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(window));
+        return;
     }
 
-    dialog.set_child(Some(&toolbar));
-    dialog.present(Some(window));
+    // Everything else (PDF, audio, documents, …) — hand off to the system default app.
+    let uri = format!("file://{}", path);
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
+        tracing::warn!("Failed to open {uri} with default app: {e}");
+        // Fall back to xdg-open.
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
 }
 
 /// Auto-dismiss the media preview popover after 15 seconds.
@@ -215,34 +354,201 @@ fn toast(overlay: &adw::ToastOverlay, msg: &str) {
     overlay.add_toast(adw::Toast::new(msg));
 }
 
-/// Show a toast with a formatted error message.
-fn toast_error(overlay: &adw::ToastOverlay, prefix: &str, error: &str) {
-    overlay.add_toast(adw::Toast::new(&format!("{prefix}: {error}")));
+/// Show a toast when the window is focused, or a D-Bus desktop notification
+/// when the window is unfocused.  Use for notification-worthy events (mentions,
+/// alerts, DMs) so the user is always informed regardless of app focus.
+fn toast_or_notify(
+    window: &MxWindow,
+    overlay: &adw::ToastOverlay,
+    notif_id: &str,
+    title: &str,
+    body: &str,
+) {
+    use gtk::prelude::{GtkWindowExt, WidgetExt};
+    use gio::prelude::ApplicationExt;
+    if window.is_active() {
+        let t = adw::Toast::builder()
+            .title(body)
+            .timeout(8)
+            .build();
+        overlay.add_toast(t);
+    } else {
+        if let Some(app) = GtkWindowExt::application(window) {
+            let notif = gio::Notification::new(title);
+            notif.set_body(Some(body));
+            notif.set_priority(gio::NotificationPriority::High);
+            notif.set_default_action("app.activate");
+            app.send_notification(Some(notif_id), &notif);
+        }
+    }
 }
 
-/// Apply background tint via a CSS provider on the default display.
-fn apply_tint_css(settings: &AppearanceSettings) {
-    let css = if settings.tint_color.is_empty() {
-        ".mx-tinted-bg { }".to_string()
-    } else {
-        // Parse hex color and apply with the user's opacity.
-        let opacity = settings.tint_opacity.clamp(0.0, 0.5);
-        format!(
-            ".mx-tinted-bg {{ background: alpha({}, {}); }}",
-            settings.tint_color, opacity
-        )
+/// Show a toast with a formatted error message.
+fn toast_error(overlay: &adw::ToastOverlay, prefix: &str, error: &str) {
+    overlay.add_toast(
+        adw::Toast::builder()
+            .title(&format!("{prefix}: {error}"))
+            .timeout(30)
+            .build()
+    );
+}
+
+thread_local! {
+    static BOOKMARK_CSS_PROVIDER: gtk::CssProvider = {
+        let p = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &p,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
+        p
     };
 
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(&css);
+    static NEW_MESSAGE_CSS_PROVIDER: gtk::CssProvider = {
+        let p = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &p,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
+        p
+    };
 
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    static TINT_PROVIDER: gtk::CssProvider = {
+        let p = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &p,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
+        p
+    };
+
+    /// Static app CSS: active room highlight, etc.
+    static APP_CSS_PROVIDER: gtk::CssProvider = {
+        let p = gtk::CssProvider::new();
+        p.load_from_string(
+            ".active-room-row { \
+               background-color: alpha(@accent_bg_color, 0.15); \
+               border-radius: 6px; \
+             } \
+             .active-room-row label { color: @accent_color; font-weight: bold; } \
+             @keyframes message-flash { \
+               0%   { background-color: alpha(@accent_bg_color, 0.45); } \
+               100% { background-color: transparent; } \
+             } \
+             .message-flash { animation: message-flash 0.9s ease-out; } \
+             .bookmark-card, .bookmark-room-card { border-radius: 12px; } \
+             .bookmark-delete-btn { opacity: 0; transition: opacity 200ms; } \
+             flowboxchild:hover .bookmark-delete-btn { opacity: 1; } \
+             .rolodex-contact { \
+               color: @accent_color; \
+               font-weight: bold; \
+               text-decoration: underline; \
+               filter: drop-shadow(0 0 4px alpha(@accent_color, 0.5)); \
+             }"
         );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &p,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        p
+    };
+}
+
+fn tint_rule(class: &str, color: &str, color2: &str, opacity: f64) -> String {
+    let transparent = format!(
+        "{class}, {class} > listview, {class} > listview > row, {class} > listview > listitem \
+         {{ background-color: transparent; }}"
+    );
+    if color.is_empty() {
+        return transparent;
     }
+    let rgba = gtk::gdk::RGBA::parse(color).unwrap_or(gtk::gdk::RGBA::BLACK);
+    let r = (rgba.red() * 255.0) as u8;
+    let g = (rgba.green() * 255.0) as u8;
+    let b = (rgba.blue() * 255.0) as u8;
+    let op = opacity.clamp(0.0, 0.5);
+
+    if color2.is_empty() {
+        // Solid tint — same color on container and all list children.
+        format!(
+            "{class}, {class} > listview, {class} > listview > row, \
+             {class} > listview > listitem {{ background-color: rgba({r},{g},{b},{op}); }}"
+        )
+    } else {
+        // Gradient — apply to container only, children are transparent so the
+        // gradient shows through the scrollable list.
+        let rgba2 = gtk::gdk::RGBA::parse(color2).unwrap_or(gtk::gdk::RGBA::BLACK);
+        let r2 = (rgba2.red() * 255.0) as u8;
+        let g2 = (rgba2.green() * 255.0) as u8;
+        let b2 = (rgba2.blue() * 255.0) as u8;
+        format!(
+            "{class} {{ background: linear-gradient(to bottom, \
+               rgba({r},{g},{b},{op}), rgba({r2},{g2},{b2},{op})); }}\n\
+             {class} > listview, {class} > listview > row, \
+             {class} > listview > listitem {{ background-color: transparent; }}"
+        )
+    }
+}
+
+/// Apply background tints for message area and sidebar via a single CSS provider.
+fn apply_tint_css(settings: &AppearanceSettings) {
+    let css = format!(
+        "{}\n{}",
+        tint_rule(".mx-tinted-bg", &settings.tint_color, &settings.tint_color2, settings.tint_opacity),
+        tint_rule(".mx-tinted-sidebar", &settings.sidebar_tint_color, &settings.sidebar_tint_color2, settings.sidebar_tint_opacity),
+    );
+    TINT_PROVIDER.with(|p| p.load_from_string(&css));
+}
+
+/// Apply bookmark highlight color via a thread-local CSS provider.
+fn apply_bookmark_css(color: &str) {
+    let color = if color.is_empty() { "#f5c542" } else { color };
+    let css = if let Ok(rgba) = gtk::gdk::RGBA::parse(color) {
+        let r = (rgba.red() * 255.0) as u8;
+        let g = (rgba.green() * 255.0) as u8;
+        let b = (rgba.blue() * 255.0) as u8;
+        format!(
+            ".bookmarked-message {{ \
+               background-color: rgba({r},{g},{b},0.15); \
+               border-radius: 8px; \
+               border-left: 3px solid rgba({r},{g},{b},0.7); \
+               padding: 6px 10px; \
+               margin: 2px 4px; \
+             }}"
+        )
+    } else {
+        String::new()
+    };
+    BOOKMARK_CSS_PROVIDER.with(|p| p.load_from_string(&css));
+}
+
+fn apply_new_message_css(color: &str) {
+    let color = if color.is_empty() { "#5B9BD5" } else { color };
+    let css = if let Ok(rgba) = gtk::gdk::RGBA::parse(color) {
+        let r = (rgba.red() * 255.0) as u8;
+        let g = (rgba.green() * 255.0) as u8;
+        let b = (rgba.blue() * 255.0) as u8;
+        format!(
+            ".new-message {{ \
+               background-color: rgba({r},{g},{b},0.12); \
+               border-radius: 4px; \
+             }}"
+        )
+    } else {
+        String::new()
+    };
+    NEW_MESSAGE_CSS_PROVIDER.with(|p| p.load_from_string(&css));
 }
 
 /// Apply font settings via a CSS provider on the default display.
@@ -288,6 +594,15 @@ impl MxWindow {
         let _ = imp.event_rx.set(event_rx.clone());
         let _ = imp.command_tx.set(command_tx.clone());
 
+        // Load persisted local unread counts, then connect broker → room list.
+        imp.local_unread.load();
+        {
+            let rlv = imp.room_list_view.clone();
+            imp.local_unread.connect_room_unread_changed(move |_, room_id, unread, highlights| {
+                rlv.set_room_unread_counts(&room_id, unread, highlights);
+            });
+        }
+
         // Wire up login button.
         let cmd_tx = command_tx.clone();
         imp.login_page.connect_login_requested(move |homeserver, username, password| {
@@ -309,6 +624,8 @@ impl MxWindow {
         imp.room_list_view.connect_room_selected(move |room_id, room_name| {
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
+                window.imp().notification_manager.set_current_room(Some(&room_id));
+                room_list.set_active_room(&room_id);
                 if let Some(page) = window.imp().content_page.get() {
                     page.set_title(&room_name);
                 }
@@ -319,6 +636,9 @@ impl MxWindow {
                 if let Some(btn) = window.imp().bookmark_button.get() {
                     btn.set_visible(true);
                 }
+                if let Some(btn) = window.imp().export_button.get() {
+                    btn.set_visible(true);
+                }
                 // Hide details sidebar when switching rooms.
                 window.imp().details_revealer.set_reveal_child(false);
                 window.imp().details_revealer.set_visible(false);
@@ -326,21 +646,41 @@ impl MxWindow {
                     sep.set_visible(false);
                 }
             }
+            // Capture the current unread badge BEFORE clear_unread() zeroes it.
+            // Passed to SelectRoom so the Matrix thread can use it as a floor for
+            // quick_meta when the SDK store returns 0 pre-sync.
+            let known_unread = room_list.imp().room_registry.borrow()
+                .get(&room_id)
+                .map(|o| o.unread_count())
+                .unwrap_or(0);
             // Suppress server unread counts immediately — add to locally_read
             // so sync cycles don't overwrite the badge while we're in the room.
             // The actual read receipt + badge clear happens after 15 seconds.
             room_list.clear_unread(&room_id);
+            if let Some(w) = window_weak.upgrade() {
+                w.imp().local_unread.mark_read(&room_id);
+            }
 
             // Delay sending read receipt by 15 seconds.
             // This ensures the user actually stays in the room before telling the server.
             if let Some(window) = window_weak.upgrade() {
                 let imp = window.imp();
-                // Cancel any previous timer (switched rooms before it fired).
+                // Flush any pending receipt for the room we're leaving.
                 // timeout_add_local_once auto-removes the source after firing,
                 // so only call .remove() if the callback hasn't fired yet.
-                if let Some((old_id, fired)) = imp.read_timer.borrow_mut().take() {
+                if let Some((old_id, fired, old_rid)) = imp.read_timer.borrow_mut().take() {
                     if !fired.get() {
                         old_id.remove();
+                        // User is leaving the room — mark it as read now.
+                        tracing::info!("Room leave: sending MarkRead for {old_rid}");
+                        room_list.clear_unread(&old_rid);
+                        imp.local_unread.mark_read(&old_rid);
+                        let tx = cmd_tx.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(MatrixCommand::MarkRead { room_id: old_rid }).await;
+                        });
+                    } else {
+                        tracing::info!("Room leave: timer already fired for {old_rid}, no MarkRead needed");
                     }
                 }
                 let room_list_timer = room_list.clone();
@@ -364,6 +704,9 @@ impl MxWindow {
                         );
                         if still_here {
                             room_list_timer.clear_unread(&rid_timer);
+                            if let Some(w) = win_weak_timer.upgrade() {
+                                w.imp().local_unread.mark_read(&rid_timer);
+                            }
                             let tx = cmd_tx_timer.clone();
                             let rid = rid_timer.clone();
                             glib::spawn_future_local(async move {
@@ -372,37 +715,136 @@ impl MxWindow {
                         }
                     },
                 );
-                imp.read_timer.replace(Some((source, fired_flag)));
+                imp.read_timer.replace(Some((source, fired_flag, room_id.clone())));
             }
             // Clear old messages while we fetch the new room's messages.
             msg_view.clear();
             let tx = cmd_tx.clone();
             let rid = room_id.clone();
             glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
+                let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid, known_unread }).await;
             });
         });
 
         // Leave button is wired in setup_ui.
 
-        // Wire up "Join Room" banner in space drill-down.
-        let cmd_tx_browse = command_tx.clone();
-        imp.room_list_view.connect_browse_space(move |space_id| {
-            let tx = cmd_tx_browse.clone();
-            let sid = space_id.clone();
-            glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::BrowseSpaceRooms { space_id: sid }).await;
-            });
-        });
+        // Wire Ctrl+click → FetchRoomPreview → show AI summary popover.
+        {
+            let cmd_tx_h = command_tx.clone();
+            let window_weak_h = window.downgrade();
+            imp.room_list_view.connect_room_preview_requested(move |room_id, y| {
+                let Some(window) = window_weak_h.upgrade() else { return };
+                // Only fetch if Ollama is enabled and configured.
+                let ollama_cfg = crate::config::settings().ollama;
+                if !ollama_cfg.enabled || ollama_cfg.endpoint.is_empty() { return; }
 
-        // Wire up "Join Room" banner in Rooms tab — fetch public rooms.
-        let cmd_tx_browse = command_tx.clone();
-        imp.room_list_view.connect_browse_rooms(move || {
-            let tx = cmd_tx_browse.clone();
-            glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::BrowsePublicRooms { search_term: None }).await;
+                // Dismiss any previous summary before showing the new one.
+                window.imp().hover_popover.popdown();
+
+                *window.imp().hover_room_id.borrow_mut() = Some(room_id.clone());
+                let gen = window.imp().hover_gen.get().wrapping_add(1);
+                window.imp().hover_gen.set(gen);
+
+                // Show a pulsing progress bar in the popover while the model loads.
+                let loading_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(4)
+                    .margin_start(12).margin_end(12)
+                    .margin_top(10).margin_bottom(8)
+                    .width_request(260)
+                    .build();
+                let top_row = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(8)
+                    .build();
+                let title_label = gtk::Label::builder()
+                    .label("Generating summary…")
+                    .hexpand(true)
+                    .xalign(0.0)
+                    .build();
+                let cancel_btn = gtk::Button::builder()
+                    .label("Cancel")
+                    .css_classes(["flat", "caption"])
+                    .build();
+                top_row.append(&title_label);
+                top_row.append(&cancel_btn);
+                let progress_bar = gtk::ProgressBar::new();
+                progress_bar.set_pulse_step(0.15);
+                let hint_label = gtk::Label::builder()
+                    .label("May take 1–5 min if model isn't loaded")
+                    .css_classes(["dim-label", "caption"])
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build();
+                loading_box.append(&top_row);
+                loading_box.append(&progress_bar);
+                loading_box.append(&hint_label);
+
+                let popover = &window.imp().hover_popover;
+                {
+                    let pop = popover.clone();
+                    let win_weak = window.downgrade();
+                    cancel_btn.connect_clicked(move |_| {
+                        if let Some(win) = win_weak.upgrade() {
+                            if let Some(sid) = win.imp().hover_pulse_timer.borrow_mut().take() {
+                                sid.remove();
+                            }
+                            win.imp().hover_room_id.borrow_mut().take();
+                        }
+                        pop.popdown();
+                    });
+                }
+                // Cancel any previous pulse timer before starting a new one.
+                if let Some(sid) = window.imp().hover_pulse_timer.borrow_mut().take() {
+                    sid.remove();
+                }
+                let bar_weak = progress_bar.downgrade();
+                let sid = glib::timeout_add_local(
+                    std::time::Duration::from_millis(150),
+                    move || {
+                        if let Some(bar) = bar_weak.upgrade() {
+                            bar.pulse();
+                            glib::ControlFlow::Continue
+                        } else {
+                            glib::ControlFlow::Break
+                        }
+                    },
+                );
+                window.imp().hover_pulse_timer.replace(Some(sid));
+                popover.set_child(Some(&loading_box));
+
+                // Anchor the popover to the room list widget (once only).
+                let rlv: &gtk::Widget = window.imp().room_list_view.upcast_ref();
+                if popover.parent().is_none() {
+                    popover.set_parent(rlv);
+                }
+                // Point the popover arrow at the clicked row.
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                    0, y as i32, rlv.width(), 1,
+                )));
+                popover.set_position(gtk::PositionType::Right);
+                popover.popup();
+
+                let unread_count = window.imp().room_list_view
+                    .imp().room_registry.borrow()
+                    .get(&room_id)
+                    .map(|o| o.unread_count())
+                    .unwrap_or(0);
+
+                let tx = cmd_tx_h.clone();
+                let ollama_cfg = crate::config::settings().ollama;
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::FetchRoomPreview {
+                        room_id,
+                        unread_count,
+                        ollama_endpoint: ollama_cfg.endpoint,
+                        ollama_model: ollama_cfg.model,
+                        extra_instructions: ollama_cfg.room_preview_extra,
+                    }).await;
+                });
             });
-        });
+        }
+
 
         // Wire up scroll-to-top → fetch older messages.
         let cmd_tx = command_tx.clone();
@@ -461,7 +903,7 @@ impl MxWindow {
         });
 
         let cmd_tx_edit2 = command_tx.clone();
-        imp.message_view.connect_send_message(move |body, reply_to, quote_text| {
+        imp.message_view.connect_send_message(move |body, reply_to, quote_text, formatted_body, mentioned_user_ids| {
             let room_id = window_weak
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
@@ -475,7 +917,8 @@ impl MxWindow {
                             None => &body,
                         };
                         tracing::info!("Editing message {} with new body: {}", event_id, edit_preview);
-                        msg_view_for_send.update_message_body(event_id, &body);
+                        let formatted = crate::markdown::md_to_html(&body);
+                        msg_view_for_send.update_message_body(event_id, &body, Some(&formatted));
 
                         let tx = cmd_tx_edit2.clone();
                         let eid = event_id.to_string();
@@ -490,6 +933,21 @@ impl MxWindow {
                     }
                 }
 
+                // Detect /me and : emote prefixes — strip them before sending.
+                let (send_body, is_emote) =
+                    if let Some(rest) = body.strip_prefix("/me ").or_else(|| body.strip_prefix(": ")) {
+                        (rest.to_string(), true)
+                    } else if body.starts_with(':') && body.len() > 1 && !body.starts_with("::") {
+                        (body[1..].trim_start().to_string(), true)
+                    } else {
+                        (body.clone(), false)
+                    };
+                let echo_body = if is_emote {
+                    format!("* {send_body}")
+                } else {
+                    send_body.clone()
+                };
+
                 // Local echo — show the message immediately.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -501,7 +959,8 @@ impl MxWindow {
                 let echo = crate::matrix::MessageInfo {
                     sender: "You".to_string(),
                     sender_id: my_id,
-                    body: body.clone(),
+                    body: echo_body,
+                    formatted_body: if is_emote { None } else { formatted_body.clone() },
                     timestamp: now,
                     event_id: String::new(),
                     reply_to: reply_to.clone(),
@@ -510,12 +969,26 @@ impl MxWindow {
                     reactions: Vec::new(),
                     media: None,
                     is_highlight: false,
+                    is_system_event: false,
                 };
-                msg_view_for_send.append_message(&echo);
+                // Sending a message means the user has read everything — clear
+                // the divider so their own echo doesn't appear below it.
+                msg_view_for_send.dismiss_unread();
+                msg_view_for_send.append_message(&echo, false);
 
                 let tx = cmd_tx.clone();
+                let send_formatted = if is_emote { None } else { formatted_body.clone() };
+                let send_mentions = if is_emote { Vec::new() } else { mentioned_user_ids.clone() };
                 glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::SendMessage { room_id, body, reply_to, quote_text }).await;
+                    let _ = tx.send(MatrixCommand::SendMessage {
+                        room_id,
+                        body: send_body,
+                        formatted_body: send_formatted,
+                        reply_to,
+                        quote_text,
+                        is_emote,
+                        mentioned_user_ids: send_mentions,
+                    }).await;
                 });
             }
         });
@@ -577,6 +1050,7 @@ impl MxWindow {
                     sender: "You".to_string(),
                     sender_id: my_id,
                     body: filename.clone(),
+                    formatted_body: None,
                     timestamp: now,
                     event_id: String::new(),
                     reply_to: None,
@@ -591,8 +1065,10 @@ impl MxWindow {
                         source_json: String::new(),
                     }),
                     is_highlight: false,
+                    is_system_event: false,
                 };
-                msg_view_attach.append_message(&echo);
+                msg_view_attach.dismiss_unread();
+                msg_view_attach.append_message(&echo, false);
 
                 toast(&toast_attach, &format!("Sending {filename}…"));
                 let tx = cmd_tx_attach.clone();
@@ -669,6 +1145,14 @@ impl MxWindow {
             }
         });
 
+        // Initialise the NotificationManager now that we have the window reference.
+        imp.notification_manager.set_banner(imp.notify_banner.clone());
+        imp.notification_manager.set_window(
+            glib::object::ObjectExt::downgrade(
+                window.upcast_ref::<gtk::Window>()
+            )
+        );
+
         // Focus change handler — clear unseen counter when window regains focus.
         let window_weak_focus = window.downgrade();
         let room_list_focus = imp.room_list_view.clone();
@@ -681,11 +1165,32 @@ impl MxWindow {
                     // Clear the badge and remove divider lines.
                     if let Some(rid) = win.imp().current_room_id.borrow().clone() {
                         room_list_focus.clear_unread(&rid);
+                        win.imp().local_unread.mark_read(&rid);
                     }
                     msg_view_focus.remove_dividers();
                 }
             }
         });
+
+        // "Jump" button on the mention banner — navigate to the mentioned room.
+        {
+            let window_weak = window.downgrade();
+            imp.notify_banner.connect_button_clicked(move |_| {
+                let Some(win) = window_weak.upgrade() else { return };
+                let room_id = win.imp().notification_manager.banner_room_id();
+                if let Some(rid) = room_id {
+                    let reg = win.imp().room_list_view.imp().room_registry.borrow();
+                    if let Some(obj) = reg.get(&rid) {
+                        let name = obj.name();
+                        drop(reg);
+                        if let Some(ref cb) = *win.imp().room_list_view.imp().on_room_selected.borrow() {
+                            cb(rid, name);
+                        }
+                    }
+                }
+                win.imp().notification_manager.dismiss_banner();
+            });
+        }
 
         // Thread icon click — open thread in sidebar.
         let cmd_tx_thread = command_tx.clone();
@@ -711,6 +1216,102 @@ impl MxWindow {
         let login_page = imp.login_page.clone();
         let room_list_view = imp.room_list_view.clone();
         let message_view = imp.message_view.clone();
+        // ── Room-update ticker ───────────────────────────────────────────────────
+        // Fires every 50 ms (the "timeslice") at DEFAULT_IDLE priority (200).
+        // Running below GDK events (0) and the frame clock (GDK_PRIORITY_REDRAW=120)
+        // means the ticker never preempts a click or a focus-in event — the user
+        // always gets instant visual feedback before any room-list work runs.
+        // Under heavy sync load many RoomListUpdated snapshots are coalesced into
+        // the single latest snapshot.  When nothing is pending the tick is free.
+        {
+            let ticker_win = window.downgrade();
+            let ticker_rlv = room_list_view.clone();
+            glib::timeout_add_local_full(
+                std::time::Duration::from_millis(50),
+                glib::Priority::DEFAULT_IDLE,
+                move || {
+                    let Some(win) = ticker_win.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    {
+                        let imp = win.imp();
+                        // Nothing pending, or an idle is already in-flight: skip.
+                        // The in-flight guard ensures at most one update runs per
+                        // timeslice — predictable, no stacking.
+                        if imp.pending_rooms.borrow().is_none() || imp.rooms_idle_pending.get() {
+                            return glib::ControlFlow::Continue;
+                        }
+                        // Priority patch: synchronously update the currently open
+                        // room's GObject right now (1 room, ~8 guarded property
+                        // reads) so its sidebar row reflects the latest state
+                        // before the idle that refreshes everything else.
+                        let current_rid = imp.current_room_id.borrow().clone();
+                        if let Some(ref rid) = current_rid {
+                            let pending = imp.pending_rooms.borrow();
+                            if let Some(ref rooms) = *pending {
+                                if let Some(info) = rooms.iter().find(|r| &r.room_id == rid) {
+                                    ticker_rlv.patch_room(info);
+                                }
+                            }
+                        }
+                        imp.rooms_idle_pending.set(true);
+                    }
+                    // Hand off to idle so user input is never preempted.
+                    let win2 = ticker_win.clone();
+                    let rlv2 = ticker_rlv.clone();
+                    glib::idle_add_local_once(move || {
+                        let Some(win) = win2.upgrade() else { return };
+                        let imp = win.imp();
+                        imp.rooms_idle_pending.set(false); // clear before any early return
+                        let Some(rooms) = imp.pending_rooms.borrow_mut().take() else { return };
+                        // Detect rooms read on another client BEFORE update_rooms
+                        // overwrites prev_server_counts.
+                        let cross_reads = rlv2.detect_cross_client_reads(&rooms);
+                        rlv2.update_rooms(&rooms);
+                        // Mark rooms read on another client — zeroes broker count
+                        // with "read_elsewhere" semantics so we know why it zeroed.
+                        for room_id in cross_reads {
+                            imp.local_unread.mark_read_elsewhere(&room_id);
+                        }
+                        // Re-apply broker counts as a floor after the server sync
+                        // may have zeroed rooms the user hasn't visited.
+                        imp.local_unread.for_each_nonzero(|room_id, unread, highlights| {
+                            rlv2.set_room_unread_counts(room_id, unread, highlights);
+                        });
+                        // Keep favourite rooms in the bookmarks overview in sync.
+                        {
+                            let registry = rlv2.imp().room_registry.borrow();
+                            let mut favs: Vec<crate::models::RoomObject> = rooms.iter()
+                                .filter(|r| r.is_favourite)
+                                .filter_map(|r| registry.get(&r.room_id).cloned())
+                                .collect();
+                            favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
+                            imp.bookmarks_overview.set_favourite_rooms(&favs);
+                        }
+                        // Request avatar downloads for any new rooms with avatars.
+                        let to_fetch = {
+                            let mut requested = imp.requested_room_avatars.borrow_mut();
+                            rlv2.rooms_needing_avatars()
+                                .into_iter()
+                                .filter(|(id, _)| requested.insert(id.clone()))
+                                .collect::<Vec<_>>()
+                        };
+                        for (room_id, mxc_url) in to_fetch {
+                            if let Some(tx) = imp.command_tx.get() {
+                                let tx = tx.clone();
+                                glib::spawn_future_local(async move {
+                                    let _ = tx.send(crate::matrix::MatrixCommand::FetchRoomAvatar {
+                                        room_id, mxc_url,
+                                    }).await;
+                                });
+                            }
+                        }
+                    });
+                    glib::ControlFlow::Continue
+                },
+            );
+        }
+
         let window_weak = window.downgrade();
         glib::spawn_future_local(async move {
             while let Ok(event) = event_rx.recv().await {
@@ -719,10 +1320,15 @@ impl MxWindow {
                 };
                 match event {
                     MatrixEvent::LoginRequired => {
-                        // No saved session — show the login page.
-                        window.show_login();
+                        if crate::config::gsettings().boolean("first-start") {
+                            window.show_onboarding();
+                        } else {
+                            window.show_login();
+                        }
                     }
                     MatrixEvent::LoginSuccess { display_name, user_id } => {
+                        // Clear first-start flag now that login succeeded.
+                        let _ = crate::config::gsettings().set_boolean("first-start", false);
                         let msg = format!("Logged in as {display_name}");
                         toast(&toast_overlay, &msg);
                         login_page.stop_spinner();
@@ -742,6 +1348,14 @@ impl MxWindow {
                         }
                         message_view.set_highlight_names(&names);
                         window.show_main_view();
+                        // Show first-run AI setup if not yet done.
+                        if !crate::config::settings().ollama.setup_done {
+                            let w = window.clone();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(800),
+                                move || show_ai_setup_dialog(&w),
+                            );
+                        }
                     }
                     MatrixEvent::LoginFailed { error } => {
                         toast_error(&toast_overlay, "Login failed", &error);
@@ -751,24 +1365,57 @@ impl MxWindow {
                     }
                     MatrixEvent::SyncStarted => {
                         tracing::info!("Initial sync started…");
+                        // Preload the Ollama model in the background so the
+                        // first Ctrl+click doesn't pay the full load penalty.
+                        let ollama_cfg = crate::config::settings().ollama;
+                        if ollama_cfg.enabled && !ollama_cfg.endpoint.is_empty() && !ollama_cfg.model.is_empty() {
+                            let tx = command_tx.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(crate::matrix::MatrixCommand::WarmupOllama {
+                                    endpoint: ollama_cfg.endpoint,
+                                    model: ollama_cfg.model,
+                                }).await;
+                            });
+                        }
                     }
                     MatrixEvent::SyncError { error } => {
                         tracing::error!("Sync error: {error}");
                         toast_error(&toast_overlay, "Sync error", &error);
                     }
                     MatrixEvent::RoomListUpdated { rooms } => {
-                        room_list_view.update_rooms(&rooms);
+                        // Store the latest snapshot; the 50 ms ticker drains it.
+                        // Multiple events arriving within one timeslice are
+                        // coalesced — only the newest snapshot is kept.
+                        window.imp().pending_rooms.replace(Some(rooms));
+                    }
+                    MatrixEvent::BgRefreshStarted { room_id } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.set_refreshing(true);
+                        }
                     }
                     MatrixEvent::RoomMessages { room_id, messages, prev_batch_token, room_meta } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
+                            // Fresh data arrived — hide the loading bar (if shown for stale cache).
+                            message_view.set_refreshing(false);
                             window.imp().current_room_meta.replace(Some(room_meta.clone()));
+                            // MOTD: clear changed icon and record the current topic as seen.
+                            #[cfg(feature = "motd")]
+                            {
+                                room_list_view.set_topic_changed(&room_id, false);
+                                if !room_meta.topic.is_empty() {
+                                    let mut cache = crate::plugins::motd::load();
+                                    crate::plugins::motd::mark_seen(&room_id, &room_meta.topic, &mut cache);
+                                }
+                            }
                             // Check if this room is a DM by looking at the registry.
                             let is_dm = {
                                 let reg = room_list_view.imp().room_registry.borrow();
-                                reg.get(&room_id).map(|o| o.kind() == "dm").unwrap_or(false)
+                                reg.get(&room_id).map(|o| o.kind() == crate::matrix::RoomKind::DirectMessage).unwrap_or(false)
                             };
                             message_view.set_is_dm_room(is_dm);
+                            message_view.set_no_media(room_list_view.resolve_no_media(&room_id));
                             message_view.set_room_meta(&room_meta);
                             // Update bookmark button icon.
                             if let Some(btn) = window.imp().bookmark_button.get() {
@@ -784,7 +1431,51 @@ impl MxWindow {
                                 }));
                             }
                             message_view.set_messages(&messages, prev_batch_token);
+                            message_view.load_bookmarks(&room_id);
+
+                            // Flash a bookmarked message if one is pending.
+                            if let Some(eid) = window.imp().pending_flash_event_id.take() {
+                                let mv = message_view.clone();
+                                glib::idle_add_local_once(move || {
+                                    mv.scroll_to_event(&eid);
+                                });
+                            }
+
+                            // Queue avatar fetches only for senders of the displayed
+                            // messages — not all room members (which can be thousands).
+                            let avatar_lookup: std::collections::HashMap<&str, &str> =
+                                room_meta.member_avatars.iter()
+                                    .map(|(uid, mxc)| (uid.as_str(), mxc.as_str()))
+                                    .collect();
+                            let to_fetch: Vec<(String, String)> = {
+                                let cached = window.imp().avatar_cache.borrow();
+                                messages.iter()
+                                    .map(|m| m.sender_id.as_str())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .filter(|uid| !uid.is_empty() && !cached.contains_key(*uid))
+                                    .filter_map(|uid| {
+                                        avatar_lookup.get(uid)
+                                            .filter(|mxc| !mxc.is_empty())
+                                            .map(|mxc| (uid.to_string(), mxc.to_string()))
+                                    })
+                                    .collect()
+                            };
+                            for (uid, mxc) in to_fetch {
+                                let tx = command_tx.clone();
+                                glib::spawn_future_local(async move {
+                                    let _ = tx.send(MatrixCommand::FetchAvatar {
+                                        user_id: uid, mxc_url: mxc,
+                                    }).await;
+                                });
+                            }
                         }
+                    }
+                    MatrixEvent::AvatarReady { user_id, path } => {
+                        window.imp().avatar_cache.borrow_mut().insert(user_id, path);
+                    }
+                    MatrixEvent::RoomAvatarReady { room_id, path } => {
+                        room_list_view.set_room_avatar_path(&room_id, &path);
                     }
                     MatrixEvent::OlderMessages { room_id, messages, prev_batch_token } => {
                         let current = window.imp().current_room_id.borrow().clone();
@@ -796,71 +1487,61 @@ impl MxWindow {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             message_view.patch_echo_event_id(&echo_body, &event_id);
+                            message_view.update_history_event_id(&echo_body, &event_id);
                         }
                     }
-                    MatrixEvent::NewMessage { room_id, room_name, sender_id, message, is_mention } => {
+                    MatrixEvent::NewMessage { room_id, room_name, sender_id, message, is_mention, is_dm } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         let my_id = window.imp().user_id.borrow().clone();
-                        let is_self = sender_id == my_id;
+                        // Guard: only treat as self-message when user_id is known.
+                        let is_self = !my_id.is_empty() && sender_id == my_id;
                         let is_current_room = current.as_deref() == Some(&room_id);
                         let window_focused = window.is_active();
+                        tracing::debug!(
+                            "UI NewMessage room={room_id} is_dm={is_dm} is_self={is_self} is_current={is_current_room}"
+                        );
 
                         if is_current_room && !is_self {
                             // Insert a "New messages" divider before the first
                             // unseen message when the window is unfocused.
-                            if !window_focused && window.imp().unseen_while_unfocused.get() == 0 {
+                            let unfocused = !window_focused;
+                            if unfocused && window.imp().unseen_while_unfocused.get() == 0 {
                                 message_view.insert_divider();
                             }
-                            message_view.append_message(&message);
-                            if !window_focused {
+                            // Tint the row blue when the window is not focused.
+                            message_view.append_message(&message, unfocused);
+                            if unfocused {
                                 let count = window.imp().unseen_while_unfocused.get() + 1;
                                 window.imp().unseen_while_unfocused.set(count);
+                                // Keep the banner title in sync with the live count.
+                                message_view.set_unseen_count(count);
                                 // Also show unread badge since user hasn't seen these.
-                                room_list_view.increment_unread(&room_id, is_mention);
+                                window.imp().local_unread.increment(&room_id, is_mention);
                             }
                         } else if is_current_room && is_self && !message_view.has_event(&message.event_id) {
-                            message_view.append_message(&message);
+                            // Sync arrived before MessageSent — patch the local echo
+                            // if one exists (prevents duplicates). Only append if no
+                            // unpatched echo is found (e.g. echo was already spliced out).
+                            if !message_view.patch_echo_event_id(&message.body, &message.event_id) {
+                                message_view.append_message(&message, false);
+                            }
                         }
 
                         // Update unread badge on rooms we're NOT viewing.
-                        if !is_current_room {
-                            room_list_view.increment_unread(&room_id, is_mention);
+                        // Route through the local broker so counts persist across restarts.
+                        if !is_current_room && !is_self {
+                            window.imp().local_unread.increment(&room_id, is_mention);
                         }
 
-                        // In-app toast + desktop notification for mentions and DMs.
-                        if is_mention && !is_self {
-                            // In-app toast with room name. Escape markup chars
-                            // since Toast interprets title as Pango markup.
-                            let toast_end = message.body.char_indices()
-                                .nth(60).map(|(i, _)| i)
-                                .unwrap_or(message.body.len());
-                            let preview = glib::markup_escape_text(
-                                &message.body[..toast_end]
-                            );
-                            let sender = glib::markup_escape_text(&message.sender);
-                            let rname = glib::markup_escape_text(&room_name);
-                            let toast_msg = adw::Toast::builder()
-                                .title(&format!("{sender} in {rname}: {preview}"))
-                                .timeout(5)
-                                .build();
-                            toast_overlay.add_toast(toast_msg);
-
-                            // Desktop notification.
-                            let app = window.application().unwrap();
-                            let notif = gio::Notification::new(&format!(
-                                "Mentioned in {}", room_name
-                            ));
-                            let body_preview = match message.body.char_indices().nth(100) {
-                                Some((idx, _)) => &message.body[..idx],
-                                None => &message.body,
-                            };
-                            notif.set_body(Some(&format!(
-                                "{}: {}", message.sender, body_preview
-                            )));
-                            notif.set_priority(gio::NotificationPriority::High);
-                            app.send_notification(
-                                Some(&format!("mention-{}", room_id)),
-                                &notif,
+                        // Delegate all in-app banner + desktop notification logic
+                        // to the NotificationManager, which checks UX state internally.
+                        if !is_self && (is_mention || is_dm) {
+                            window.imp().notification_manager.push(
+                                &room_id,
+                                &room_name,
+                                &message.sender,
+                                &message.body,
+                                is_dm,
                             );
                         }
                     }
@@ -874,10 +1555,19 @@ impl MxWindow {
                             }
                         }
                     }
-                    MatrixEvent::MessageEdited { room_id, event_id, new_body } => {
+                    MatrixEvent::ReactionNotification { room_id, room_name, reactor, emoji } => {
+                        toast_or_notify(
+                            &window,
+                            &toast_overlay,
+                            &format!("reaction-{room_id}"),
+                            "New reaction",
+                            &format!("{reactor} reacted {emoji} to your message in {room_name}"),
+                        );
+                    }
+                    MatrixEvent::MessageEdited { room_id, event_id, new_body, formatted_body } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
-                            message_view.update_message_body(&event_id, &new_body);
+                            message_view.update_message_body(&event_id, &new_body, formatted_body.as_deref());
                         }
                     }
                     MatrixEvent::MessageRedacted { room_id, event_id } => {
@@ -916,8 +1606,10 @@ impl MxWindow {
                         }
                         window.imp().verify_banner.set_revealed(false);
                         let toast = adw::Toast::builder()
-                            .title("Device verified! Use menu → Recover Encryption Keys to decrypt old messages.")
-                            .timeout(8)
+                            .title("Device verified! Recover your key backup to decrypt older messages.")
+                            .button_label("Recover Keys")
+                            .action_name("win.recover-keys")
+                            .timeout(30)
                             .build();
                         toast_overlay.add_toast(toast);
                     }
@@ -929,39 +1621,222 @@ impl MxWindow {
                         window.imp().verify_banner.set_revealed(true);
                         toast_error(&toast_overlay, "Verification cancelled", &reason);
                     }
+                    MatrixEvent::CrossSigningBootstrapped => {
+                        // New account: keys just created.  Backup still needs
+                        // connecting, handled by BackupVersionMismatch below.
+                        toast(&toast_overlay, "Encryption ready. Use Recover Keys to connect a key backup.");
+                    }
+                    MatrixEvent::CrossSigningNeedsPassword => {
+                        toast_error(
+                            &toast_overlay,
+                            "Encryption setup incomplete",
+                            "Log out and back in to finish setting up encryption.",
+                        );
+                    }
                     MatrixEvent::DeviceUnverified => {
                         window.imp().verify_banner.set_revealed(true);
                     }
-                    MatrixEvent::RecoveryComplete => {
-                        toast(&toast_overlay, "Encryption keys recovered! Re-select a room to decrypt messages.");
+                    MatrixEvent::RecoveryStarted => {
+                        toast(&toast_overlay, "Recovering keys… this may take up to a minute.");
+                    }
+                    MatrixEvent::RecoveryComplete { backup_connected } => {
+                        if backup_connected {
+                            toast(&toast_overlay, "Keys recovered — open each room to see decrypted messages.");
+                        } else {
+                            // SSSS has a key for an older backup version. The server's
+                            // current backup was created without updating SSSS.
+                            // The app will attempt to download from the matching backup
+                            // version directly. If that fails, contact support.
+                            toast_error(
+                                &toast_overlay,
+                                "Passphrase correct — downloading from backup",
+                                "Your passphrase unlocks an older backup. Fetching keys now.",
+                            );
+                            let tx = window.imp().command_tx.get().unwrap().clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::DownloadFromSsssBackup).await;
+                            });
+                        }
                     }
                     MatrixEvent::RecoveryFailed { error } => {
                         toast_error(&toast_overlay, "Key recovery failed", &error);
                     }
+                    MatrixEvent::BackupVersionMismatch => {
+                        toast_error(
+                            &toast_overlay,
+                            "Key backup not connected",
+                            "Use Recover Keys in the menu to reconnect your key backup and decrypt messages.",
+                        );
+                    }
+                    MatrixEvent::StaleBackupDeleted => {
+                        toast(&toast_overlay, "Stale backup cleared — click Recover Keys once more to connect.");
+                    }
+                    MatrixEvent::KeysImported { imported, total } => {
+                        toast(&toast_overlay, &format!("Imported {imported}/{total} session keys — messages will decrypt now."));
+                    }
+                    MatrixEvent::KeyImportFailed { error } => {
+                        toast_error(&toast_overlay, "Key import failed", &error);
+                    }
+                    MatrixEvent::MetricsReady { path, event_count, metrics_text } => {
+                        let msg = format!("Exported {event_count} events → {path}");
+                        toast(&toast_overlay, &msg);
+                        let cfg = crate::config::settings();
+                        if !cfg.ollama.endpoint.is_empty() && cfg.ollama.enabled {
+                            let tx = window.imp().command_tx.get().unwrap().clone();
+                            let prompt = build_metrics_prompt(&metrics_text, cfg.ollama.detect_conflict, cfg.ollama.detect_coc);
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::RunOllamaMetrics {
+                                    prompt,
+                                    endpoint: cfg.ollama.endpoint,
+                                    model: cfg.ollama.model,
+                                }).await;
+                            });
+                        }
+                    }
+                    MatrixEvent::MetricsFailed { error } => {
+                        toast_error(&toast_overlay, "Metrics export failed", &error);
+                    }
+                    // RoomPreview is no longer sent — Ollama now runs on the tokio thread
+                    // and sends OllamaChunk events directly.
+                    MatrixEvent::RoomPreview { .. } => {}
+                    MatrixEvent::OllamaChunk { context, chunk, done } => {
+                        if let Some(room_id) = context.strip_prefix("preview:") {
+                            // Room preview popover — only update if still hovering this room.
+                            if window.imp().hover_room_id.borrow().as_deref() != Some(room_id) {
+                                // Stale — ignore.
+                            } else if done && chunk.is_empty() {
+                                // Empty done = Ollama unavailable, no messages, or
+                                // the final protocol terminator after real content.
+                                // Only dismiss if no content was ever shown — otherwise
+                                // let the user read and close manually.
+                                let has_content = window.imp().hover_popover.child()
+                                    .and_then(|w| w.downcast::<gtk::Box>().ok())
+                                    .map(|b| b.has_css_class("preview-content"))
+                                    .unwrap_or(false);
+                                if !has_content {
+                                    if let Some(sid) = window.imp().hover_pulse_timer.borrow_mut().take() {
+                                        sid.remove();
+                                    }
+                                    window.imp().hover_popover.popdown();
+                                    window.imp().hover_room_id.borrow_mut().take();
+                                }
+                            } else {
+                                // First chunk: replace loading spinner with content vbox.
+                                // Detect by checking for the "preview-content" CSS class.
+                                let needs_setup = window.imp().hover_popover.child()
+                                    .and_then(|w| w.downcast::<gtk::Box>().ok())
+                                    .map(|b| !b.has_css_class("preview-content"))
+                                    .unwrap_or(true);
+                                if needs_setup {
+                                    // Cancel the pulse timer — content is arriving.
+                                    if let Some(sid) = window.imp().hover_pulse_timer.borrow_mut().take() {
+                                        sid.remove();
+                                    }
+                                    let vbox = gtk::Box::builder()
+                                        .orientation(gtk::Orientation::Vertical)
+                                        .spacing(4)
+                                        .margin_start(8).margin_end(8)
+                                        .css_classes(["preview-content"])
+                                        .margin_top(8).margin_bottom(4)
+                                        .build();
+                                    let label = gtk::Label::builder()
+                                        .wrap(true).max_width_chars(40).xalign(0.0)
+                                        .build();
+                                    label.set_widget_name("preview-label");
+                                    let close_btn = gtk::Button::builder()
+                                        .label("Close")
+                                        .halign(gtk::Align::End)
+                                        .css_classes(["flat", "caption"])
+                                        .build();
+                                    let pop = window.imp().hover_popover.clone();
+                                    close_btn.connect_clicked(move |_| pop.popdown());
+                                    vbox.append(&label);
+                                    vbox.append(&close_btn);
+                                    window.imp().hover_popover.set_child(Some(&vbox));
+                                }
+                                // Append chunk to existing text.
+                                if !chunk.is_empty() {
+                                    if let Some(child) = window.imp().hover_popover.child() {
+                                        if let Some(vbox) = child.downcast_ref::<gtk::Box>() {
+                                            if let Some(label) = vbox.first_child()
+                                                .and_then(|w| w.downcast::<gtk::Label>().ok())
+                                            {
+                                                let current = label.text().to_string();
+                                                label.set_text(&format!("{current}{chunk}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if context == "metrics" {
+                            // Metrics summary — accumulate into a dialog.
+                            if done {
+                                let text = window.imp().metrics_summary_buf.take();
+                                if !text.is_empty() {
+                                    let dialog = adw::AlertDialog::builder()
+                                        .heading("Metrics Summary")
+                                        .body(&text)
+                                        .build();
+                                    dialog.add_response("ok", "OK");
+                                    dialog.present(Some(&window));
+                                }
+                            } else if !chunk.is_empty() {
+                                let mut buf = window.imp().metrics_summary_buf.borrow_mut();
+                                buf.push_str(&chunk);
+                            }
+                        }
+                    }
                     MatrixEvent::MediaReady { url, path } => {
-                        // Cache the downloaded path.
-                        window.imp().media_cache.borrow_mut().insert(url, path.clone());
+                        // Cache the downloaded path.  Cap at 200 entries — files
+                        // stay on disk so a cache miss just re-populates cheaply.
+                        let mut cache = window.imp().media_cache.borrow_mut();
+                        if cache.len() >= 200 {
+                            cache.clear();
+                        }
+                        cache.insert(url, path.clone());
 
                         // Open with system viewer.
                         show_media_preview(&window, window.upcast_ref::<gtk::Widget>(), &path);
                     }
-                    MatrixEvent::RoomJoined { room_id: _, room_name } => {
+                    MatrixEvent::RoomJoined { room_id, room_name } => {
                         toast(&toast_overlay, &format!("Joined {room_name}"));
+                        // Replace the "Joining…" button with a static "Joined" label.
+                        if let Some(btn) = window.imp().directory_join_buttons.borrow_mut().remove(&room_id) {
+                            if let Some(parent) = btn.parent().and_downcast::<adw::ActionRow>() {
+                                parent.remove(&btn);
+                                let badge = gtk::Label::builder()
+                                    .label("Joined")
+                                    .css_classes(["dim-label", "caption"])
+                                    .build();
+                                parent.add_suffix(&badge);
+                            }
+                        }
                     }
                     MatrixEvent::JoinFailed { error } => {
                         toast_error(&toast_overlay, "Failed to join", &error);
+                        // Re-enable all stuck "Joining…" buttons so the user can retry.
+                        for btn in window.imp().directory_join_buttons.borrow().values() {
+                            btn.set_sensitive(true);
+                            btn.set_label("Join");
+                        }
                     }
-                    MatrixEvent::PublicRoomDirectory { rooms } => {
-                        window.show_space_directory(&rooms);
+                    MatrixEvent::PublicRoomDirectory { title, rooms } => {
+                        window.show_or_update_directory(&title, &rooms);
                     }
                     MatrixEvent::SpaceDirectory { space_id: _, rooms } => {
-                        window.show_space_directory(&rooms);
+                        window.show_space_directory("Space Rooms", &rooms);
                     }
                     MatrixEvent::RoomLeft { room_id: _ } => {
                         // Room list will refresh on next sync.
                     }
                     MatrixEvent::LeaveFailed { error } => {
                         toast_error(&toast_overlay, "Failed to leave", &error);
+                    }
+                    MatrixEvent::InviteSuccess { user_id } => {
+                        toast(&toast_overlay, &format!("Invited {user_id}"));
+                    }
+                    MatrixEvent::InviteFailed { error } => {
+                        toast_error(&toast_overlay, "Invite failed", &error);
                     }
                     MatrixEvent::DmReady { user_id: _, room_id, room_name } => {
                         // Navigate to the DM room — same as clicking it in the sidebar.
@@ -973,29 +1848,31 @@ impl MxWindow {
                         let tx = window.imp().command_tx.get().unwrap().clone();
                         let rid = room_id.clone();
                         glib::spawn_future_local(async move {
-                            let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
+                            let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid, known_unread: 0 }).await;
                         });
                     }
                     MatrixEvent::DmFailed { error } => {
                         toast_error(&toast_overlay, "Failed to open DM", &error);
                     }
                     MatrixEvent::SyncGap { room_id } => {
-                        let current = window.imp().current_room_id.borrow().clone();
-                        if current.as_deref() == Some(&room_id) {
-                            // Re-fetch the current room's timeline to fill the gap.
-                            tracing::info!("Sync gap in current room {room_id}, re-fetching");
-                            message_view.clear();
-                            let tx = window.imp().command_tx.get().unwrap().clone();
-                            let rid = room_id.clone();
-                            glib::spawn_future_local(async move {
-                                let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid }).await;
-                            });
-                        }
+                        // The memory cache was wiped by the sync thread so the next
+                        // SelectRoom (when the user navigates away and back) will
+                        // trigger a full bg_refresh.  While the user is currently
+                        // viewing the room, NewMessage events are already delivering
+                        // each message live — no need to trigger a full re-fetch that
+                        // would flash the "Updating messages" banner every 30 s on
+                        // busy rooms (KDE, GNOME, etc. whose timeline is always limited).
+                        tracing::debug!("SyncGap for {room_id} (cache wiped; live NewMessage events cover gap)");
                     }
                     MatrixEvent::TypingUsers { room_id, names } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             message_view.set_typing_users(&names);
+                        }
+                        // Update the room row typing indicator in the sidebar.
+                        let reg = room_list_view.imp().room_registry.borrow();
+                        if let Some(obj) = reg.get(&room_id) {
+                            obj.set_is_typing(!names.is_empty());
                         }
                     }
                     MatrixEvent::ThreadReplies { room_id, thread_root_id: _, root_message, replies } => {
@@ -1004,11 +1881,71 @@ impl MxWindow {
                             window.show_thread_sidebar(&root_message, &replies);
                         }
                     }
+                    MatrixEvent::LoggedOut => {
+                        toast(&toast_overlay, "Logged out");
+                        window.show_login();
+                    }
+                    #[cfg(feature = "motd")]
+                    MatrixEvent::TopicChanged { room_id, new_topic } => {
+                        if crate::config::settings().plugins.motd {
+                            let current = window.imp().current_room_id.borrow().clone();
+                            if current.as_deref() == Some(&room_id) {
+                                // User is in this room — show a toast immediately.
+                                let label = if new_topic.is_empty() {
+                                    "Room topic was cleared".to_string()
+                                } else {
+                                    format!("Topic updated: {new_topic}")
+                                };
+                                toast(&toast_overlay, &label);
+                            } else {
+                                // Not in this room — flag the row in the sidebar.
+                                room_list_view.set_topic_changed(&room_id, true);
+                            }
+                        }
+                    }
+                    MatrixEvent::RoomKeysReceived { room_ids } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if let Some(rid) = current {
+                            // Empty room_ids means all rooms changed (post-recovery cache clear).
+                            let affects_current = room_ids.is_empty()
+                                || room_ids.iter().any(|id| *id == rid);
+                            if affects_current {
+                                let tx = window.imp().command_tx.get().unwrap().clone();
+                                glib::spawn_future_local(async move {
+                                    // Re-loading the current room after key recovery: user is
+                                    // already viewing it so unread count is 0.
+                                    let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid, known_unread: 0 }).await;
+                                });
+                            }
+                        }
+                    }
+                    #[cfg(feature = "ai")]
+                    MatrixEvent::RoomAlert { room_id, room_name, matched_term } => {
+                        room_list_view.set_watch_alert(&room_id, true);
+                        let msg = format!("\u{201c}{matched_term}\u{201d} matched in {room_name}");
+                        toast_or_notify(
+                            &window,
+                            &toast_overlay,
+                            &format!("alert-{room_id}"),
+                            &format!("Watch alert: {room_name}"),
+                            &msg,
+                        );
+                    }
                 }
             }
         });
 
         window
+    }
+
+    fn show_onboarding(&self) {
+        let imp = self.imp();
+        let weak = self.downgrade();
+        imp.onboarding_page.connect_get_started(move || {
+            let Some(win) = weak.upgrade() else { return };
+            win.show_login();
+        });
+        imp.toolbar.set_content(Some(&imp.onboarding_page));
     }
 
     fn show_login(&self) {
@@ -1022,16 +1959,41 @@ impl MxWindow {
         // Register actions for the menu.
         self.setup_actions();
 
-        // Sidebar header with hamburger menu.
-        let sidebar_header = adw::HeaderBar::new();
+        // Sidebar header with hamburger menu — no close button (content header has it).
+        let sidebar_header = adw::HeaderBar::builder()
+            .show_end_title_buttons(false)
+            .build();
+
+        // Search toggle button — shows/hides the search bar.
+        let search_btn = gtk::ToggleButton::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Search rooms")
+            .build();
+        search_btn.add_css_class("flat");
+        sidebar_header.pack_start(&search_btn);
+
+        // "New / Join Room" button — activates the inline join bar.
+        let join_header_btn = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Join or explore rooms (Ctrl+J)")
+            .action_name("win.join-room")
+            .build();
+        join_header_btn.add_css_class("flat");
+        sidebar_header.pack_start(&join_header_btn);
+
         let menu = gio::Menu::new();
         let main_section = gio::Menu::new();
         main_section.append(Some("_Verify Device"), Some("win.verify"));
         main_section.append(Some("_Recover Encryption Keys"), Some("win.recover-keys"));
+        main_section.append(Some("_Import E2E Keys from File"), Some("win.import-keys"));
         main_section.append(Some("_Preferences"), Some("win.preferences"));
         menu.append_section(None, &main_section);
+        let account_section = gio::Menu::new();
+        account_section.append(Some("_Log Out"), Some("win.logout"));
+        menu.append_section(None, &account_section);
         let about_section = gio::Menu::new();
-        about_section.append(Some("_About Matx"), Some("win.about"));
+        about_section.append(Some("_Keyboard Shortcuts"), Some("win.shortcuts"));
+        about_section.append(Some("_About Hikyaku"), Some("win.about"));
         menu.append_section(None, &about_section);
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -1042,6 +2004,27 @@ impl MxWindow {
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
         sidebar_toolbar.set_content(Some(&imp.room_list_view));
+
+        // Wire search toggle button ↔ search bar.
+        let search_bar = imp.room_list_view.search_bar();
+        let rlv_weak = imp.room_list_view.downgrade();
+        search_btn.connect_toggled(move |btn| {
+            if let Some(rlv) = rlv_weak.upgrade() {
+                let bar = rlv.search_bar();
+                if btn.is_active() != bar.is_search_mode() {
+                    rlv.toggle_search();
+                }
+            }
+        });
+        // Keep toggle button in sync when search mode is disabled (e.g. Escape).
+        let search_btn_weak = search_btn.downgrade();
+        search_bar.connect_notify_local(Some("search-mode-enabled"), move |bar: &gtk::SearchBar, _| {
+            if let Some(btn) = search_btn_weak.upgrade() {
+                btn.set_active(bar.is_search_mode());
+            }
+        });
+        // Allow typing anywhere in the sidebar to activate search.
+        search_bar.set_key_capture_widget(Some(&sidebar_toolbar));
 
         let sidebar_page = adw::NavigationPage::builder()
             .title("Rooms")
@@ -1087,9 +2070,19 @@ impl MxWindow {
         leave_button.add_css_class("flat");
         content_header.pack_end(&leave_button);
 
+        // Export metrics button — hidden until a room is selected.
+        let export_button = gtk::Button::builder()
+            .icon_name("x-office-spreadsheet-symbolic")
+            .tooltip_text("Export room metrics")
+            .visible(false)
+            .build();
+        export_button.add_css_class("flat");
+        content_header.pack_end(&export_button);
+
         // Store button references so room selection can show/hide them.
         let _ = imp.info_button.set(info_button.clone());
         let _ = imp.bookmark_button.set(bookmark_button.clone());
+        let _ = imp.export_button.set(export_button.clone());
 
         // Wire bookmark toggle.
         let window_weak_bm = self.downgrade();
@@ -1165,6 +2158,16 @@ impl MxWindow {
             toast_leave.add_toast(toast);
         });
 
+        // Wire up export metrics button.
+        let window_weak_export = self.downgrade();
+        export_button.connect_clicked(move |_| {
+            let Some(window) = window_weak_export.upgrade() else { return };
+            let imp = window.imp();
+            let Some(room_id) = imp.current_room_id.borrow().clone() else { return };
+            let tx = imp.command_tx.get().unwrap().clone();
+            show_export_metrics_dialog(&window, room_id, tx);
+        });
+
         // Details sidebar (right side, hidden by default).
         let details_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1214,20 +2217,29 @@ impl MxWindow {
 
         let content_toolbar = adw::ToolbarView::new();
         content_toolbar.add_top_bar(&content_header);
+        content_toolbar.add_top_bar(&imp.notify_banner);
         content_toolbar.set_content(Some(&content_box));
 
         let content_page = adw::NavigationPage::builder()
-            .title("Matx")
+            .title("Hikyaku")
             .child(&content_toolbar)
             .build();
         let _ = imp.content_page.set(content_page.clone());
 
-        let split_view = adw::NavigationSplitView::new();
-        split_view.set_sidebar(Some(&sidebar_page));
-        split_view.set_content(Some(&content_page));
-        split_view.set_min_sidebar_width(290.0);
-        split_view.set_max_sidebar_width(400.0);
-        split_view.set_sidebar_width_fraction(0.32);
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.set_start_child(Some(&sidebar_page));
+        paned.set_end_child(Some(&content_page));
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+
+        // Restore saved sidebar width (clamped to a sane range).
+        let saved_width = crate::config::gsettings().int("sidebar-width").clamp(180, 600);
+        paned.set_position(saved_width);
+
+        // Persist the width whenever the user drags the divider.
+        paned.connect_notify_local(Some("position"), |p, _| {
+            let _ = crate::config::gsettings().set_int("sidebar-width", p.position());
+        });
 
         // Wire up the banner's Verify button.
         let tx = imp.command_tx.get().unwrap().clone();
@@ -1244,6 +2256,25 @@ impl MxWindow {
                 let dialog = crate::widgets::verification_dialog::show_waiting_dialog(
                     &window, tx.clone(),
                 );
+                // Clear verify_dialog on any dismissal; re-show banner on cancel.
+                let window_weak2 = window.downgrade();
+                let tx2 = tx.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if let Some(w) = window_weak2.upgrade() {
+                        w.imp().verify_dialog.replace(None);
+                        if response == "cancel" {
+                            w.imp().verify_banner.set_revealed(true);
+                            let tx = tx2.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx
+                                    .send(MatrixCommand::CancelVerification {
+                                        flow_id: String::new(),
+                                    })
+                                    .await;
+                            });
+                        }
+                    }
+                });
                 window.imp().verify_dialog.replace(Some(dialog));
                 glib::spawn_future_local(async move {
                     let _ = tx
@@ -1253,13 +2284,257 @@ impl MxWindow {
             }
         });
 
-        // Use a ToolbarView to place the banner above the split view,
-        // spanning the full window width.
-        let main_toolbar = adw::ToolbarView::new();
-        main_toolbar.add_top_bar(&imp.verify_banner);
-        main_toolbar.set_content(Some(&split_view));
+        // verify_banner spans the full window width — use a wrapper box since
+        // there is no single top-level ToolbarView+HeaderBar for the whole window.
+        let main_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        paned.set_vexpand(true);
+        main_box.append(&imp.verify_banner);
+        main_box.append(&paned);
 
-        imp.toast_overlay.set_child(Some(&main_toolbar));
+        // AdwBottomSheet: main view is always live; bookmarks slides up over it.
+        // The sheet animation is handled by libadwaita — no layout loop risk.
+        let bookmarks_sheet = adw::BottomSheet::builder()
+            .content(&main_box)
+            .sheet(&imp.bookmarks_overview)
+            .full_width(true)
+            .show_drag_handle(false)
+            .modal(true)
+            .open(false)
+            .build();
+        imp.bookmarks_sheet.set(bookmarks_sheet.clone()).ok();
+        imp.toast_overlay.set_child(Some(&bookmarks_sheet));
+
+        // Sync the sheet content height to the window height while the sheet
+        // is open.  BookmarksOverview.measure() returns minimum=0 so this
+        // height_request only sets the natural height (what BottomSheet uses
+        // to size the panel), not the minimum — the window can resize freely.
+        //
+        // notify::default-height fires for every interactive resize because
+        // minimum=0 lets the window manager honour any size the user requests.
+        let sync_sheet_height = {
+            let overview = imp.bookmarks_overview.clone();
+            let sheet = bookmarks_sheet.clone();
+            move |win: &crate::widgets::window::MxWindow| {
+                if sheet.is_open() {
+                    let h = win.height();
+                    if h > 0 { overview.set_height_request(h); }
+                }
+            }
+        };
+        self.connect_notify_local(Some("default-height"), {
+            let f = sync_sheet_height.clone();
+            move |win, _| f(win)
+        });
+        // Fullscreen/maximise: allocation updates asynchronously — defer one
+        // frame so win.height() returns the new value.
+        for prop in ["fullscreened", "maximized"] {
+            let f = sync_sheet_height.clone();
+            let win_weak = self.downgrade();
+            self.connect_notify_local(Some(prop), move |_, _| {
+                let f = f.clone();
+                let win_weak = win_weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(win) = win_weak.upgrade() { f(&win); }
+                });
+            });
+        }
+
+        // Bookmarks tab activated → show overlay + reload cards.
+        let window_weak = self.downgrade();
+        imp.room_list_view.connect_bookmarks_activated(move || {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            imp.bookmarks_overview.reload_messages();
+            imp.bookmarks_overview.clear_search();
+            // Rebuild favourite room cards with current registry objects.
+            {
+                let registry = imp.room_list_view.imp().room_registry.borrow();
+                let cached = imp.room_list_view.imp().cached_rooms.borrow();
+                let mut favs: Vec<crate::models::RoomObject> = cached.iter()
+                    .filter(|r| r.is_favourite)
+                    .filter_map(|r| registry.get(&r.room_id).cloned())
+                    .collect();
+                favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
+                imp.bookmarks_overview.set_favourite_rooms(&favs);
+            }
+            if let Some(sheet) = imp.bookmarks_sheet.get() {
+                imp.bookmarks_overview.set_height_request(window.height());
+                sheet.set_open(true);
+            }
+        });
+
+        // Bookmarks overlay closed → slide down, switch sidebar to messages.
+        let window_weak = self.downgrade();
+        imp.bookmarks_overview.connect_close(move || {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            if let Some(sheet) = imp.bookmarks_sheet.get() {
+                sheet.set_open(false);
+                imp.bookmarks_overview.set_height_request(-1);
+            }
+            imp.room_list_view.select_messages_tab();
+        });
+
+        // Favourite room card clicked → instant dismiss + navigate to room.
+        let window_weak = self.downgrade();
+        imp.bookmarks_overview.connect_room_navigate(move |room_id, room_name| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            if let Some(sheet) = imp.bookmarks_sheet.get() {
+                sheet.set_open(false);
+                imp.bookmarks_overview.set_height_request(-1);
+            }
+            imp.room_list_view.navigate_to_room_context(&room_id);
+            let has_cb = imp.room_list_view.imp().on_room_selected.borrow().is_some();
+            if has_cb {
+                let borrow = imp.room_list_view.imp().on_room_selected.borrow();
+                borrow.as_ref().unwrap()(room_id, room_name);
+            }
+        });
+
+        // Saved message card clicked → instant dismiss + navigate to room + flash message.
+        let window_weak = self.downgrade();
+        imp.bookmarks_overview.connect_navigate(move |room_id, event_id| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            if let Some(sheet) = imp.bookmarks_sheet.get() {
+                sheet.set_open(false);
+                imp.bookmarks_overview.set_height_request(-1);
+            }
+            imp.room_list_view.navigate_to_room_context(&room_id);
+            // Navigate to room first; flash happens after messages load via pending_flash.
+            let registry = imp.room_list_view.imp().room_registry.borrow();
+            let name = registry.get(&room_id).map(|o| o.name()).unwrap_or_default();
+            drop(registry);
+            if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
+                cb(room_id, name);
+            }
+            // Store event_id to flash after the room loads.
+            imp.pending_flash_event_id.replace(Some(event_id));
+        });
+
+        // Message bookmark button → save to store + highlight row + add card to overview.
+        let window_weak = self.downgrade();
+        imp.message_view.connect_bookmark(move |event_id, sender, body, timestamp| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            let room_id = imp.current_room_id.borrow().clone().unwrap_or_default();
+            let room_name = imp.content_page.get()
+                .map(|p| p.title().to_string())
+                .unwrap_or_default();
+            let entry = crate::bookmarks::BookmarkEntry {
+                room_id,
+                room_name,
+                event_id: event_id.clone(),
+                sender,
+                body_preview: body.chars().take(200).collect(),
+                timestamp,
+            };
+            crate::bookmarks::BOOKMARK_STORE.add(entry.clone());
+            imp.message_view.set_message_bookmarked(&event_id, true);
+            imp.bookmarks_overview.add_message_card(&entry);
+            imp.toast_overlay.add_toast(
+                adw::Toast::builder().title("Saved for later").timeout(2).build()
+            );
+        });
+
+        // Unbookmark: remove from store, un-highlight row, remove card from overview.
+        let window_weak = self.downgrade();
+        imp.message_view.connect_unbookmark(move |event_id| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+            crate::bookmarks::BOOKMARK_STORE.remove(&event_id);
+            imp.message_view.set_message_bookmarked(&event_id, false);
+            imp.bookmarks_overview.remove_message_card(&event_id);
+            imp.toast_overlay.add_toast(
+                adw::Toast::builder().title("Bookmark removed").timeout(2).build()
+            );
+        });
+
+        let window_weak = self.downgrade();
+        imp.message_view.connect_add_to_rolodex(move |user_id, display_name| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let store = &window.imp().rolodex_store;
+            // Deduplicate: do nothing if already present.
+            let already = (0..store.n_items()).any(|i| {
+                store.item(i)
+                    .and_downcast::<crate::models::RolodexEntryObject>()
+                    .map(|o| o.user_id() == user_id)
+                    .unwrap_or(false)
+            });
+            if already { return; }
+            let added_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            store.append(&crate::models::RolodexEntryObject::new(
+                &user_id, &display_name, "", added_at,
+            ));
+            // items-changed fires → save to JSON + GSettings automatically.
+            window.imp().toast_overlay.add_toast(
+                adw::Toast::builder()
+                    .title(&format!("{display_name} added to contacts"))
+                    .timeout(2)
+                    .build()
+            );
+        });
+
+        let window_weak = self.downgrade();
+        imp.message_view.connect_remove_from_rolodex(move |user_id| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let store = &window.imp().rolodex_store;
+            if let Some(pos) = (0..store.n_items()).find(|&i| {
+                store.item(i)
+                    .and_downcast::<crate::models::RolodexEntryObject>()
+                    .map(|o| o.user_id() == user_id)
+                    .unwrap_or(false)
+            }) {
+                store.remove(pos);
+                // items-changed fires → save to JSON + GSettings automatically.
+            }
+            window.imp().toast_overlay.add_toast(
+                adw::Toast::builder().title("Removed from contacts").timeout(2).build()
+            );
+        });
+
+        let window_weak = self.downgrade();
+        imp.message_view.connect_get_rolodex_notes(move |user_id| {
+            let window = window_weak.upgrade()?;
+            let store = &window.imp().rolodex_store;
+            (0..store.n_items()).find_map(|i| {
+                store.item(i)
+                    .and_downcast::<crate::models::RolodexEntryObject>()
+                    .filter(|o| o.user_id() == user_id)
+                    .map(|o| o.notes())
+            })
+        });
+
+        let window_weak = self.downgrade();
+        imp.message_view.connect_save_rolodex_notes(move |user_id, notes| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let store = &window.imp().rolodex_store;
+            if let Some(obj) = (0..store.n_items()).find_map(|i| {
+                store.item(i)
+                    .and_downcast::<crate::models::RolodexEntryObject>()
+                    .filter(|o| o.user_id() == user_id)
+            }) {
+                obj.set_notes(notes.as_str());
+                // Manually trigger persistence since set_property doesn't fire items-changed.
+                let n = store.n_items();
+                let mut entries = Vec::with_capacity(n as usize);
+                let mut gs_entries = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    if let Some(o) = store.item(i).and_downcast::<crate::models::RolodexEntryObject>() {
+                        gs_entries.push(o.user_id());
+                        entries.push(o.to_entry());
+                    }
+                }
+                crate::plugins::rolodex::save(&entries);
+                crate::config::set_rolodex(&gs_entries);
+            }
+        });
 
         // Register custom icon theme for our symbolic icons.
         if let Some(display) = gtk::gdk::Display::default() {
@@ -1279,9 +2554,28 @@ impl MxWindow {
             theme.add_search_path("data/icons");
         }
 
-        // Apply font and tint settings from config.
+        // Apply font, tint, and bookmark highlight settings from config.
         apply_font_css(&crate::config::settings().appearance);
         apply_tint_css(&crate::config::settings().appearance);
+        apply_bookmark_css(&crate::config::settings().appearance.bookmark_highlight_color);
+        apply_new_message_css(&crate::config::settings().appearance.new_message_highlight_color);
+        // Initialize static app CSS (active room highlight etc.).
+        APP_CSS_PROVIDER.with(|_| {});
+
+        // Persist rolodex store to JSON + GSettings on every change.
+        imp.rolodex_store.connect_items_changed(|store, _, _, _| {
+            let n = store.n_items();
+            let mut entries = Vec::with_capacity(n as usize);
+            let mut gs_entries = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                if let Some(obj) = store.item(i).and_downcast::<crate::models::RolodexEntryObject>() {
+                    gs_entries.push(format!("{}|{}", obj.display_name(), obj.user_id()));
+                    entries.push(obj.to_entry());
+                }
+            }
+            crate::plugins::rolodex::save(&entries);
+            crate::config::set_rolodex(&gs_entries);
+        });
 
         // Badge styles for room rows.
         let badge_css = gtk::CssProvider::new();
@@ -1325,16 +2619,6 @@ impl MxWindow {
             .info-button:hover {
                 background: #2a7de1;
             }
-            .join-banner {
-                background: #3584e4;
-                color: white;
-                border-radius: 0;
-                border: none;
-                font-weight: bold;
-            }
-            .join-banner:hover {
-                background: #2a7de1;
-            }
             .action-overlay {
                 opacity: 0.7;
                 transition: opacity 200ms ease-in;
@@ -1344,10 +2628,17 @@ impl MxWindow {
             }
             .msg-action-bar {
                 opacity: 0;
-                transition: opacity 300ms ease-in-out;
+                transition: opacity 150ms ease-in-out;
+                margin-top: 0;
+                margin-bottom: 0;
             }
             .msg-action-bar-visible {
-                opacity: 0.85;
+                opacity: 1.0;
+            }
+            .msg-action-bar button {
+                min-height: 20px;
+                min-width: 20px;
+                padding: 2px;
             }
             .media-placeholder {
                 background: alpha(@accent_bg_color, 0.1);
@@ -1376,6 +2667,24 @@ impl MxWindow {
                 padding: 4px 0;
                 margin: 8px 12px;
                 border-top: 1px solid alpha(@accent_bg_color, 0.5);
+            }
+            .active-room-row {
+                background: alpha(@accent_bg_color, 0.18);
+                border-radius: 6px;
+            }
+            @keyframes typing-pulse {
+                0%   { opacity: 1.0; }
+                50%  { opacity: 0.4; }
+                100% { opacity: 1.0; }
+            }
+            .typing-indicator {
+                animation: typing-pulse 1.4s ease-in-out infinite;
+                font-style: italic;
+            }
+            .code-block {
+                border-radius: 6px;
+                padding: 8px;
+                font-family: monospace;
             }
 ",
         );
@@ -1412,6 +2721,25 @@ impl MxWindow {
                 let dialog = crate::widgets::verification_dialog::show_waiting_dialog(
                     window, tx.clone(),
                 );
+                // Clear verify_dialog on any dismissal; re-show banner on cancel.
+                let window_weak = window.downgrade();
+                let tx2 = tx.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if let Some(w) = window_weak.upgrade() {
+                        w.imp().verify_dialog.replace(None);
+                        if response == "cancel" {
+                            w.imp().verify_banner.set_revealed(true);
+                            let tx = tx2.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx
+                                    .send(MatrixCommand::CancelVerification {
+                                        flow_id: String::new(),
+                                    })
+                                    .await;
+                            });
+                        }
+                    }
+                });
                 window.imp().verify_dialog.replace(Some(dialog));
                 glib::spawn_future_local(async move {
                     let _ = tx
@@ -1428,17 +2756,116 @@ impl MxWindow {
             })
             .build();
 
-        let join_action = ActionEntryBuilder::new("join-room")
+        let import_keys_action = ActionEntryBuilder::new("import-keys")
             .activate(|window: &Self, _, _| {
-                window.show_join_bar();
+                let tx = window.imp().command_tx.get().unwrap().clone();
+                let window = window.clone();
+                glib::spawn_future_local(async move {
+                    show_import_keys_dialog(&window, tx).await;
+                });
             })
             .build();
 
-        self.add_action_entries([about_action, preferences_action, verify_action, recover_action, join_action]);
+        let logout_action = ActionEntryBuilder::new("logout")
+            .activate(|window: &Self, _, _| {
+                let tx = window.imp().command_tx.get().unwrap().clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::Logout).await;
+                });
+            })
+            .build();
+
+        let join_action = ActionEntryBuilder::new("join-room")
+            .activate(|window: &Self, _, _| {
+                let tab = window.imp().room_list_view.visible_tab();
+                match tab.as_deref() {
+                    Some("messages") => {
+                        window.show_new_dm_bar();
+                    }
+                    Some("rooms") => {
+                        let tx = window.imp().command_tx.get().unwrap().clone();
+                        window.imp().directory_spaces_only.set(false);
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(crate::matrix::MatrixCommand::BrowsePublicRooms {
+                                search_term: None,
+                                spaces_only: false,
+                                server: None,
+                            }).await;
+                        });
+                    }
+                    Some("spaces") => {
+                        let tx = window.imp().command_tx.get().unwrap().clone();
+                        window.imp().directory_spaces_only.set(true);
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(crate::matrix::MatrixCommand::BrowsePublicRooms {
+                                search_term: None,
+                                spaces_only: true,
+                                server: None,
+                            }).await;
+                        });
+                    }
+                    _ => {
+                        window.show_join_bar();
+                    }
+                }
+            })
+            .build();
+
+        let shortcuts_action = ActionEntryBuilder::new("shortcuts")
+            .activate(|window: &Self, _, _| {
+                show_shortcuts_window(window);
+            })
+            .build();
+
+        let prev_room_action = ActionEntryBuilder::new("prev-room")
+            .activate(|window: &Self, _, _| {
+                let imp = window.imp();
+                let current = imp.current_room_id.borrow().clone().unwrap_or_default();
+                imp.room_list_view.navigate_room(&current, -1);
+            })
+            .build();
+
+        let next_room_action = ActionEntryBuilder::new("next-room")
+            .activate(|window: &Self, _, _| {
+                let imp = window.imp();
+                let current = imp.current_room_id.borrow().clone().unwrap_or_default();
+                imp.room_list_view.navigate_room(&current, 1);
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action, verify_action, recover_action, import_keys_action, logout_action, join_action, shortcuts_action, prev_room_action, next_room_action]);
+    }
+
+    /// Navigate to a room identified by a Matrix ID or alias.
+    /// If the room is already joined, opens it directly.
+    /// Otherwise shows the join bar pre-filled with the identifier.
+    pub fn handle_matrix_link(&self, identifier: &str) {
+        let imp = self.imp();
+        // Check if we already have this room.
+        let registry = imp.room_list_view.imp().room_registry.borrow();
+        if let Some(obj) = registry.values().find(|o| o.room_id() == identifier) {
+            let room_id = obj.room_id();
+            let name = obj.name();
+            drop(registry);
+            if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
+                cb(room_id, name);
+            }
+            return;
+        }
+        drop(registry);
+        // Not joined — show the join bar pre-filled.
+        self.show_join_bar_with(Some(identifier));
     }
 
     fn show_join_bar(&self) {
+        self.show_join_bar_with(None);
+    }
+
+    fn show_join_bar_with(&self, initial: Option<&str>) {
         let imp = self.imp();
+        if imp.inline_bar_active.get() { return; }
+        imp.inline_bar_active.set(true);
+
         let toast_overlay = imp.toast_overlay.clone();
         let tx = imp.command_tx.get().unwrap().clone();
 
@@ -1447,6 +2874,9 @@ impl MxWindow {
             .placeholder_text("#room:server or !id:server")
             .hexpand(true)
             .build();
+        if let Some(text) = initial {
+            entry.set_text(text);
+        }
         let join_btn = gtk::Button::builder()
             .label("Join")
             .css_classes(["suggested-action"])
@@ -1467,93 +2897,181 @@ impl MxWindow {
         bar.append(&join_btn);
         bar.append(&cancel_btn);
 
-        // Use a Revealer to slide in the join bar.
         let revealer = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .reveal_child(true)
             .child(&bar)
             .build();
 
-        // Insert the revealer at the top of the room list.
         imp.room_list_view.prepend(&revealer);
         entry.grab_focus();
 
-        // Join on Enter or button click.
-        let tx2 = tx.clone();
-        let entry2 = entry.clone();
-        let revealer2 = revealer.clone();
-        let toast2 = toast_overlay.clone();
-        let do_join = move || {
-            let text = entry2.text().to_string();
-            if text.is_empty() {
-                return;
-            }
-            let tx = tx2.clone();
-            let revealer = revealer2.clone();
-            let toast = toast2.clone();
-            glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: text }).await;
+        let dismiss = {
+            let win_weak = self.downgrade();
+            let revealer = revealer.clone();
+            move || {
                 revealer.set_reveal_child(false);
-                // Remove after animation.
+                if let Some(win) = win_weak.upgrade() {
+                    win.imp().inline_bar_active.set(false);
+                }
+                let r = revealer.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                    if let Some(parent) = revealer.parent() {
+                    if let Some(parent) = r.parent() {
                         if let Some(b) = parent.downcast_ref::<gtk::Box>() {
-                            b.remove(&revealer);
+                            b.remove(&r);
                         }
                     }
                 });
+            }
+        };
+
+        let tx2 = tx.clone();
+        let entry2 = entry.clone();
+        let dismiss2 = dismiss.clone();
+        let toast2 = toast_overlay.clone();
+        let do_join = move || {
+            let text = entry2.text().to_string();
+            if text.is_empty() { return; }
+            let tx = tx2.clone();
+            let dismiss = dismiss2.clone();
+            let _toast = toast2.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: text }).await;
+                dismiss();
             });
         };
 
         let join_fn = do_join.clone();
         join_btn.connect_clicked(move |_| join_fn());
-        let join_fn = do_join;
-        entry.connect_activate(move |_| join_fn());
+        entry.connect_activate(move |_| do_join());
 
-        // Cancel hides the bar.
-        let revealer3 = revealer.clone();
-        cancel_btn.connect_clicked(move |_| {
-            revealer3.set_reveal_child(false);
-            let r = revealer3.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                if let Some(parent) = r.parent() {
-                    if let Some(b) = parent.downcast_ref::<gtk::Box>() {
-                        b.remove(&r);
-                    }
-                }
-            });
-        });
+        cancel_btn.connect_clicked(move |_| dismiss());
     }
 
-    fn show_space_directory(&self, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
-        let dialog = adw::Dialog::builder()
-            .title("Join a Room")
-            .content_width(400)
-            .content_height(500)
+    /// Show an inline bar to start a new DM with a Matrix user.
+    fn show_new_dm_bar(&self) {
+        let imp = self.imp();
+        if imp.inline_bar_active.get() { return; }
+        imp.inline_bar_active.set(true);
+
+        let tx = imp.command_tx.get().unwrap().clone();
+
+        let entry = gtk::Entry::builder()
+            .placeholder_text("@user:server")
+            .hexpand(true)
+            .build();
+        let start_btn = gtk::Button::builder()
+            .label("Message")
+            .css_classes(["suggested-action"])
+            .build();
+        let cancel_btn = gtk::Button::builder()
+            .label("Cancel")
             .build();
 
-        let toolbar = adw::ToolbarView::new();
-        let header = adw::HeaderBar::new();
-        toolbar.add_top_bar(&header);
-
-        let list_box = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .margin_start(12)
-            .margin_end(12)
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(8)
+            .margin_end(8)
             .margin_top(6)
-            .margin_bottom(12)
+            .margin_bottom(6)
+            .build();
+        bar.append(&entry);
+        bar.append(&start_btn);
+        bar.append(&cancel_btn);
+
+        let revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .reveal_child(true)
+            .child(&bar)
             .build();
 
+        imp.room_list_view.prepend(&revealer);
+        entry.grab_focus();
+
+        let dismiss = {
+            let win_weak = self.downgrade();
+            let revealer = revealer.clone();
+            move || {
+                revealer.set_reveal_child(false);
+                if let Some(win) = win_weak.upgrade() {
+                    win.imp().inline_bar_active.set(false);
+                }
+                let r = revealer.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    if let Some(parent) = r.parent() {
+                        if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+                            b.remove(&r);
+                        }
+                    }
+                });
+            }
+        };
+
+        let tx2 = tx.clone();
+        let entry2 = entry.clone();
+        let dismiss2 = dismiss.clone();
+        let do_start = move || {
+            let text = entry2.text().to_string();
+            if text.is_empty() { return; }
+            let tx = tx2.clone();
+            let dismiss = dismiss2.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CreateDm { user_id: text }).await;
+                dismiss();
+            });
+        };
+
+        let start_fn = do_start.clone();
+        start_btn.connect_clicked(move |_| start_fn());
+        entry.connect_activate(move |_| do_start());
+
+        cancel_btn.connect_clicked(move |_| dismiss());
+    }
+
+    /// Show the directory dialog or update it in-place if already open.
+    fn show_or_update_directory(&self, title: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+        let imp = self.imp();
+        // If the dialog is already open, just repopulate the list in-place.
+        if let Some(list_box) = imp.directory_list_box.borrow().as_ref() {
+            Self::populate_directory_list(
+                list_box,
+                rooms,
+                imp.command_tx.get().unwrap(),
+                &mut imp.directory_join_buttons.borrow_mut(),
+            );
+            return;
+        }
+        self.show_space_directory(title, rooms);
+    }
+
+    /// Fill a ListBox with directory room rows.
+    ///
+    /// `join_buttons` is cleared and repopulated with the new Join buttons so
+    /// the `RoomJoined` / `JoinFailed` event handlers can update them.
+    fn populate_directory_list(
+        list_box: &gtk::ListBox,
+        rooms: &[crate::matrix::SpaceDirectoryRoom],
+        tx: &async_channel::Sender<MatrixCommand>,
+        join_buttons: &mut std::collections::HashMap<String, gtk::Button>,
+    ) {
+        join_buttons.clear();
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
         for room in rooms {
+            // Room topics can contain Pango-unsafe characters (& in URLs etc.).
+            let safe_name = glib::markup_escape_text(&room.name);
+            let safe_topic = glib::markup_escape_text(&room.topic);
+            let subtitle = if safe_topic.is_empty() {
+                format!("{} members", room.member_count)
+            } else {
+                format!("{safe_topic} — {} members", room.member_count)
+            };
             let row = adw::ActionRow::builder()
-                .title(&room.name)
-                .subtitle(&if room.topic.is_empty() {
-                    format!("{} members", room.member_count)
-                } else {
-                    format!("{} — {} members", room.topic, room.member_count)
-                })
-                .activatable(true)
+                .title(safe_name.as_str())
+                .subtitle(&subtitle)
+                .activatable(false)
                 .build();
 
             if room.already_joined {
@@ -1568,9 +3086,8 @@ impl MxWindow {
                     .css_classes(["suggested-action"])
                     .valign(gtk::Align::Center)
                     .build();
-                let tx = self.imp().command_tx.get().unwrap().clone();
+                let tx = tx.clone();
                 let rid = room.room_id.clone();
-                let _toast_overlay = self.imp().toast_overlay.clone();
                 join_btn.connect_clicked(move |btn| {
                     btn.set_sensitive(false);
                     btn.set_label("Joining…");
@@ -1582,29 +3099,153 @@ impl MxWindow {
                         }).await;
                     });
                 });
+                join_buttons.insert(room.room_id.clone(), join_btn.clone());
                 row.add_suffix(&join_btn);
             }
 
             list_box.append(&row);
         }
+    }
 
-        if rooms.is_empty() {
-            let empty = adw::StatusPage::builder()
-                .icon_name("system-search-symbolic")
-                .title("No Rooms Found")
-                .description("This space doesn't have any discoverable rooms.")
-                .build();
-            toolbar.set_content(Some(&empty));
-        } else {
-            let scroll = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(&list_box)
-                .build();
-            toolbar.set_content(Some(&scroll));
-        }
+    fn show_space_directory(&self, title: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+        let imp = self.imp();
+        let tx = imp.command_tx.get().unwrap().clone();
+        let spaces_only = imp.directory_spaces_only.get();
+
+        // Derive the user's homeserver from their user ID (@user:server → server).
+        let homeserver = {
+            let uid = imp.user_id.borrow();
+            uid.splitn(2, ':').nth(1).unwrap_or("").to_string()
+        };
+
+        let dialog = adw::Dialog::builder()
+            .title(title)
+            .content_width(420)
+            .content_height(540)
+            .build();
+
+        let toolbar = adw::ToolbarView::new();
+        let header = adw::HeaderBar::new();
+
+        // Room name search entry in the header title.
+        let search_entry = gtk::SearchEntry::builder()
+            .placeholder_text("Search rooms…")
+            .hexpand(true)
+            .build();
+        header.set_title_widget(Some(&search_entry));
+        toolbar.add_top_bar(&header);
+
+        // Server entry row — lets the user browse any other homeserver.
+        let server_entry = gtk::Entry::builder()
+            .placeholder_text("homeserver (e.g. matrix.org)")
+            .text(&homeserver)
+            .hexpand(true)
+            .build();
+        let server_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(2)
+            .build();
+        let server_label = gtk::Label::builder()
+            .label("Server:")
+            .css_classes(["dim-label"])
+            .build();
+        server_row.append(&server_label);
+        server_row.append(&server_entry);
+        let server_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+
+        let list_box = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(12)
+            .build();
+
+        let content_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        content_box.append(&server_row);
+        content_box.append(&server_separator);
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&list_box)
+            .build();
+        content_box.append(&scroll);
+        toolbar.set_content(Some(&content_box));
+
+        Self::populate_directory_list(
+            &list_box,
+            rooms,
+            &tx,
+            &mut imp.directory_join_buttons.borrow_mut(),
+        );
+
+        // Shared debounce timer — cancelled and restarted by either entry changing.
+        let debounce: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+
+        let do_fetch = {
+            let tx = tx.clone();
+            let search_entry = search_entry.clone();
+            let server_entry = server_entry.clone();
+            let debounce = debounce.clone();
+            move || {
+                let tx = tx.clone();
+                let text = search_entry.text().to_string();
+                let srv = server_entry.text().to_string();
+                // Cancel any pending timer.  Only call remove() when the ID is
+                // still in the cell — the timer clears itself on fire, so if
+                // the cell is already None the timer already ran.
+                if let Some(id) = debounce.take() { id.remove(); }
+                let debounce_self = debounce.clone();
+                let id = glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(400),
+                    move || {
+                        // Clear our own ID so a future cancel doesn't call
+                        // remove() on an already-fired source.
+                        debounce_self.set(None);
+                        let term = if text.is_empty() { None } else { Some(text.clone()) };
+                        let server = if srv.is_empty() { None } else { Some(srv.clone()) };
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(MatrixCommand::BrowsePublicRooms {
+                                search_term: term,
+                                spaces_only,
+                                server,
+                            }).await;
+                        });
+                    },
+                );
+                debounce.set(Some(id));
+            }
+        };
+
+        let fetch2 = do_fetch.clone();
+        search_entry.connect_search_changed(move |_| fetch2());
+        server_entry.connect_changed(move |_| do_fetch());
 
         dialog.set_child(Some(&toolbar));
+
+        // Store references so we can update the list in-place on search responses.
+        *imp.directory_dialog.borrow_mut() = Some(dialog.clone());
+        *imp.directory_list_box.borrow_mut() = Some(list_box);
+
+        // Clear stored refs when the dialog closes.
+        let win_weak = self.downgrade();
+        dialog.connect_closed(move |_| {
+            if let Some(win) = win_weak.upgrade() {
+                *win.imp().directory_dialog.borrow_mut() = None;
+                *win.imp().directory_list_box.borrow_mut() = None;
+                win.imp().directory_join_buttons.borrow_mut().clear();
+            }
+        });
+
         dialog.present(Some(self));
     }
 
@@ -1698,6 +3339,136 @@ impl MxWindow {
             }
         }
         container.append(&info);
+
+        // Media preview toggle — walks the context chain (room → space → global).
+        {
+            container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            // Determine current override level and resolved state.
+            let registry = imp.room_list_view.imp().room_registry.borrow();
+            let room_obj = registry.get(&room_id);
+            use crate::room_context::CtxValue;
+            let room_override = room_obj.map(|o| o.ctx_no_media()).unwrap_or(CtxValue::Inherit);
+            let parent_space_id = room_obj.map(|o| o.parent_space_id()).unwrap_or_default();
+            let space_override = if !parent_space_id.is_empty() {
+                registry.get(&parent_space_id).map(|o| o.ctx_no_media()).unwrap_or(CtxValue::Inherit)
+            } else { CtxValue::Inherit };
+            drop(registry);
+
+            let resolved_no_media = match room_override {
+                CtxValue::NoMedia => true,
+                CtxValue::ShowMedia => false,
+                CtxValue::Inherit => space_override == CtxValue::NoMedia,
+            };
+
+            let source_note = match room_override {
+                CtxValue::Inherit if space_override != CtxValue::Inherit => "Inherited from space",
+                CtxValue::Inherit => "Default",
+                _ => "Room setting",
+            };
+
+            let media_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            let label_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(2)
+                .hexpand(true)
+                .build();
+            label_box.append(&gtk::Label::builder()
+                .label("Show media previews")
+                .halign(gtk::Align::Start)
+                .css_classes(["body"])
+                .build());
+            label_box.append(&gtk::Label::builder()
+                .label(source_note)
+                .halign(gtk::Align::Start)
+                .css_classes(["caption", "dim-label"])
+                .build());
+            media_row.append(&label_box);
+
+            let media_switch = gtk::Switch::builder()
+                .active(!resolved_no_media)
+                .valign(gtk::Align::Center)
+                .build();
+            let rid_toggle = room_id.clone();
+            let rl_toggle = imp.room_list_view.clone();
+            let msg_view_toggle = imp.message_view.clone();
+            media_switch.connect_state_set(move |_, show| {
+                // Toggle at the room level (user explicitly sets this room's preference).
+                use crate::room_context::CtxValue;
+                let value = if show { CtxValue::ShowMedia } else { CtxValue::NoMedia };
+                rl_toggle.set_context_override(&rid_toggle, value);
+                msg_view_toggle.set_no_media(!show);
+                glib::Propagation::Proceed
+            });
+            media_row.append(&media_switch);
+            container.append(&media_row);
+        }
+
+        // Invite button.
+        {
+            container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let invite_btn = gtk::Button::builder()
+                .label("Invite User")
+                .icon_name("list-add-symbolic")
+                .css_classes(["pill"])
+                .halign(gtk::Align::Start)
+                .build();
+            let tx = imp.command_tx.get().unwrap().clone();
+            let rid = room_id.clone();
+            let win_weak = self.downgrade();
+            invite_btn.connect_clicked(move |btn| {
+                let entry = adw::EntryRow::builder()
+                    .title("Matrix user ID")
+                    .show_apply_button(true)
+                    .build();
+                let content = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(8)
+                    .margin_top(8)
+                    .build();
+                let hint = gtk::Label::builder()
+                    .label("e.g. @user:matrix.org")
+                    .css_classes(["caption", "dim-label"])
+                    .halign(gtk::Align::Start)
+                    .build();
+                content.append(&entry);
+                content.append(&hint);
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Invite User")
+                    .extra_child(&content)
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("invite", "Invite");
+                dialog.set_response_appearance("invite", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("invite"));
+                let tx2 = tx.clone();
+                let rid2 = rid.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "invite" {
+                        let uid = entry.text().to_string();
+                        if !uid.is_empty() {
+                            let tx = tx2.clone();
+                            let room_id = rid2.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::InviteUser {
+                                    room_id,
+                                    user_id: uid,
+                                }).await;
+                            });
+                        }
+                    }
+                });
+                if let Some(w) = win_weak.upgrade() {
+                    dialog.present(Some(&w));
+                } else {
+                    dialog.present(Some(btn));
+                }
+            });
+            container.append(&invite_btn);
+        }
 
         // Members list.
         if !meta.members.is_empty() {
@@ -1883,10 +3654,10 @@ impl MxWindow {
         let dialog = adw::AboutDialog::builder()
             .application_name(crate::config::APP_NAME)
             .application_icon(crate::config::APP_ID)
-            .developer_name("Matx Contributors")
+            .developer_name("Hikyaku Contributors")
             .version("0.1.0")
             .comments("A Matrix client built with Rust and libadwaita, designed around activity awareness.")
-            .website("https://github.com/matx")
+            .website("https://gitlab.gnome.org/ramkrishna/hikyaku")
             .license_type(gtk::License::Gpl30)
             .build();
 
@@ -1898,30 +3669,6 @@ impl MxWindow {
 
         let dialog = adw::PreferencesDialog::new();
         let cfg = config::settings().clone();
-
-        // --- Rooms group ---
-        let rooms_group = adw::PreferencesGroup::builder()
-            .title("Rooms")
-            .description("How many rooms to show in the sidebar")
-            .build();
-
-        let max_dms_row = adw::SpinRow::builder()
-            .title("Max DMs")
-            .subtitle("Maximum direct messages shown")
-            .adjustment(&gtk::Adjustment::new(
-                cfg.rooms.max_dms as f64, 5.0, 500.0, 5.0, 25.0, 0.0,
-            ))
-            .build();
-        rooms_group.add(&max_dms_row);
-
-        let max_rooms_row = adw::SpinRow::builder()
-            .title("Max Rooms")
-            .subtitle("Maximum rooms shown")
-            .adjustment(&gtk::Adjustment::new(
-                cfg.rooms.max_rooms as f64, 5.0, 1000.0, 10.0, 50.0, 0.0,
-            ))
-            .build();
-        rooms_group.add(&max_rooms_row);
 
         // --- Sync group ---
         let sync_group = adw::PreferencesGroup::builder()
@@ -2028,26 +3775,45 @@ impl MxWindow {
         ));
 
         // Background tint row.
+        fn tint_subtitle(color: &str, color2: &str, opacity: f64) -> String {
+            if color.is_empty() { return "None".to_string(); }
+            let pct = (opacity * 100.0).round();
+            if color2.is_empty() {
+                format!("{color} at {pct}%")
+            } else {
+                format!("{color} → {color2} at {pct}%")
+            }
+        }
+
         let tint_row = adw::ActionRow::builder()
             .title("Background Tint")
-            .subtitle(if cfg.appearance.tint_color.is_empty() {
-                "None".to_string()
-            } else {
-                format!("{} at {}%", cfg.appearance.tint_color,
-                    (cfg.appearance.tint_opacity * 100.0).round())
-            })
+            .subtitle(tint_subtitle(
+                &cfg.appearance.tint_color,
+                &cfg.appearance.tint_color2,
+                cfg.appearance.tint_opacity,
+            ))
             .build();
 
         let color_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("Start color")
             .valign(gtk::Align::Center)
             .build();
         color_btn.set_dialog(&gtk::ColorDialog::new());
-        // Set initial color from config.
         if !cfg.appearance.tint_color.is_empty() {
-            if let Ok(true) = gtk::gdk::RGBA::parse(&cfg.appearance.tint_color).map(|c| {
+            if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.tint_color) {
                 color_btn.set_rgba(&c);
-                true
-            }) {}
+            }
+        }
+
+        let color2_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("Gradient end color (optional)")
+            .valign(gtk::Align::Center)
+            .build();
+        color2_btn.set_dialog(&gtk::ColorDialog::new());
+        if !cfg.appearance.tint_color2.is_empty() {
+            if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.tint_color2) {
+                color2_btn.set_rgba(&c);
+            }
         }
 
         let opacity_scale = gtk::Scale::builder()
@@ -2068,55 +3834,468 @@ impl MxWindow {
         clear_btn.add_css_class("flat");
 
         tint_row.add_suffix(&color_btn);
+        tint_row.add_suffix(&color2_btn);
         tint_row.add_suffix(&opacity_scale);
         tint_row.add_suffix(&clear_btn);
         appearance_group.add(&tint_row);
 
+        // Helper: read hex from a ColorDialogButton.
+        fn rgba_to_hex(btn: &gtk::ColorDialogButton) -> String {
+            let c = btn.rgba();
+            format!("#{:02x}{:02x}{:02x}",
+                (c.red() * 255.0) as u8, (c.green() * 255.0) as u8, (c.blue() * 255.0) as u8)
+        }
+
         // Wire color/opacity changes.
         let tint_row_for_color = tint_row.clone();
+        let color2_for_color = color2_btn.clone();
         let scale_for_color = opacity_scale.clone();
         color_btn.connect_rgba_notify(move |btn| {
-            let rgba = btn.rgba();
-            let hex = format!("#{:02x}{:02x}{:02x}",
-                (rgba.red() * 255.0) as u8,
-                (rgba.green() * 255.0) as u8,
-                (rgba.blue() * 255.0) as u8,
-            );
+            let hex = rgba_to_hex(btn);
+            let hex2 = rgba_to_hex(&color2_for_color);
             let opacity = scale_for_color.value() / 100.0;
             let mut new_cfg = config::settings().clone();
             new_cfg.appearance.tint_color = hex.clone();
+            new_cfg.appearance.tint_color2 = hex2.clone();
             new_cfg.appearance.tint_opacity = opacity;
             apply_tint_css(&new_cfg.appearance);
             let _ = config::save_settings(&new_cfg);
-            tint_row_for_color.set_subtitle(&format!("{hex} at {}%", (opacity * 100.0).round()));
+            tint_row_for_color.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
         });
 
-        let tint_row_for_scale = tint_row.clone();
-        let color_btn_for_scale = color_btn.clone();
-        opacity_scale.connect_value_changed(move |scale| {
-            let rgba = color_btn_for_scale.rgba();
-            let hex = format!("#{:02x}{:02x}{:02x}",
-                (rgba.red() * 255.0) as u8,
-                (rgba.green() * 255.0) as u8,
-                (rgba.blue() * 255.0) as u8,
-            );
-            let opacity = scale.value() / 100.0;
+        let tint_row_for_color2 = tint_row.clone();
+        let color_for_color2 = color_btn.clone();
+        let scale_for_color2 = opacity_scale.clone();
+        color2_btn.connect_rgba_notify(move |btn| {
+            let hex = rgba_to_hex(&color_for_color2);
+            let hex2 = rgba_to_hex(btn);
+            let opacity = scale_for_color2.value() / 100.0;
             let mut new_cfg = config::settings().clone();
             new_cfg.appearance.tint_color = hex.clone();
+            new_cfg.appearance.tint_color2 = hex2.clone();
             new_cfg.appearance.tint_opacity = opacity;
             apply_tint_css(&new_cfg.appearance);
             let _ = config::save_settings(&new_cfg);
-            tint_row_for_scale.set_subtitle(&format!("{hex} at {}%", (opacity * 100.0).round()));
+            tint_row_for_color2.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
+        });
+
+        // Debounce opacity changes: rapid slider drags crash GTK's CSS engine
+        // if load_from_string fires on every tick. Apply after 120ms idle.
+        let tint_row_for_scale = tint_row.clone();
+        let color_btn_for_scale = color_btn.clone();
+        let color2_btn_for_scale = color2_btn.clone();
+        let pending_scale: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        opacity_scale.connect_value_changed(move |scale| {
+            let hex = rgba_to_hex(&color_btn_for_scale);
+            let hex2 = rgba_to_hex(&color2_btn_for_scale);
+            let opacity = scale.value() / 100.0;
+            tint_row_for_scale.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
+            if let Some(id) = pending_scale.take() { id.remove(); }
+            let pending = pending_scale.clone();
+            let id = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(120),
+                move || {
+                    pending.set(None);
+                    let mut new_cfg = config::settings().clone();
+                    new_cfg.appearance.tint_color = hex.clone();
+                    new_cfg.appearance.tint_color2 = hex2.clone();
+                    new_cfg.appearance.tint_opacity = opacity;
+                    apply_tint_css(&new_cfg.appearance);
+                    let _ = config::save_settings(&new_cfg);
+                },
+            );
+            pending_scale.set(Some(id));
         });
 
         let tint_row_for_clear = tint_row.clone();
         clear_btn.connect_clicked(move |_| {
             let mut new_cfg = config::settings().clone();
             new_cfg.appearance.tint_color = String::new();
+            new_cfg.appearance.tint_color2 = String::new();
             new_cfg.appearance.tint_opacity = 0.05;
             apply_tint_css(&new_cfg.appearance);
             let _ = config::save_settings(&new_cfg);
             tint_row_for_clear.set_subtitle("None");
+        });
+
+        // Sidebar tint row.
+        let sidebar_tint_row = adw::ActionRow::builder()
+            .title("Sidebar Tint")
+            .subtitle(tint_subtitle(
+                &cfg.appearance.sidebar_tint_color,
+                &cfg.appearance.sidebar_tint_color2,
+                cfg.appearance.sidebar_tint_opacity,
+            ))
+            .build();
+
+        let sidebar_color_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("Start color")
+            .valign(gtk::Align::Center)
+            .build();
+        sidebar_color_btn.set_dialog(&gtk::ColorDialog::new());
+        if !cfg.appearance.sidebar_tint_color.is_empty() {
+            if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.sidebar_tint_color) {
+                sidebar_color_btn.set_rgba(&c);
+            }
+        }
+
+        let sidebar_color2_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("Gradient end color (optional)")
+            .valign(gtk::Align::Center)
+            .build();
+        sidebar_color2_btn.set_dialog(&gtk::ColorDialog::new());
+        if !cfg.appearance.sidebar_tint_color2.is_empty() {
+            if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.sidebar_tint_color2) {
+                sidebar_color2_btn.set_rgba(&c);
+            }
+        }
+
+        let sidebar_opacity_scale = gtk::Scale::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .adjustment(&gtk::Adjustment::new(
+                cfg.appearance.sidebar_tint_opacity * 100.0, 0.0, 50.0, 1.0, 5.0, 0.0,
+            ))
+            .width_request(120)
+            .valign(gtk::Align::Center)
+            .draw_value(false)
+            .build();
+
+        let sidebar_clear_btn = gtk::Button::builder()
+            .icon_name("edit-clear-symbolic")
+            .tooltip_text("Remove sidebar tint")
+            .valign(gtk::Align::Center)
+            .build();
+        sidebar_clear_btn.add_css_class("flat");
+
+        sidebar_tint_row.add_suffix(&sidebar_color_btn);
+        sidebar_tint_row.add_suffix(&sidebar_color2_btn);
+        sidebar_tint_row.add_suffix(&sidebar_opacity_scale);
+        sidebar_tint_row.add_suffix(&sidebar_clear_btn);
+        appearance_group.add(&sidebar_tint_row);
+
+        let sidebar_tint_row_for_color = sidebar_tint_row.clone();
+        let sidebar_color2_for_color = sidebar_color2_btn.clone();
+        let sidebar_scale_for_color = sidebar_opacity_scale.clone();
+        sidebar_color_btn.connect_rgba_notify(move |btn| {
+            let hex = rgba_to_hex(btn);
+            let hex2 = rgba_to_hex(&sidebar_color2_for_color);
+            let opacity = sidebar_scale_for_color.value() / 100.0;
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.sidebar_tint_color = hex.clone();
+            new_cfg.appearance.sidebar_tint_color2 = hex2.clone();
+            new_cfg.appearance.sidebar_tint_opacity = opacity;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            sidebar_tint_row_for_color.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
+        });
+
+        let sidebar_tint_row_for_color2 = sidebar_tint_row.clone();
+        let sidebar_color_for_color2 = sidebar_color_btn.clone();
+        let sidebar_scale_for_color2 = sidebar_opacity_scale.clone();
+        sidebar_color2_btn.connect_rgba_notify(move |btn| {
+            let hex = rgba_to_hex(&sidebar_color_for_color2);
+            let hex2 = rgba_to_hex(btn);
+            let opacity = sidebar_scale_for_color2.value() / 100.0;
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.sidebar_tint_color = hex.clone();
+            new_cfg.appearance.sidebar_tint_color2 = hex2.clone();
+            new_cfg.appearance.sidebar_tint_opacity = opacity;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            sidebar_tint_row_for_color2.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
+        });
+
+        let sidebar_tint_row_for_scale = sidebar_tint_row.clone();
+        let sidebar_color_btn_for_scale = sidebar_color_btn.clone();
+        let sidebar_color2_btn_for_scale = sidebar_color2_btn.clone();
+        let pending_sidebar: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        sidebar_opacity_scale.connect_value_changed(move |scale| {
+            let hex = rgba_to_hex(&sidebar_color_btn_for_scale);
+            let hex2 = rgba_to_hex(&sidebar_color2_btn_for_scale);
+            let opacity = scale.value() / 100.0;
+            sidebar_tint_row_for_scale.set_subtitle(&tint_subtitle(&hex, &hex2, opacity));
+            if let Some(id) = pending_sidebar.take() { id.remove(); }
+            let pending = pending_sidebar.clone();
+            let id = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(120),
+                move || {
+                    pending.set(None);
+                    let mut new_cfg = config::settings().clone();
+                    new_cfg.appearance.sidebar_tint_color = hex.clone();
+                    new_cfg.appearance.sidebar_tint_color2 = hex2.clone();
+                    new_cfg.appearance.sidebar_tint_opacity = opacity;
+                    apply_tint_css(&new_cfg.appearance);
+                    let _ = config::save_settings(&new_cfg);
+                },
+            );
+            pending_sidebar.set(Some(id));
+        });
+
+        let sidebar_tint_row_for_clear = sidebar_tint_row.clone();
+        sidebar_clear_btn.connect_clicked(move |_| {
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.sidebar_tint_color = String::new();
+            new_cfg.appearance.sidebar_tint_color2 = String::new();
+            new_cfg.appearance.sidebar_tint_opacity = 0.05;
+            apply_tint_css(&new_cfg.appearance);
+            let _ = config::save_settings(&new_cfg);
+            sidebar_tint_row_for_clear.set_subtitle("None");
+        });
+
+        // Nick colorize toggle.
+        let nick_row = adw::SwitchRow::builder()
+            .title("Colorize Sender Names")
+            .subtitle("Assign a consistent color to each person's name")
+            .active(cfg.appearance.colorize_nicks)
+            .build();
+        appearance_group.add(&nick_row);
+        nick_row.connect_active_notify(move |row| {
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.colorize_nicks = row.is_active();
+            let _ = config::save_settings(&new_cfg);
+        });
+
+        // Bookmark highlight color row.
+        let bm_row = adw::ActionRow::builder()
+            .title("Bookmark Highlight Color")
+            .subtitle("Left-border tint for bookmarked messages")
+            .build();
+        let bm_color_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("Highlight color")
+            .valign(gtk::Align::Center)
+            .build();
+        bm_color_btn.set_dialog(&gtk::ColorDialog::new());
+        if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.bookmark_highlight_color) {
+            bm_color_btn.set_rgba(&c);
+        }
+        bm_row.add_suffix(&bm_color_btn);
+        appearance_group.add(&bm_row);
+        bm_color_btn.connect_rgba_notify(move |btn| {
+            let c = btn.rgba();
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (c.red() * 255.0) as u8, (c.green() * 255.0) as u8, (c.blue() * 255.0) as u8);
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.bookmark_highlight_color = hex.clone();
+            apply_bookmark_css(&hex);
+            let _ = config::save_settings(&new_cfg);
+        });
+
+        // New message highlight color row.
+        let nm_row = adw::ActionRow::builder()
+            .title("New Message Highlight Color")
+            .subtitle("Background tint for unread messages")
+            .build();
+        let nm_color_btn = gtk::ColorDialogButton::builder()
+            .tooltip_text("New message color")
+            .valign(gtk::Align::Center)
+            .build();
+        nm_color_btn.set_dialog(&gtk::ColorDialog::new());
+        if let Ok(c) = gtk::gdk::RGBA::parse(&cfg.appearance.new_message_highlight_color) {
+            nm_color_btn.set_rgba(&c);
+        }
+        nm_row.add_suffix(&nm_color_btn);
+        appearance_group.add(&nm_row);
+        nm_color_btn.connect_rgba_notify(move |btn| {
+            let c = btn.rgba();
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (c.red() * 255.0) as u8, (c.green() * 255.0) as u8, (c.blue() * 255.0) as u8);
+            let mut new_cfg = config::settings().clone();
+            new_cfg.appearance.new_message_highlight_color = hex.clone();
+            apply_new_message_css(&hex);
+            let _ = config::save_settings(&new_cfg);
+        });
+
+        // --- AI group ---
+        let ai_group = adw::PreferencesGroup::builder()
+            .title("AI (Ollama)")
+            .description("Local LLM for room metrics summaries. No data leaves the machine.")
+            .build();
+
+        // Status row — probed asynchronously when the dialog opens.
+        let status_row = adw::ActionRow::builder()
+            .title("Status")
+            .subtitle("Checking…")
+            .build();
+        let spinner = gtk::Spinner::builder().spinning(true).build();
+        status_row.add_suffix(&spinner);
+        ai_group.add(&status_row);
+
+        let endpoint_row = adw::EntryRow::builder()
+            .title("Endpoint")
+            .text(&cfg.ollama.endpoint)
+            .build();
+        let model_row = adw::EntryRow::builder()
+            .title("Model  (e.g. qwen2.5:3b)")
+            .text(&cfg.ollama.model)
+            .build();
+
+        // Pull button — downloads the configured model via Ollama's /api/pull.
+        let pull_btn = gtk::Button::builder()
+            .label("Pull Model")
+            .valign(gtk::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        model_row.add_suffix(&pull_btn);
+
+        let ollama_enabled_row = adw::SwitchRow::builder()
+            .title("Enable AI Summaries")
+            .subtitle("Ctrl+click a room to get a topic summary")
+            .active(cfg.ollama.enabled)
+            .build();
+        ai_group.add(&ollama_enabled_row);
+
+        ai_group.add(&endpoint_row);
+        ai_group.add(&model_row);
+
+        let extra_row = adw::EntryRow::builder()
+            .title("Extra Instructions")
+            .text(&cfg.ollama.room_preview_extra)
+            .show_apply_button(true)
+            .build();
+        extra_row.set_tooltip_text(Some(
+            "Appended to the summary prompt, e.g. \"Name the active participants. Describe the mood.\""
+        ));
+        ai_group.add(&extra_row);
+
+        // Probe Ollama status asynchronously and update the status row.
+        {
+            let status_row = status_row.clone();
+            let spinner = spinner.clone();
+            let endpoint = cfg.ollama.endpoint.clone();
+            glib::spawn_future_local(async move {
+                use crate::intelligence::ollama_manager::{detect, OllamaStatus};
+                let st = detect(&endpoint).await;
+                spinner.set_spinning(false);
+                spinner.set_visible(false);
+                let (subtitle, icon) = match &st {
+                    OllamaStatus::Running { .. } => (st.label(), "emblem-ok-symbolic"),
+                    OllamaStatus::Found { .. }   => (st.label(), "dialog-warning-symbolic"),
+                    _                             => (st.label(), "dialog-error-symbolic"),
+                };
+                status_row.set_subtitle(&subtitle);
+                let img = gtk::Image::from_icon_name(icon);
+                status_row.add_suffix(&img);
+            });
+        }
+
+        // Re-probe when endpoint changes.
+        {
+            let status_row = status_row.clone();
+            endpoint_row.connect_changed(move |row| {
+                let mut new_cfg = config::settings().clone();
+                new_cfg.ollama.endpoint = row.text().to_string();
+                let _ = config::save_settings(&new_cfg);
+                // Reset status — will re-probe on next dialog open.
+                status_row.set_subtitle("Changed — reopen Preferences to check");
+            });
+        }
+        model_row.connect_changed(move |row: &adw::EntryRow| {
+            let mut new_cfg = config::settings().clone();
+            new_cfg.ollama.model = row.text().to_string();
+            let _ = config::save_settings(&new_cfg);
+        });
+
+        // Pull model button — uses Ollama's own /api/pull with live progress.
+        {
+            let model_row_for_pull = model_row.clone();
+            let pull_btn_clone = pull_btn.clone();
+            pull_btn.connect_clicked(move |_| {
+                let model = model_row_for_pull.text().to_string();
+                let endpoint = config::settings().ollama.endpoint.clone();
+                if model.is_empty() || endpoint.is_empty() { return; }
+                pull_btn_clone.set_label("0%");
+                pull_btn_clone.set_sensitive(false);
+                let btn = pull_btn_clone.clone();
+                let provider = gtk::CssProvider::new();
+                btn.style_context().add_provider(
+                    &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION
+                );
+                glib::spawn_future_local(async move {
+                    let btn_prog = btn.clone();
+                    let prov_prog = provider.clone();
+                    let result = crate::intelligence::pull_model(
+                        &endpoint, &model,
+                        move |p| {
+                            let pct = (p * 100.0) as u32;
+                            btn_prog.set_label(&format!("{pct}%"));
+                            prov_prog.load_from_data(&format!(
+                                "button {{ background: linear-gradient(\
+                                    to right,\
+                                    alpha(@accent_bg_color,0.4) {pct}%,\
+                                    alpha(@accent_bg_color,0.1) {pct}%\
+                                ); }}"
+                            ));
+                        }
+                    ).await;
+                    // Clear the progress background.
+                    provider.load_from_data("button {}");
+                    match result {
+                        Ok(()) => btn.set_label("Done ✓"),
+                        Err(e) => {
+                            tracing::warn!("Model pull failed: {e}");
+                            btn.set_label("Failed");
+                        }
+                    }
+                    btn.set_sensitive(true);
+                });
+            });
+        }
+
+        let window_weak_ai = self.downgrade();
+        ollama_enabled_row.connect_active_notify(move |row| {
+            if row.is_active() {
+                // Warn the user before enabling — AI uses significant RAM.
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Enable AI Summaries?")
+                    .body(
+                        "AI summaries use a local language model via Ollama.\n\n\
+                         ⚠ AI responses can be inaccurate or misleading — \
+                         always verify important information yourself.\n\n\
+                         Loading the model requires several GB of RAM and may \
+                         temporarily slow your machine on first use. The model \
+                         stays loaded for 15 minutes after last use. Smaller \
+                         models (e.g. llama3.2:1b, qwen2.5:0.5b) load much \
+                         faster and use less memory.\n\n\
+                         Make sure Ollama is installed and the model is \
+                         downloaded before enabling this feature."
+                    )
+                    .close_response("cancel")
+                    .default_response("enable")
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("enable", "Enable");
+                dialog.set_response_appearance(
+                    "enable",
+                    adw::ResponseAppearance::Suggested,
+                );
+                let row_weak = row.downgrade();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "enable" {
+                        let mut new_cfg = config::settings().clone();
+                        new_cfg.ollama.enabled = true;
+                        let _ = config::save_settings(&new_cfg);
+                    } else {
+                        // User cancelled — revert the switch without re-triggering.
+                        if let Some(r) = row_weak.upgrade() {
+                            r.set_active(false);
+                        }
+                    }
+                });
+                if let Some(win) = window_weak_ai.upgrade() {
+                    dialog.present(Some(&win));
+                }
+            } else {
+                let mut new_cfg = config::settings().clone();
+                new_cfg.ollama.enabled = false;
+                let _ = config::save_settings(&new_cfg);
+            }
+        });
+        extra_row.connect_apply(|row| {
+            let mut new_cfg = config::settings().clone();
+            new_cfg.ollama.room_preview_extra = row.text().to_string();
+            let _ = config::save_settings(&new_cfg);
         });
 
         // --- Info group ---
@@ -2126,31 +4305,307 @@ impl MxWindow {
 
         let config_path_row = adw::ActionRow::builder()
             .title("Config File")
-            .subtitle("~/.config/matx/config.toml")
+            .subtitle("GSettings (dconf) · me.ramkrishna.hikyaku")
             .build();
         info_group.add(&config_path_row);
+
+        // --- Account group ---
+        let account_group = adw::PreferencesGroup::builder()
+            .title("Account")
+            .build();
+
+        let logout_row = adw::ActionRow::builder()
+            .title("Log Out")
+            .subtitle("Sign out and return to the login screen")
+            .activatable(true)
+            .build();
+        logout_row.add_suffix(&gtk::Image::from_icon_name("system-log-out-symbolic"));
+        let tx = self.imp().command_tx.get().unwrap().clone();
+        let dialog_weak = dialog.downgrade();
+        logout_row.connect_activated(move |_| {
+            let tx = tx.clone();
+            let dialog_weak = dialog_weak.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::Logout).await;
+                if let Some(dialog) = dialog_weak.upgrade() {
+                    dialog.close();
+                }
+            });
+        });
+        account_group.add(&logout_row);
 
         let page = adw::PreferencesPage::builder()
             .icon_name("preferences-system-symbolic")
             .title("General")
             .build();
-        page.add(&rooms_group);
         page.add(&sync_group);
         page.add(&appearance_group);
+        #[cfg(feature = "ai")]
+        page.add(&ai_group);
         page.add(&info_group);
+        page.add(&account_group);
         dialog.add(&page);
+
+        // --- Rolodex page ---
+        #[cfg(feature = "rolodex")]
+        {
+        let rolodex_page = adw::PreferencesPage::builder()
+            .icon_name("contact-new-symbolic")
+            .title("Rolodex")
+            .build();
+
+        let rolodex_group = adw::PreferencesGroup::builder()
+            .title("Contacts")
+            .description("Right-click any sender name in chat to add them. Also appear first in @ completion.")
+            .build();
+
+        // Bind a ListBox to the GObject store so it stays live.
+        let contact_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+
+        let store = self.imp().rolodex_store.clone();
+        let store_for_factory = store.clone();
+        contact_list.bind_model(Some(&store), move |obj| {
+            let store = store_for_factory.clone();
+            let entry = obj.downcast_ref::<crate::models::RolodexEntryObject>().unwrap();
+            let row = adw::ActionRow::builder()
+                .title(entry.display_name())
+                .subtitle(entry.user_id())
+                .build();
+            let remove_btn = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "circular"])
+                .tooltip_text("Remove contact")
+                .build();
+            // Bind display-name notify so the row title stays live if edited.
+            entry.bind_property("display-name", &row, "title")
+                .sync_create()
+                .build();
+            let uid = entry.user_id();
+            remove_btn.connect_clicked(move |_| {
+                if let Some(pos) = (0..store.n_items()).find(|&i| {
+                    store.item(i)
+                        .and_downcast::<crate::models::RolodexEntryObject>()
+                        .map(|o| o.user_id() == uid)
+                        .unwrap_or(false)
+                }) {
+                    store.remove(pos);
+                }
+            });
+            row.add_suffix(&remove_btn);
+            row.upcast::<gtk::Widget>()
+        });
+
+        rolodex_group.add(&contact_list);
+
+        // Manual add group.
+        let add_group = adw::PreferencesGroup::builder()
+            .title("Add Contact Manually")
+            .build();
+
+        let name_entry = adw::EntryRow::builder()
+            .title("Display Name")
+            .build();
+        let uid_entry = adw::EntryRow::builder()
+            .title("User ID  (e.g. @alice:example.com)")
+            .build();
+        let add_btn = gtk::Button::builder()
+            .label("Add")
+            .halign(gtk::Align::End)
+            .margin_top(4)
+            .css_classes(["suggested-action", "pill"])
+            .build();
+
+        let store = self.imp().rolodex_store.clone();
+        {
+            let name_entry = name_entry.clone();
+            let uid_entry = uid_entry.clone();
+            add_btn.connect_clicked(move |_| {
+                let name = name_entry.text().trim().to_string();
+                let uid = uid_entry.text().trim().to_string();
+                if name.is_empty() || uid.is_empty() { return; }
+                // Deduplicate.
+                let exists = (0..store.n_items()).any(|i| {
+                    store.item(i)
+                        .and_downcast::<crate::models::RolodexEntryObject>()
+                        .map(|o| o.user_id() == uid)
+                        .unwrap_or(false)
+                });
+                if exists { return; }
+                let added_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                store.append(&crate::models::RolodexEntryObject::new(
+                    &uid, &name, "", added_at,
+                ));
+                // items-changed → save JSON + GSettings automatically.
+                name_entry.set_text("");
+                uid_entry.set_text("");
+            });
+        }
+
+        add_group.add(&name_entry);
+        add_group.add(&uid_entry);
+        add_group.add(&add_btn);
+
+        rolodex_page.add(&rolodex_group);
+        rolodex_page.add(&add_group);
+        dialog.add(&rolodex_page);
+        } // #[cfg(feature = "rolodex")]
+
+        // --- Plugins page ---
+        let plugins_page = adw::PreferencesPage::builder()
+            .icon_name("application-x-addon-symbolic")
+            .title("Plugins")
+            .build();
+
+        let plugins_group = adw::PreferencesGroup::builder()
+            .title("Installed Plugins")
+            .description("Enable or disable optional features. Changes take effect immediately.")
+            .build();
+
+        // AI plugin — reuses the existing ollama-enabled setting.
+        #[cfg(feature = "ai")]
+        {
+            let ai_switch = adw::SwitchRow::builder()
+                .title("AI Summaries")
+                .subtitle("Ctrl+click a room for an Ollama-powered summary (no data leaves your machine)")
+                .active(cfg.ollama.enabled)
+                .build();
+            plugins_group.add(&ai_switch);
+            ai_switch.connect_active_notify(|sw| {
+                let gs = crate::config::gsettings();
+                let _ = gs.set_boolean("ollama-enabled", sw.is_active());
+            });
+        }
+
+        // Rolodex plugin.
+        #[cfg(feature = "rolodex")]
+        {
+            let rolodex_switch = adw::SwitchRow::builder()
+                .title("Rolodex")
+                .subtitle("Personal contact book with notes and @-completion")
+                .active(cfg.plugins.rolodex)
+                .build();
+            plugins_group.add(&rolodex_switch);
+            rolodex_switch.connect_active_notify(|sw| {
+                let gs = crate::config::gsettings();
+                let _ = gs.set_boolean("plugin-rolodex-enabled", sw.is_active());
+            });
+        }
+
+        // Pinning plugin.
+        #[cfg(feature = "pinning")]
+        {
+            let pinning_switch = adw::SwitchRow::builder()
+                .title("Message Pinning")
+                .subtitle("Bookmark messages locally to come back to later")
+                .active(cfg.plugins.pinning)
+                .build();
+            plugins_group.add(&pinning_switch);
+            pinning_switch.connect_active_notify(|sw| {
+                let gs = crate::config::gsettings();
+                let _ = gs.set_boolean("plugin-pinning-enabled", sw.is_active());
+            });
+        }
+
+        // MOTD plugin.
+        #[cfg(feature = "motd")]
+        {
+            let rl_view = self.imp().room_list_view.clone();
+            let motd_switch = adw::SwitchRow::builder()
+                .title("Topic Change Tracker")
+                .subtitle("Toast when the room topic changes; icon on rooms you haven't visited yet")
+                .active(cfg.plugins.motd)
+                .build();
+            plugins_group.add(&motd_switch);
+            motd_switch.connect_active_notify(move |sw| {
+                let gs = crate::config::gsettings();
+                let _ = gs.set_boolean("plugin-motd-enabled", sw.is_active());
+                if !sw.is_active() {
+                    rl_view.clear_all_topic_changed();
+                }
+            });
+        }
+
+        plugins_page.add(&plugins_group);
+        dialog.add(&plugins_page);
+
+        // --- Watch page ---
+        #[cfg(feature = "ai")]
+        {
+        let watch_page = adw::PreferencesPage::builder()
+            .icon_name("view-reveal-symbolic")
+            .title("Watch")
+            .build();
+
+        let watch_group = adw::PreferencesGroup::builder()
+            .title("Room Interest Watcher")
+            .description("Get notified when messages semantically match your keywords (CPU ONNX)")
+            .build();
+
+        let watch_enabled_row = adw::SwitchRow::builder()
+            .title("Enable Watcher")
+            .subtitle("Alert when a watched term matches a recent message")
+            .active(cfg.watch.enabled)
+            .build();
+        watch_group.add(&watch_enabled_row);
+
+        let watch_terms_row = adw::EntryRow::builder()
+            .title("Terms (comma-separated)")
+            .text(&cfg.watch.terms.join(", "))
+            .show_apply_button(true)
+            .build();
+        watch_terms_row.set_tooltip_text(Some(
+            "E.g. \"urgent deploy, security incident, budget approval\""
+        ));
+        watch_group.add(&watch_terms_row);
+
+        let watch_threshold_row = adw::SpinRow::builder()
+            .title("Similarity Threshold")
+            .subtitle("Cosine similarity required for a match (0.0–1.0, default 0.65)")
+            .adjustment(&gtk::Adjustment::new(
+                cfg.watch.threshold, 0.1, 1.0, 0.05, 0.1, 0.0,
+            ))
+            .digits(2)
+            .build();
+        watch_group.add(&watch_threshold_row);
+
+        watch_enabled_row.connect_active_notify(|row| {
+            let gs = crate::config::gsettings();
+            let _ = gs.set_boolean("watch-enabled", row.is_active());
+        });
+        watch_terms_row.connect_apply(|row| {
+            let gs = crate::config::gsettings();
+            let raw = row.text().to_string();
+            let terms: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            let _ = gs.set_strv("watch-terms", refs.as_slice());
+        });
+        watch_threshold_row.connect_value_notify(|row| {
+            let gs = crate::config::gsettings();
+            let _ = gs.set_double("watch-threshold", row.value());
+        });
+
+        watch_page.add(&watch_group);
+        dialog.add(&watch_page);
+        } // #[cfg(feature = "ai")]
 
         // Save when values change (font is saved directly from the FontDialog callback).
         let save = {
-            let max_dms_row = max_dms_row.clone();
-            let max_rooms_row = max_rooms_row.clone();
             let timeline_row = timeline_row.clone();
             let timeout_row = timeout_row.clone();
             let cfg = cfg.clone();
             move || {
                 let mut new_cfg = cfg.clone();
-                new_cfg.rooms.max_dms = max_dms_row.value() as usize;
-                new_cfg.rooms.max_rooms = max_rooms_row.value() as usize;
                 new_cfg.sync.timeline_limit = timeline_row.value() as u32;
                 new_cfg.sync.timeout_secs = timeout_row.value() as u64;
                 if let Err(e) = config::save_settings(&new_cfg) {
@@ -2160,14 +4615,457 @@ impl MxWindow {
         };
 
         let s = save.clone();
-        max_dms_row.connect_value_notify(move |_| s());
-        let s = save.clone();
-        max_rooms_row.connect_value_notify(move |_| s());
-        let s = save.clone();
         timeline_row.connect_value_notify(move |_| s());
         let s = save.clone();
         timeout_row.connect_value_notify(move |_| s());
 
         dialog.present(Some(self));
     }
+}
+
+/// Show the GNOME-standard keyboard shortcuts window (Ctrl+?).
+/// Built programmatically using gtk::ShortcutsWindow / Section / Group / Shortcut.
+/// First-run AI setup dialog shown once after login.
+/// Lets the user pick and pull a recommended Ollama model.
+/// Marks setup_done=true on skip or after a successful pull.
+fn show_ai_setup_dialog(window: &MxWindow) {
+    use crate::intelligence::ollama_manager;
+
+    let dialog = adw::Dialog::builder()
+        .title("Set Up AI Summaries")
+        .content_width(420)
+        .build();
+
+    let toolbar = adw::ToolbarView::new();
+    dialog.set_child(Some(&toolbar));
+
+    let header = adw::HeaderBar::new();
+    toolbar.add_top_bar(&header);
+
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(12)
+        .margin_bottom(24)
+        .build();
+    toolbar.set_content(Some(&vbox));
+
+    // Description.
+    let desc = gtk::Label::builder()
+        .label("Hikyaku can use a local AI model to summarize room activity. \
+                No data leaves your machine. Choose a model to download via Ollama, \
+                or skip to configure later in Preferences.")
+        .wrap(true)
+        .halign(gtk::Align::Start)
+        .css_classes(["body"])
+        .build();
+    vbox.append(&desc);
+
+    // Ollama status row.
+    let status_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    let status_icon = gtk::Image::from_icon_name("emblem-synchronizing-symbolic");
+    let status_label = gtk::Label::builder()
+        .label("Checking for Ollama…")
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    status_box.append(&status_icon);
+    status_box.append(&status_label);
+    vbox.append(&status_box);
+
+    // Model choices — displayed as a list of radio-style ActionRows.
+    // (name, tag, description)
+    let models: &[(&str, &str, &str)] = &[
+        ("Qwen 2.5 1.5B",    "qwen2.5:1.5b",    "Recommended · ~1 GB · fast, multilingual"),
+        ("DeepSeek-R1 1.5B", "deepseek-r1:1.5b", "Reasoning distillation · ~1 GB"),
+        ("MiniCPM 3",        "minicpm3",          "Efficient · ~2.5 GB · strong for its size"),
+    ];
+
+    let model_group = adw::PreferencesGroup::new();
+    vbox.append(&model_group);
+
+    // Track selected model tag.
+    let selected_model = std::rc::Rc::new(std::cell::RefCell::new("qwen2.5:1.5b".to_string()));
+
+    // Build a checkmark toggle for each model row.
+    let checks: Vec<gtk::Image> = models.iter().enumerate().map(|(i, (name, tag, desc))| {
+        let row = adw::ActionRow::builder()
+            .title(*name)
+            .subtitle(*desc)
+            .activatable(true)
+            .build();
+        let check = gtk::Image::builder()
+            .icon_name(if i == 0 { "emblem-ok-symbolic" } else { "" })
+            .build();
+        row.add_suffix(&check);
+        model_group.add(&row);
+
+        let sel = selected_model.clone();
+        let tag_str = tag.to_string();
+        row.connect_activated(move |_| {
+            *sel.borrow_mut() = tag_str.clone();
+        });
+        check
+    }).collect();
+
+    // Update checkmarks when selection changes.
+    {
+        let checks = checks.clone();
+        let sel = selected_model.clone();
+        // Wire activated signal to update all checkmarks.
+        for (i, (_name, tag, _desc)) in models.iter().enumerate() {
+            let checks_inner = checks.clone();
+            let tag_str = tag.to_string();
+            let sel_inner = sel.clone();
+            // Re-read sel after activate to refresh checkmarks.
+            // Connect a second time for the visual update.
+            let rows: Vec<adw::ActionRow> = model_group
+                .observe_children()
+                .into_iter()
+                .filter_map(|o| o.ok()?.downcast::<adw::ActionRow>().ok())
+                .collect();
+            if let Some(row) = rows.get(i) {
+                row.connect_activated(move |_| {
+                    let current = sel_inner.borrow().clone();
+                    for (j, c) in checks_inner.iter().enumerate() {
+                        c.set_icon_name(
+                            if models[j].1 == current { Some("emblem-ok-symbolic") } else { None }
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    // Progress label + bar (hidden until pull starts).
+    let progress_bar = gtk::ProgressBar::builder()
+        .visible(false)
+        .show_text(true)
+        .build();
+    let progress_label = gtk::Label::builder()
+        .label("")
+        .visible(false)
+        .css_classes(["caption"])
+        .halign(gtk::Align::Start)
+        .build();
+    vbox.append(&progress_label);
+    vbox.append(&progress_bar);
+
+    // Button row.
+    let btn_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    vbox.append(&btn_row);
+
+    let skip_btn = gtk::Button::builder()
+        .label("Skip")
+        .css_classes(["flat"])
+        .build();
+    let pull_btn = gtk::Button::builder()
+        .label("Download & Use")
+        .css_classes(["suggested-action", "pill"])
+        .build();
+    btn_row.append(&skip_btn);
+    btn_row.append(&pull_btn);
+
+    // Skip → mark done, close.
+    {
+        let dialog = dialog.clone();
+        skip_btn.connect_clicked(move |_| {
+            let mut cfg = crate::config::settings().clone();
+            cfg.ollama.setup_done = true;
+            let _ = crate::config::save_settings(&cfg);
+            dialog.close();
+        });
+    }
+
+    // Pull → download model via Ollama API, then mark done.
+    {
+        let dialog = dialog.clone();
+        let selected = selected_model.clone();
+        let progress_bar = progress_bar.clone();
+        let progress_label = progress_label.clone();
+        let pull_btn_clone = pull_btn.clone();
+        let skip_btn = skip_btn.clone();
+        pull_btn.connect_clicked(move |_| {
+            let model = selected.borrow().clone();
+            let endpoint = crate::config::settings().ollama.endpoint.clone();
+
+            pull_btn_clone.set_sensitive(false);
+            skip_btn.set_sensitive(false);
+            pull_btn_clone.set_label("Downloading…");
+            progress_bar.set_visible(true);
+            progress_label.set_visible(true);
+            progress_label.set_label(&format!("Pulling {model} via Ollama…"));
+            progress_bar.pulse();
+
+            let progress_bar_inner = progress_bar.clone();
+            let progress_label_inner = progress_label.clone();
+            let pull_btn_inner = pull_btn_clone.clone();
+            let dialog_inner = dialog.clone();
+            let model_clone = model.clone();
+
+            glib::spawn_future_local(async move {
+                match ollama_manager::ensure_running(&endpoint).await {
+                    None => {
+                        progress_label_inner.set_label(
+                            "Ollama is not running. Install Ollama first."
+                        );
+                        pull_btn_inner.set_label("Download & Use");
+                        pull_btn_inner.set_sensitive(true);
+                        progress_bar_inner.set_visible(false);
+                    }
+                    Some(ep) => {
+                        let bar = progress_bar_inner.clone();
+                        let lbl = progress_label_inner.clone();
+                        let btn_p = pull_btn_inner.clone();
+                        let model_p = model_clone.clone();
+                        match crate::intelligence::pull_model(
+                            &ep, &model_clone,
+                            move |p| {
+                                bar.set_fraction(p);
+                                let pct = (p * 100.0) as u32;
+                                lbl.set_label(&format!("Pulling {model_p}… {pct}%"));
+                                btn_p.set_label(&format!("{pct}%"));
+                            }
+                        ).await {
+                            Ok(()) => {
+                                let mut cfg = crate::config::settings().clone();
+                                cfg.ollama.model = model.clone();
+                                cfg.ollama.setup_done = true;
+                                let _ = crate::config::save_settings(&cfg);
+                                progress_label_inner.set_label(&format!("✓ {model} is ready"));
+                                progress_bar_inner.set_fraction(1.0);
+                                pull_btn_inner.set_label("Done");
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_secs(1),
+                                    move || { dialog_inner.close(); },
+                                );
+                            }
+                            Err(e) => {
+                                progress_label_inner.set_label(&format!("Pull failed: {e}"));
+                                pull_btn_inner.set_label("Download & Use");
+                                pull_btn_inner.set_sensitive(true);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    // Probe Ollama in background and update the status row.
+    {
+        use ollama_manager::OllamaStatus;
+        let endpoint = crate::config::settings().ollama.endpoint.clone();
+        glib::spawn_future_local(async move {
+            match ollama_manager::detect(&endpoint).await {
+                OllamaStatus::Running { .. } => {
+                    status_icon.set_icon_name(Some("emblem-ok-symbolic"));
+                    status_label.set_label("Ollama is running");
+                }
+                OllamaStatus::Found { ref path } => {
+                    status_icon.set_icon_name(Some("dialog-warning-symbolic"));
+                    status_label.set_label(&format!(
+                        "Ollama found at {} (will start on demand)", path.display()
+                    ));
+                }
+                OllamaStatus::NeedDownload => {
+                    status_icon.set_icon_name(Some("dialog-error-symbolic"));
+                    status_label.set_label("Ollama not found — install it first");
+                    pull_btn.set_sensitive(false);
+                }
+                OllamaStatus::NotAvailable => {
+                    status_icon.set_icon_name(Some("dialog-error-symbolic"));
+                    status_label.set_label("Ollama not found — install from ollama.com");
+                    pull_btn.set_sensitive(false);
+                }
+            }
+        });
+    }
+
+    dialog.present(Some(window));
+}
+
+fn show_shortcuts_window(window: &MxWindow) {
+    let shortcuts_window = gtk::ShortcutsWindow::builder()
+        .transient_for(window)
+        .modal(true)
+        .build();
+
+    // The ShortcutsWindow requires at least one ShortcutsSection.
+    let section = gtk::ShortcutsSection::builder()
+        .title("Hikyaku")
+        .section_name("main")
+        .build();
+    shortcuts_window.add_section(&section);
+
+    // --- Navigation group ---
+    let nav_group = gtk::ShortcutsGroup::builder()
+        .title("Navigation")
+        .build();
+    section.add_group(&nav_group);
+
+    for (accel, title) in [
+        ("<Alt>Up",   "Previous room"),
+        ("<Alt>Down", "Next room"),
+    ] {
+        nav_group.add_shortcut(&gtk::ShortcutsShortcut::builder()
+            .accelerator(accel)
+            .title(title)
+            .build());
+    }
+
+    // --- Messaging group ---
+    let msg_group = gtk::ShortcutsGroup::builder()
+        .title("Messaging")
+        .build();
+    section.add_group(&msg_group);
+
+    for (accel, title) in [
+        ("Return",        "Send message"),
+        ("Tab",           "Complete @mention"),
+    ] {
+        msg_group.add_shortcut(&gtk::ShortcutsShortcut::builder()
+            .accelerator(accel)
+            .title(title)
+            .build());
+    }
+
+    // --- Application group ---
+    let app_group = gtk::ShortcutsGroup::builder()
+        .title("Application")
+        .build();
+    section.add_group(&app_group);
+
+    for (accel, title) in [
+        ("<Control>comma",    "Preferences"),
+        ("<Control><Shift>j", "Join a room"),
+        ("<Control>question", "Keyboard shortcuts"),
+    ] {
+        app_group.add_shortcut(&gtk::ShortcutsShortcut::builder()
+            .accelerator(accel)
+            .title(title)
+            .build());
+    }
+
+    shortcuts_window.present();
+}
+
+/// Show a file picker + passphrase dialog to import E2E session keys
+/// exported from Element (or any Matrix client using the standard format).
+async fn show_import_keys_dialog(window: &MxWindow, command_tx: async_channel::Sender<MatrixCommand>) {
+    // File picker.
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Key files (*.txt)"));
+    filter.add_pattern("*.txt");
+    filter.add_pattern("*.key");
+
+    let file_dialog = gtk::FileDialog::builder()
+        .title("Select exported key file")
+        .default_filter(&filter)
+        .build();
+
+    let file = match file_dialog.open_future(Some(window)).await {
+        Ok(f) => f,
+        Err(_) => return, // cancelled
+    };
+
+    let path = match file.path() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Passphrase dialog.
+    let entry = gtk::PasswordEntry::builder()
+        .placeholder_text("Passphrase used when exporting")
+        .show_peek_icon(true)
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .build();
+    content.append(&gtk::Label::builder()
+        .label("Enter the passphrase you used when exporting keys from Element.")
+        .wrap(true)
+        .xalign(0.0)
+        .build());
+    content.append(&entry);
+
+    let passphrase_dialog = adw::AlertDialog::builder()
+        .heading("Import Encryption Keys")
+        .extra_child(&content)
+        .build();
+    passphrase_dialog.add_response("cancel", "Cancel");
+    passphrase_dialog.add_response("import", "Import");
+    passphrase_dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+    passphrase_dialog.set_default_response(Some("import"));
+
+    let response = passphrase_dialog.choose_future(window).await;
+    if response != "import" {
+        return;
+    }
+
+    let passphrase = entry.text().to_string();
+    if passphrase.is_empty() {
+        return;
+    }
+
+    let _ = command_tx.send(MatrixCommand::ImportRoomKeys { path, passphrase }).await;
+}
+
+fn show_export_metrics_dialog(
+    parent: &MxWindow,
+    room_id: String,
+    command_tx: async_channel::Sender<MatrixCommand>,
+) {
+    let spin = gtk::SpinButton::with_range(1.0, 365.0, 1.0);
+    spin.set_value(30.0);
+    spin.set_digits(0);
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .build();
+    content.append(&gtk::Label::builder()
+        .label("Export events from the last N days:")
+        .xalign(0.0)
+        .build());
+    content.append(&spin);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Export Room Metrics")
+        .extra_child(&content)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("export", "Export");
+    dialog.set_response_appearance("export", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("export"));
+
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "export" {
+            let days = spin.value() as u32;
+            let tx = command_tx.clone();
+            let rid = room_id.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::ExportRoomMetrics {
+                    room_id: rid,
+                    days,
+                }).await;
+            });
+        }
+    });
+
+    dialog.present(Some(parent));
 }

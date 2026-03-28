@@ -1,22 +1,35 @@
 using Gtk 4.0;
+using Adw 1;
 
 template $MxRoomRow : Gtk.Box {
   orientation: horizontal;
   spacing: 8;
-  margin-top: 6;
-  margin-bottom: 6;
+  margin-top: 4;
+  margin-bottom: 4;
   margin-start: 6;
   margin-end: 6;
 
-  Gtk.Image kind_icon {
-    icon-name: "chat-message-new-symbolic";
-    pixel-size: 20;
+  Adw.Avatar avatar {
+    size: 32;
+    show-initials: true;
   }
 
-  Gtk.Label name_label {
-    halign: start;
+  Gtk.Box name_box {
+    orientation: vertical;
     hexpand: true;
-    ellipsize: end;
+    valign: center;
+
+    Gtk.Label name_label {
+      halign: start;
+      ellipsize: end;
+    }
+
+    Gtk.Label typing_label {
+      halign: start;
+      visible: false;
+      label: "typing…";
+      styles ["caption", "dim-label", "typing-indicator"]
+    }
   }
 
   // Status icons grouped together (admin, tombstone, lock).
@@ -47,6 +60,22 @@ template $MxRoomRow : Gtk.Box {
       pixel-size: 16;
       visible: false;
       styles ["dim-label"]
+    }
+
+    Gtk.Image motd_icon {
+      icon-name: "emblem-important-symbolic";
+      pixel-size: 14;
+      visible: false;
+      tooltip-text: "Room topic has changed";
+      styles ["accent"]
+    }
+
+    Gtk.Image watch_alert_icon {
+      icon-name: "view-reveal-symbolic";
+      pixel-size: 14;
+      visible: false;
+      tooltip-text: "A watched term matched a recent message";
+      styles ["warning"]
     }
   }
 

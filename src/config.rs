@@ -1,142 +1,213 @@
+use gio::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::collections::HashSet;
 
 pub const APP_ID: &str = "me.ramkrishna.hikyaku";
 pub const APP_NAME: &str = "Hikyaku";
 
-/// User-facing settings loaded from ~/.config/matx/config.toml.
-///
-/// All fields have sensible defaults so the file is optional — Matx works
-/// out of the box. Users can create/edit the file to tune behaviour.
+const SCHEMA_ID: &str = "me.ramkrishna.hikyaku";
+
+/// User-facing settings. A plain struct for passing around; backed by GSettings/dconf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Settings {
     pub rooms: RoomSettings,
     pub sync: SyncSettings,
     pub appearance: AppearanceSettings,
+    pub ollama: OllamaSettings,
+    pub plugins: PluginsSettings,
+    pub watch: WatchSettings,
+    /// Pinned contacts for @ completion: "Display Name|@user:server" entries.
+    pub rolodex: Vec<String>,
+}
+
+/// Room interest watcher settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchSettings {
+    pub enabled: bool,
+    pub terms: Vec<String>,
+    /// Cosine similarity threshold (0.0–1.0). Default 0.65.
+    pub threshold: f64,
+}
+
+/// Runtime enable/disable for each plugin.
+/// The AI plugin reuses ollama.enabled as its toggle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginsSettings {
+    /// Whether the Rolodex contact book plugin is active.
+    pub rolodex: bool,
+    /// Whether the local message pinning plugin is active.
+    pub pinning: bool,
+    /// Whether the room topic change (MOTD) tracker is active.
+    pub motd: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+pub struct OllamaSettings {
+    pub endpoint: String,
+    pub model: String,
+    /// Whether AI summaries are enabled (Ctrl+click popover).
+    pub enabled: bool,
+    /// Whether the first-run AI setup dialog has been shown.
+    pub setup_done: bool,
+    /// Extra instructions appended to the room preview prompt.
+    /// E.g. "Include the names of active participants. Describe the mood."
+    pub room_preview_extra: String,
+    /// Hidden: include conflict/spam detection in summaries.
+    /// Enable via: gsettings set me.ramkrishna.hikyaku ai-detect-conflict true
+    pub detect_conflict: bool,
+    /// Hidden: include code-of-conduct signals in summaries.
+    /// Enable via: gsettings set me.ramkrishna.hikyaku ai-detect-coc true
+    pub detect_coc: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomSettings {
-    /// Maximum number of DMs to show in the sidebar.
-    pub max_dms: usize,
-    /// Maximum number of rooms (non-DM) to show in the sidebar.
-    pub max_rooms: usize,
-    /// Room IDs that are pinned (e.g. friend DMs you always want visible).
-    pub pinned_rooms: std::collections::HashSet<String>,
+    pub pinned_rooms: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AppearanceSettings {
-    /// Font family for message text (e.g. "Cantarell", "Monospace").
     pub font_family: String,
-    /// Font size in points for message text.
     pub font_size: u32,
-    /// Background tint color as CSS hex (e.g. "#3584e4"). Empty = no tint.
     pub tint_color: String,
-    /// Background tint opacity (0.0 = invisible, 1.0 = solid). Default 0.05.
     pub tint_opacity: f64,
+    /// Gradient end color for the message area (empty = solid tint).
+    pub tint_color2: String,
+    pub sidebar_tint_color: String,
+    pub sidebar_tint_opacity: f64,
+    /// Gradient end color for the sidebar (empty = solid tint).
+    pub sidebar_tint_color2: String,
+    /// Color sender names by their Matrix user ID.
+    pub colorize_nicks: bool,
+    /// Highlight color for bookmarked messages (CSS hex, default amber).
+    pub bookmark_highlight_color: String,
+    /// Background tint color for new (unread) messages (CSS hex, default light blue).
+    pub new_message_highlight_color: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct SyncSettings {
-    /// Number of timeline events per room during sync.
     pub timeline_limit: u32,
-    /// Sync timeout in seconds.
     pub timeout_secs: u64,
 }
 
-impl Default for AppearanceSettings {
-    fn default() -> Self {
-        Self {
-            font_family: String::new(), // empty = system default
-            font_size: 11,
-            tint_color: String::new(),  // empty = no tint
-            tint_opacity: 0.05,
-        }
-    }
+/// Get a handle to the GSettings backend.
+pub fn gsettings() -> gio::Settings {
+    gio::Settings::new(SCHEMA_ID)
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            rooms: RoomSettings::default(),
-            sync: SyncSettings::default(),
-            appearance: AppearanceSettings::default(),
-        }
-    }
-}
-
-impl Default for RoomSettings {
-    fn default() -> Self {
-        Self {
-            max_dms: 50,
-            max_rooms: 100,
-            pinned_rooms: std::collections::HashSet::new(),
-        }
-    }
-}
-
-impl Default for SyncSettings {
-    fn default() -> Self {
-        Self {
-            timeline_limit: 10,
-            timeout_secs: 60,
-        }
-    }
-}
-
-fn config_file_path() -> PathBuf {
-    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("matx");
-    path.push("config.toml");
-    path
-}
-
-/// Load settings from disk, falling back to defaults.
-fn load_settings() -> Settings {
-    let path = config_file_path();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => match toml::from_str(&contents) {
-            Ok(settings) => {
-                tracing::info!("Loaded settings from {}", path.display());
-                settings
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse {}: {e}, using defaults", path.display());
-                Settings::default()
-            }
+/// Load all settings from GSettings/dconf.
+pub fn settings() -> Settings {
+    let gs = gsettings();
+    Settings {
+        rooms: RoomSettings {
+            pinned_rooms: gs.strv("pinned-rooms").iter().map(|s| s.to_string()).collect(),
         },
-        Err(_) => {
-            tracing::info!("No config file at {}, using defaults", path.display());
-            Settings::default()
-        }
+        sync: SyncSettings {
+            timeline_limit: gs.int("timeline-limit").max(1) as u32,
+            timeout_secs: gs.int("timeout-secs").max(1) as u64,
+        },
+        appearance: AppearanceSettings {
+            font_family: gs.string("font-family").to_string(),
+            font_size: gs.int("font-size").max(6) as u32,
+            tint_color: gs.string("tint-color").to_string(),
+            tint_opacity: gs.double("tint-opacity").clamp(0.0, 0.5),
+            tint_color2: gs.string("tint-color2").to_string(),
+            sidebar_tint_color: gs.string("sidebar-tint-color").to_string(),
+            sidebar_tint_opacity: gs.double("sidebar-tint-opacity").clamp(0.0, 0.5),
+            sidebar_tint_color2: gs.string("sidebar-tint-color2").to_string(),
+            colorize_nicks: gs.boolean("colorize-nicks"),
+            bookmark_highlight_color: gs.string("bookmark-highlight-color").to_string(),
+            new_message_highlight_color: gs.string("new-message-highlight-color").to_string(),
+        },
+        ollama: OllamaSettings {
+            endpoint: gs.string("ollama-endpoint").to_string(),
+            model: gs.string("ollama-model").to_string(),
+            enabled: gs.boolean("ollama-enabled"),
+            setup_done: gs.boolean("ai-setup-done"),
+            room_preview_extra: gs.string("room-preview-extra").to_string(),
+            detect_conflict: gs.boolean("ai-detect-conflict"),
+            detect_coc: gs.boolean("ai-detect-coc"),
+        },
+        plugins: PluginsSettings {
+            rolodex: gs.boolean("plugin-rolodex-enabled"),
+            pinning: gs.boolean("plugin-pinning-enabled"),
+            motd: gs.boolean("plugin-motd-enabled"),
+        },
+        watch: WatchSettings {
+            enabled: gs.boolean("watch-enabled"),
+            terms: gs.strv("watch-terms").iter().map(|s| s.to_string()).collect(),
+            threshold: gs.double("watch-threshold").clamp(0.0, 1.0),
+        },
+        rolodex: gs.strv("rolodex").iter().map(|s| s.to_string()).collect(),
     }
 }
 
-/// Global settings instance. Loaded once at startup.
-static SETTINGS: OnceLock<Settings> = OnceLock::new();
-
-/// Get the global settings (loads from disk on first call).
-pub fn settings() -> &'static Settings {
-    SETTINGS.get_or_init(load_settings)
-}
-
-/// Save settings to the config file. Changes take effect on next launch.
+/// Save all settings to GSettings/dconf.
 pub fn save_settings(settings: &Settings) -> Result<(), Box<dyn std::error::Error>> {
-    let path = config_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let toml_str = toml::to_string_pretty(settings)?;
-    std::fs::write(&path, toml_str)?;
-    tracing::info!("Settings saved to {}", path.display());
+    let gs = gsettings();
+    let pinned: Vec<&str> = settings.rooms.pinned_rooms.iter().map(|s| s.as_str()).collect();
+    gs.set_strv("pinned-rooms", pinned.as_slice())?;
+    gs.set_int("timeline-limit", settings.sync.timeline_limit as i32)?;
+    gs.set_int("timeout-secs", settings.sync.timeout_secs as i32)?;
+    gs.set_string("font-family", &settings.appearance.font_family)?;
+    gs.set_int("font-size", settings.appearance.font_size as i32)?;
+    gs.set_string("tint-color", &settings.appearance.tint_color)?;
+    gs.set_double("tint-opacity", settings.appearance.tint_opacity)?;
+    gs.set_string("tint-color2", &settings.appearance.tint_color2)?;
+    gs.set_string("sidebar-tint-color", &settings.appearance.sidebar_tint_color)?;
+    gs.set_double("sidebar-tint-opacity", settings.appearance.sidebar_tint_opacity)?;
+    gs.set_string("sidebar-tint-color2", &settings.appearance.sidebar_tint_color2)?;
+    gs.set_boolean("colorize-nicks", settings.appearance.colorize_nicks)?;
+    gs.set_string("bookmark-highlight-color", &settings.appearance.bookmark_highlight_color)?;
+    gs.set_string("new-message-highlight-color", &settings.appearance.new_message_highlight_color)?;
+    gs.set_string("ollama-endpoint", &settings.ollama.endpoint)?;
+    gs.set_string("ollama-model", &settings.ollama.model)?;
+    gs.set_boolean("ollama-enabled", settings.ollama.enabled)?;
+    gs.set_boolean("ai-setup-done", settings.ollama.setup_done)?;
+    gs.set_string("room-preview-extra", &settings.ollama.room_preview_extra)?;
+    gs.set_boolean("ai-detect-conflict", settings.ollama.detect_conflict)?;
+    gs.set_boolean("ai-detect-coc", settings.ollama.detect_coc)?;
+    gs.set_boolean("plugin-rolodex-enabled", settings.plugins.rolodex)?;
+    gs.set_boolean("plugin-pinning-enabled", settings.plugins.pinning)?;
+    gs.set_boolean("plugin-motd-enabled", settings.plugins.motd)?;
+    gs.set_boolean("watch-enabled", settings.watch.enabled)?;
+    let watch_terms: Vec<&str> = settings.watch.terms.iter().map(|s| s.as_str()).collect();
+    gs.set_strv("watch-terms", watch_terms.as_slice())?;
+    gs.set_double("watch-threshold", settings.watch.threshold)?;
+    let rolodex: Vec<&str> = settings.rolodex.iter().map(|s| s.as_str()).collect();
+    gs.set_strv("rolodex", rolodex.as_slice())?;
+    tracing::info!("Settings saved to dconf");
     Ok(())
 }
+
+/// Parse rolodex entries into (display_name, user_id) pairs.
+pub fn parse_rolodex(entries: &[String]) -> Vec<(String, String)> {
+    entries.iter()
+        .filter_map(|e| {
+            let (name, uid) = e.split_once('|')?;
+            let name = name.trim().to_string();
+            let uid = uid.trim().to_string();
+            if name.is_empty() || uid.is_empty() { return None; }
+            Some((name, uid))
+        })
+        .collect()
+}
+
+/// Directly write rolodex to gsettings (avoids a full settings round-trip).
+pub fn set_rolodex(entries: &[String]) {
+    let gs = gsettings();
+    let v: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+    let _ = gs.set_strv("rolodex", v.as_slice());
+}
+
+/// Set pinned rooms directly (avoids a full settings round-trip).
+pub fn set_pinned_rooms(rooms: &HashSet<String>) {
+    let gs = gsettings();
+    let pinned: Vec<&str> = rooms.iter().map(|s| s.as_str()).collect();
+    let _ = gs.set_strv("pinned-rooms", pinned.as_slice());
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -144,65 +215,38 @@ mod tests {
 
     #[test]
     fn test_default_settings() {
-        let s = Settings::default();
-        assert_eq!(s.rooms.max_dms, 50);
-        assert_eq!(s.rooms.max_rooms, 100);
+        // Just verify the struct shape is sensible.
+        let s = Settings {
+            rooms: RoomSettings { pinned_rooms: HashSet::new() },
+            sync: SyncSettings { timeline_limit: 10, timeout_secs: 60 },
+            appearance: AppearanceSettings {
+                font_family: String::new(),
+                font_size: 11,
+                tint_color: String::new(),
+                tint_opacity: 0.05,
+                tint_color2: String::new(),
+                sidebar_tint_color: String::new(),
+                sidebar_tint_opacity: 0.05,
+                sidebar_tint_color2: String::new(),
+                colorize_nicks: false,
+                bookmark_highlight_color: "#f5c542".to_string(),
+                new_message_highlight_color: "#5B9BD5".to_string(),
+            },
+            ollama: OllamaSettings {
+                endpoint: "http://localhost:11434".to_string(),
+                model: "qwen2.5:3b".to_string(),
+                enabled: true,
+                setup_done: false,
+                room_preview_extra: String::new(),
+                detect_conflict: false,
+                detect_coc: false,
+            },
+            plugins: PluginsSettings { rolodex: true, pinning: true, motd: true },
+            rolodex: Vec::new(),
+            watch: WatchSettings { enabled: false, terms: Vec::new(), threshold: 0.65 },
+        };
         assert!(s.rooms.pinned_rooms.is_empty());
         assert_eq!(s.sync.timeline_limit, 10);
         assert_eq!(s.sync.timeout_secs, 60);
-    }
-
-    #[test]
-    fn test_toml_round_trip() {
-        let original = Settings {
-            rooms: RoomSettings {
-                max_dms: 25,
-                max_rooms: 200,
-                pinned_rooms: ["!room1:matrix.org".to_string(), "!room2:matrix.org".to_string()].into(),
-            },
-            sync: SyncSettings {
-                timeline_limit: 10,
-                timeout_secs: 120,
-            },
-            appearance: AppearanceSettings {
-                font_family: "Monospace".into(),
-                font_size: 14,
-                tint_color: "#3584e4".into(),
-                tint_opacity: 0.1,
-            },
-        };
-        let toml_str = toml::to_string_pretty(&original).unwrap();
-        let parsed: Settings = toml::from_str(&toml_str).unwrap();
-        assert_eq!(original, parsed);
-    }
-
-    #[test]
-    fn test_partial_toml_uses_defaults() {
-        let toml_str = "[rooms]\nmax_dms = 10\n";
-        let s: Settings = toml::from_str(toml_str).unwrap();
-        assert_eq!(s.rooms.max_dms, 10);
-        // Unspecified fields should use defaults.
-        assert_eq!(s.rooms.max_rooms, 100);
-        assert_eq!(s.sync.timeline_limit, 10);
-        assert_eq!(s.sync.timeout_secs, 60);
-    }
-
-    #[test]
-    fn test_empty_toml_uses_all_defaults() {
-        let s: Settings = toml::from_str("").unwrap();
-        assert_eq!(s, Settings::default());
-    }
-
-    #[test]
-    fn test_malformed_toml_errors() {
-        let result = toml::from_str::<Settings>("not valid toml {{{{");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extra_keys_ignored() {
-        let toml_str = "[rooms]\nmax_dms = 30\nfuture_setting = true\n";
-        let s: Settings = toml::from_str(toml_str).unwrap();
-        assert_eq!(s.rooms.max_dms, 30);
     }
 }

@@ -6,7 +6,7 @@ template $MxMessageView : Gtk.Box {
   spacing: 0;
 
   Gtk.Stack view_stack {
-    transition-type: crossfade;
+    transition-type: none;
 
     Gtk.StackPage {
       name: "placeholder";
@@ -15,6 +15,23 @@ template $MxMessageView : Gtk.Box {
         title: "Select a Room";
         description: "Choose a room from the sidebar to start chatting.";
         vexpand: true;
+      };
+    }
+
+    Gtk.StackPage {
+      name: "loading";
+      child: Gtk.Box {
+        orientation: vertical;
+        valign: center;
+        halign: center;
+        vexpand: true;
+        hexpand: true;
+
+        Gtk.Spinner loading_spinner {
+          spinning: true;
+          width-request: 32;
+          height-request: 32;
+        }
       };
     }
 
@@ -35,9 +52,9 @@ template $MxMessageView : Gtk.Box {
 
           Gtk.Label topic_label {
             halign: start;
+            hexpand: true;
             wrap: true;
             wrap-mode: word_char;
-            max-width-chars: 80;
             visible: false;
             styles ["dim-label", "caption"]
           }
@@ -64,15 +81,23 @@ template $MxMessageView : Gtk.Box {
             }
           }
 
-          Gtk.Box pinned_box {
-            orientation: vertical;
-            spacing: 2;
-            visible: false;
+          Gtk.ScrolledWindow {
+            hscrollbar-policy: never;
+            vscrollbar-policy: automatic;
+            max-content-height: 120;
+            propagate-natural-height: true;
+            visible: bind pinned_box.visible;
 
-            Gtk.Label pinned_header {
-              label: "Pinned Messages";
-              halign: start;
-              styles ["caption", "heading"]
+            Gtk.Box pinned_box {
+              orientation: vertical;
+              spacing: 2;
+              visible: false;
+
+              Gtk.Label pinned_header {
+                label: "Pinned Messages";
+                halign: start;
+                styles ["caption", "heading"]
+              }
             }
           }
         }
@@ -80,6 +105,17 @@ template $MxMessageView : Gtk.Box {
         Gtk.Separator info_separator {
           orientation: horizontal;
           visible: false;
+        }
+
+        Adw.Banner unread_banner {
+          title: "New messages";
+          button-label: "Jump";
+          revealed: false;
+        }
+
+        Adw.Banner refresh_banner {
+          title: "Updating messages…";
+          revealed: false;
         }
 
         Gtk.ScrolledWindow scrolled_window {
@@ -148,9 +184,43 @@ template $MxMessageView : Gtk.Box {
             styles ["circular", "flat"]
           }
 
-          Gtk.Entry input_entry {
-            placeholder-text: "Send a message…";
+          Gtk.Overlay input_overlay {
             hexpand: true;
+
+            Gtk.ScrolledWindow input_scroll {
+              hscrollbar-policy: never;
+              vscrollbar-policy: automatic;
+              min-content-height: 36;
+              max-content-height: 120;
+              styles ["entry"]
+
+              Gtk.TextView input_view {
+                wrap-mode: word_char;
+                accepts-tab: false;
+                top-margin: 6;
+                bottom-margin: 6;
+                left-margin: 8;
+                right-margin: 8;
+              }
+            }
+
+            [overlay]
+            Gtk.Label input_placeholder {
+              label: "Send a message…";
+              halign: start;
+              valign: center;
+              margin-start: 10;
+              sensitive: false;
+              can-focus: false;
+              can-target: false;
+              styles ["dim-label"]
+            }
+          }
+
+          Gtk.MenuButton markdown_button {
+            icon-name: "format-text-bold-symbolic";
+            tooltip-text: "Markdown mode";
+            styles ["circular", "flat"]
           }
 
           Gtk.MenuButton emoji_button {

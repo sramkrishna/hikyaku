@@ -12,6 +12,8 @@ mod imp {
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use std::cell::{Cell, RefCell};
+    use crate::matrix::RoomKind;
+    use crate::room_context::CtxValue;
 
     // The #[derive(Properties)] macro generates GObject property descriptors
     // from annotated fields. Each #[property(...)] attribute tells GObject
@@ -34,16 +36,24 @@ mod imp {
         #[property(get, set)]
         topic_summary: RefCell<String>,
 
-        /// "dm", "room", or "space"
-        #[property(get, set)]
-        kind: RefCell<String>,
+        #[property(get, set, builder(RoomKind::Room))]
+        kind: Cell<RoomKind>,
 
         #[property(get, set)]
         is_encrypted: Cell<bool>,
 
-        /// Parent space name, empty string if none.
+        /// Parent space display name, empty string if none.
         #[property(get, set)]
         parent_space: RefCell<String>,
+
+        /// Actual room_id of the parent space, empty string if none.
+        /// Used for context inheritance: room → space → global default.
+        #[property(get, set)]
+        parent_space_id: RefCell<String>,
+
+        /// Tri-state media-preview context override for this room or space.
+        #[property(get, set, builder(CtxValue::Inherit))]
+        ctx_no_media: Cell<CtxValue>,
 
         /// Whether this room is pinned by the user.
         #[property(get, set)]
@@ -68,6 +78,31 @@ mod imp {
         /// Whether this room is bookmarked (m.favourite tag).
         #[property(get, set)]
         is_favourite: Cell<bool>,
+
+        /// Whether this is the currently open room (drives highlight in sidebar).
+        #[property(get, set)]
+        is_active: Cell<bool>,
+
+        /// Room avatar mxc:// URL, empty string if none.
+        #[property(get, set)]
+        avatar_url: RefCell<String>,
+
+        /// Local cached path of the room avatar image, empty if not yet loaded.
+        #[property(get, set)]
+        avatar_path: RefCell<String>,
+
+        /// Whether the room topic has changed since the user last visited.
+        /// Drives the MOTD icon in the sidebar.
+        #[property(get, set)]
+        topic_changed: Cell<bool>,
+
+        /// Someone is currently typing in this room.
+        #[property(get, set)]
+        is_typing: Cell<bool>,
+
+        /// A watch term matched a recent message in this room.
+        #[property(get, set)]
+        watch_alert: Cell<bool>,
     }
 
     // These trait impls register our type with GObject's type system.
@@ -96,7 +131,7 @@ impl RoomObject {
     pub fn new(
         room_id: &str,
         name: &str,
-        kind: &str,
+        kind: crate::matrix::RoomKind,
         is_encrypted: bool,
         parent_space: &str,
         is_pinned: bool,

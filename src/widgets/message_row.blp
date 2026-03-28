@@ -3,8 +3,8 @@ using Gtk 4.0;
 template $MxMessageRow : Gtk.Box {
   orientation: horizontal;
   spacing: 2;
-  margin-top: 4;
-  margin-bottom: 4;
+  margin-top: 2;
+  margin-bottom: 2;
   margin-start: 12;
   margin-end: 12;
 
@@ -56,14 +56,11 @@ template $MxMessageRow : Gtk.Box {
       }
     }
 
-    Gtk.Label body_label {
-      halign: start;
-      wrap: true;
-      wrap-mode: word_char;
-      xalign: 0;
-      selectable: true;
+    // Body content — text labels and code block views are added here dynamically.
+    Gtk.Box body_box {
+      orientation: vertical;
+      spacing: 4;
       hexpand: true;
-      styles ["mx-message-body"]
     }
 
     // Media attachment placeholder — clickable.

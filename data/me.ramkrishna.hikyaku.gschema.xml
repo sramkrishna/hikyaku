@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="me.ramkrishna.hikyaku" path="/me/ramkrishna/hikyaku/">
+
+    <!-- Window layout -->
+    <key name="sidebar-width" type="i">
+      <default>290</default>
+      <summary>Sidebar width in pixels</summary>
+    </key>
+
+    <!-- Rolodex — pinned contacts for @ completion -->
+    <key name="rolodex" type="as">
+      <default>[]</default>
+      <summary>Pinned contacts shown first in Tab completion</summary>
+      <description>List of "Display Name|@user:server" entries.</description>
+    </key>
+
+    <!-- Room list settings -->
+    <key name="pinned-rooms" type="as">
+      <default>[]</default>
+      <summary>Pinned room IDs</summary>
+    </key>
+
+    <!-- Sync settings -->
+    <key name="timeline-limit" type="i">
+      <default>10</default>
+      <summary>Number of timeline events per room during sync</summary>
+    </key>
+    <key name="timeout-secs" type="i">
+      <default>60</default>
+      <summary>Sync timeout in seconds</summary>
+    </key>
+
+    <!-- Appearance settings -->
+    <key name="font-family" type="s">
+      <default>''</default>
+      <summary>Font family for message text (empty = system default)</summary>
+    </key>
+    <key name="font-size" type="i">
+      <default>11</default>
+      <summary>Font size in points for message text</summary>
+    </key>
+    <key name="tint-color" type="s">
+      <default>''</default>
+      <summary>Message area tint color as CSS hex (empty = no tint)</summary>
+    </key>
+    <key name="tint-opacity" type="d">
+      <default>0.05</default>
+      <summary>Message area tint opacity (0.0–0.5)</summary>
+    </key>
+    <key name="sidebar-tint-color" type="s">
+      <default>''</default>
+      <summary>Sidebar tint color as CSS hex (empty = no tint)</summary>
+    </key>
+    <key name="sidebar-tint-opacity" type="d">
+      <default>0.05</default>
+      <summary>Sidebar tint opacity (0.0–0.5)</summary>
+    </key>
+    <key name="tint-color2" type="s">
+      <default>''</default>
+      <summary>Message area gradient end color (empty = solid tint)</summary>
+    </key>
+    <key name="sidebar-tint-color2" type="s">
+      <default>''</default>
+      <summary>Sidebar gradient end color (empty = solid tint)</summary>
+    </key>
+    <key name="colorize-nicks" type="b">
+      <default>false</default>
+      <summary>Color sender names by Matrix user ID</summary>
+    </key>
+    <key name="bookmark-highlight-color" type="s">
+      <default>'#f5c542'</default>
+      <summary>Highlight color for bookmarked messages (CSS hex)</summary>
+    </key>
+    <key name="new-message-highlight-color" type="s">
+      <default>'#5B9BD5'</default>
+      <summary>Background tint color for new (unread) messages (CSS hex)</summary>
+    </key>
+
+    <!-- Room interest watcher -->
+    <key name="watch-enabled" type="b">
+      <default>false</default>
+      <summary>Whether the room interest watcher is active</summary>
+    </key>
+    <key name="watch-terms" type="as">
+      <default>[]</default>
+      <summary>Terms to watch for in room messages (semantic matching)</summary>
+    </key>
+    <key name="watch-threshold" type="d">
+      <default>0.65</default>
+      <summary>Cosine similarity threshold for a watch term match (0.0–1.0)</summary>
+    </key>
+
+    <!-- AI / Ollama settings -->
+    <key name="room-preview-extra" type="s">
+      <default>''</default>
+      <summary>Extra instructions appended to the room preview prompt</summary>
+    </key>
+    <key name="ollama-endpoint" type="s">
+      <default>'http://localhost:11434'</default>
+      <summary>Ollama API endpoint URL</summary>
+    </key>
+    <key name="ollama-model" type="s">
+      <default>'qwen2.5:3b'</default>
+      <summary>Ollama model name for AI summaries (default: qwen2.5:3b)</summary>
+    </key>
+    <key name="ollama-enabled" type="b">
+      <default>true</default>
+      <summary>Whether AI summaries (Ctrl+click popover) are enabled</summary>
+    </key>
+    <key name="ai-setup-done" type="b">
+      <default>false</default>
+      <summary>Whether the first-run AI setup dialog has been shown</summary>
+    </key>
+
+    <!-- Plugin enable/disable toggles -->
+    <key name="plugin-rolodex-enabled" type="b">
+      <default>true</default>
+      <summary>Whether the Rolodex contact book plugin is active</summary>
+    </key>
+    <key name="plugin-pinning-enabled" type="b">
+      <default>true</default>
+      <summary>Whether the local message pinning plugin is active</summary>
+    </key>
+    <key name="plugin-motd-enabled" type="b">
+      <default>true</default>
+      <summary>Whether the room topic change (MOTD) tracker plugin is active</summary>
+    </key>
+
+    <!-- First-run flag — set to false after onboarding completes -->
+    <key name="first-start" type="b">
+      <default>true</default>
+      <summary>Whether the app has never been launched before</summary>
+      <description>Set to false once the user completes initial login and E2EE setup.</description>
+    </key>
+
+    <!-- Hidden moderation analysis modes (not exposed in UI).
+         Enable via: gsettings set me.ramkrishna.hikyaku ai-detect-conflict true -->
+    <key name="ai-detect-conflict" type="b">
+      <default>false</default>
+      <summary>Include conflict and spam pattern detection in AI metrics summaries</summary>
+    </key>
+    <key name="ai-detect-coc" type="b">
+      <default>false</default>
+      <summary>Include code-of-conduct violation signals in AI metrics summaries</summary>
+    </key>
+
+  </schema>
+</schemalist>

@@ -7,9 +7,12 @@
 mod imp {
     use adw::prelude::*;
     use gtk::glib;
+    use gtk::pango;
+    use gtk::gdk;
     use gtk::subclass::prelude::*;
     use gtk::CompositeTemplate;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
 
     use crate::models::MessageObject;
     use crate::widgets::message_row::MessageRow;
@@ -21,13 +24,19 @@ mod imp {
         #[template_child]
         pub view_stack: TemplateChild<gtk::Stack>,
         #[template_child]
+        pub loading_spinner: TemplateChild<gtk::Spinner>,
+        #[template_child]
         pub scrolled_window: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
         pub list_view: TemplateChild<gtk::ListView>,
         #[template_child]
         pub attach_button: TemplateChild<gtk::Button>,
         #[template_child]
-        pub input_entry: TemplateChild<gtk::Entry>,
+        pub input_view: TemplateChild<gtk::TextView>,
+        #[template_child]
+        pub input_placeholder: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub markdown_button: TemplateChild<gtk::MenuButton>,
         #[template_child]
         pub emoji_button: TemplateChild<gtk::MenuButton>,
         #[template_child]
@@ -38,6 +47,10 @@ mod imp {
         pub info_banner: TemplateChild<gtk::Box>,
         #[template_child]
         pub info_separator: TemplateChild<gtk::Separator>,
+        #[template_child]
+        pub unread_banner: TemplateChild<adw::Banner>,
+        #[template_child]
+        pub refresh_banner: TemplateChild<adw::Banner>,
         #[template_child]
         pub topic_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -58,8 +71,11 @@ mod imp {
         pub reply_to_event: RefCell<Option<String>>,
         /// Quote sender + body for the reply (for fallback format).
         pub reply_quote: RefCell<Option<(String, String)>>,
-        /// Callback for sending a message: (body, reply_to_event_id, quote_text).
-        pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>, Option<(String, String)>)>>>,
+        /// Callback for sending a message: (body, reply_to_event_id, quote_text, formatted_body, mentioned_user_ids).
+        pub on_send: RefCell<Option<Box<dyn Fn(String, Option<String>, Option<(String, String)>, Option<String>, Vec<String>)>>>,
+        /// display_name → user_id for mentions inserted via nick completion.
+        /// Cleared after each send and on room switch.
+        pub pending_mentions: RefCell<std::collections::HashMap<String, String>>,
         /// Callback for sending a reaction: (event_id, emoji).
         pub on_react: RefCell<Option<Box<dyn Fn(String, String)>>>,
         /// Callback for editing a message: (event_id, body).
@@ -74,21 +90,51 @@ mod imp {
         pub on_dm: RefCell<Option<Box<dyn Fn(String)>>>,
         /// Callback for opening a thread: (thread_root_event_id).
         pub on_open_thread: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback: bookmark clicked → (event_id, sender, body, timestamp).
+        pub on_bookmark: RefCell<Option<Box<dyn Fn(String, String, String, u64)>>>,
+        /// Callback: unbookmark clicked → (event_id).
+        pub on_unbookmark: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback: add contact to rolodex → (user_id, display_name).
+        pub on_add_to_rolodex: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// Callback: remove contact from rolodex → (user_id).
+        pub on_remove_from_rolodex: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback: fetch notes for a contact → (user_id) → Option<notes>.
+        pub on_get_rolodex_notes: RefCell<Option<Box<dyn Fn(String) -> Option<String>>>>,
+        /// Callback: save notes for a contact → (user_id, notes).
+        pub on_save_rolodex_notes: RefCell<Option<Box<dyn Fn(String, String)>>>,
+        /// MessageObjects currently marked as new — cleared by remove_dividers.
+        /// Kept separate so removal is O(unread_count) not O(total messages).
+        pub new_message_objs: RefCell<Vec<MessageObject>>,
+        /// Bookmarked event IDs for the current room — drives row highlight + button icon.
+        pub bookmarked_ids: RefCell<std::collections::HashSet<String>>,
         /// Callback for typing notice: (typing: bool).
         pub on_typing: RefCell<Option<Box<dyn Fn(bool)>>>,
+        /// Pending debounce timer for typing notices.
+        pub typing_debounce: RefCell<Option<glib::SourceId>>,
+        /// Pending debounce timer for spell-check (runs 400 ms after last keystroke).
+        pub spell_debounce: RefCell<Option<glib::SourceId>>,
+        /// Last typing state sent — avoids redundant network calls.
+        pub last_typing_sent: Cell<bool>,
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
         pub prev_batch_token: RefCell<Option<String>>,
         pub fetching_older: Cell<bool>,
         /// Names to highlight in message bodies (user's own name + friends).
-        pub highlight_names: RefCell<Vec<String>>,
+        /// Rc<[String]> so row_context() clones only the pointer, not the data.
+        pub highlight_names: RefCell<std::rc::Rc<[String]>>,
         /// Current user's Matrix ID for showing edit/delete on own messages.
         pub user_id: RefCell<String>,
         /// Whether the current room is a DM (hides DM button on messages).
         pub is_dm_room: Cell<bool>,
-        /// The m.fully_read event ID — where to scroll on room entry.
-        pub fully_read_event_id: RefCell<Option<String>>,
+        /// When true, media buttons and URL image previews are hidden for this room.
+        pub is_no_media: Cell<bool>,
+        /// True after the first set_messages() call for the current room.
+        /// Suppresses auto-scroll on subsequent bg_refresh calls so the user
+        /// is not yanked away from their reading position.
+        pub messages_loaded: Cell<bool>,
+        /// Server unread count at room-load time — show divider + banner when > 0.
+        pub room_unread_count: Cell<u32>,
         /// Room members for nick completion: (lowercase_name, display_name, user_id).
         /// Sorted by lowercase_name for binary search prefix matching.
         pub room_members: RefCell<Vec<(String, String, String)>>,
@@ -97,6 +143,19 @@ mod imp {
         pub nick_list: gtk::ListBox,
         /// Original prefix and @ position when nick completion started.
         pub nick_completion_state: RefCell<Option<(usize, String, String)>>, // (at_pos, prefix, text_after)
+        /// O(1) event_id → MessageObject index. Kept in sync with list_store.
+        /// Eliminates linear scans in update/scroll/remove/has_event.
+        pub event_index: RefCell<HashMap<String, MessageObject>>,
+        /// The event_id stored in m.fully_read for this room — used for precise
+        /// divider placement.  None until set_room_meta is called.
+        pub fully_read_event_id: RefCell<Option<String>>,
+        /// Sent message history for Up/Down recall (capped at 100 entries).
+        /// Each entry is (body, event_id) — event_id is patched in by MessageSent.
+        pub send_history: RefCell<Vec<(String, String)>>,
+        /// Current position in send_history; equal to history.len() when not navigating.
+        pub history_cursor: Cell<usize>,
+        /// Draft saved when the user first presses Up to navigate history.
+        pub history_draft: RefCell<String>,
     }
 
     impl Default for MessageView {
@@ -104,15 +163,20 @@ mod imp {
             Self {
                 list_store: gio::ListStore::new::<MessageObject>(),
                 view_stack: Default::default(),
+                loading_spinner: Default::default(),
                 scrolled_window: Default::default(),
                 list_view: Default::default(),
                 attach_button: Default::default(),
-                input_entry: Default::default(),
+                input_view: Default::default(),
+                input_placeholder: Default::default(),
+                markdown_button: Default::default(),
                 emoji_button: Default::default(),
                 emoji_chooser: Default::default(),
                 send_button: Default::default(),
                 info_banner: Default::default(),
                 info_separator: Default::default(),
+                unread_banner: Default::default(),
+                refresh_banner: Default::default(),
                 topic_label: Default::default(),
                 tombstone_banner: Default::default(),
                 tombstone_label: Default::default(),
@@ -130,15 +194,28 @@ mod imp {
                 on_attach: RefCell::new(None),
                 on_dm: RefCell::new(None),
                 on_open_thread: RefCell::new(None),
+                on_bookmark: RefCell::new(None),
+                on_unbookmark: RefCell::new(None),
+                on_add_to_rolodex: RefCell::new(None),
+                on_remove_from_rolodex: RefCell::new(None),
+                on_get_rolodex_notes: RefCell::new(None),
+                on_save_rolodex_notes: RefCell::new(None),
+                new_message_objs: RefCell::new(Vec::new()),
+                bookmarked_ids: RefCell::new(std::collections::HashSet::new()),
                 on_typing: RefCell::new(None),
+                typing_debounce: RefCell::new(None),
+                spell_debounce: RefCell::new(None),
+                last_typing_sent: Cell::new(false),
                 typing_label: Default::default(),
                 is_dm_room: Cell::new(false),
-                fully_read_event_id: RefCell::new(None),
+                is_no_media: Cell::new(false),
+                messages_loaded: Cell::new(false),
+                room_unread_count: Cell::new(0),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
                 fetching_older: Cell::new(false),
-                highlight_names: RefCell::new(Vec::new()),
+                highlight_names: RefCell::new(std::rc::Rc::from([])),
                 user_id: RefCell::new(String::new()),
                 room_members: RefCell::new(Vec::new()),
                 nick_popover: {
@@ -150,7 +227,13 @@ mod imp {
                 nick_list: gtk::ListBox::builder()
                     .selection_mode(gtk::SelectionMode::Single)
                     .build(),
+                pending_mentions: RefCell::new(std::collections::HashMap::new()),
                 nick_completion_state: RefCell::new(None),
+                event_index: RefCell::new(HashMap::new()),
+                fully_read_event_id: RefCell::new(None),
+                send_history: RefCell::new(Vec::new()),
+                history_cursor: Cell::new(0),
+                history_draft: RefCell::new(String::new()),
             }
         }
     }
@@ -256,6 +339,58 @@ mod imp {
                             }
                         }
                     });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_bookmark(move |eid, sender, body, ts| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_bookmark.borrow() {
+                                cb(eid, sender, body, ts);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_unbookmark(move |eid| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_unbookmark.borrow() {
+                                cb(eid);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_add_to_rolodex(move |uid, name| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_add_to_rolodex.borrow() {
+                                cb(uid, name);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_remove_from_rolodex(move |uid| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_remove_from_rolodex.borrow() {
+                                cb(uid);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_get_rolodex_notes(move |uid| {
+                        view_weak.upgrade().and_then(|v| {
+                            v.imp().on_get_rolodex_notes.borrow().as_ref().and_then(|cb| cb(uid))
+                        })
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_save_rolodex_notes(move |uid, notes| {
+                        if let Some(v) = view_weak.upgrade() {
+                            if let Some(ref cb) = *v.imp().on_save_rolodex_notes.borrow() {
+                                cb(uid, notes);
+                            }
+                        }
+                    });
                 }
 
                 list_item.set_child(Some(&row));
@@ -276,41 +411,72 @@ mod imp {
                     .expect("MessageRow expected");
 
                 let view = obj_weak.upgrade();
-                let names = view.as_ref()
-                    .map(|o| o.imp().highlight_names.borrow().clone())
+                let ctx = view.as_ref()
+                    .map(|v| v.row_context())
                     .unwrap_or_default();
-                let my_id = view.as_ref()
-                    .map(|o| o.imp().user_id.borrow().clone())
-                    .unwrap_or_default();
-                let is_dm = view.as_ref()
-                    .map(|o| o.imp().is_dm_room.get())
+                row.bind_message_object(&msg_obj, &ctx);
+                let is_bm = view.as_ref()
+                    .map(|v| v.imp().bookmarked_ids.borrow().contains(&msg_obj.event_id()))
                     .unwrap_or(false);
-                row.bind_message_object(
-                    &msg_obj,
-                    &names,
-                    &my_id,
-                    is_dm,
-                );
+                row.set_bookmarked(is_bm);
+            });
+
+            // Disconnect flash handler when a row is recycled for a different item.
+            factory.connect_unbind(|_factory, list_item| {
+                let list_item = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("ListItem expected");
+                if let Some(row) = list_item.child().and_downcast::<MessageRow>() {
+                    row.clear_flash_handler();
+                }
             });
 
             let no_selection = gtk::NoSelection::new(Some(self.list_store.clone()));
             self.list_view.set_model(Some(&no_selection));
             self.list_view.set_factory(Some(&factory));
 
+            // Helper: get full text from the TextView buffer.
+            fn buf_text(buf: &gtk::TextBuffer) -> String {
+                buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string()
+            }
+
+            // Helper: push text to send history, reset cursor to end.
+            fn push_history(imp: &MessageView, text: &str) {
+                let mut history = imp.send_history.borrow_mut();
+                // Avoid consecutive duplicates.
+                if history.last().map(|(b, _)| b.as_str()) != Some(text) {
+                    history.push((text.to_string(), String::new()));
+                    if history.len() > 100 {
+                        history.remove(0);
+                    }
+                }
+                let len = history.len();
+                drop(history);
+                imp.history_cursor.set(len);
+                imp.history_draft.borrow_mut().clear();
+            }
+
             // Send on button click.
             let obj = self.obj();
-            let entry = self.input_entry.clone();
+            let tv = self.input_view.clone();
             let view = obj.clone();
             self.send_button.connect_clicked(move |_| {
-                let text = entry.text().to_string();
-                if !text.is_empty() {
+                let buf = tv.buffer();
+                let text = buf_text(&buf);
+                if !text.trim().is_empty() {
                     let imp = view.imp();
                     let reply_to = imp.reply_to_event.borrow().clone();
                     let quote = imp.reply_quote.borrow().clone();
+                    let html = crate::markdown::md_to_html(&text);
+                    let pending = imp.pending_mentions.borrow().clone();
+                    let (html_with_pills, mentioned_ids) = super::inject_mention_pills(&html, &pending);
+                    let formatted = Some(html_with_pills);
+                    push_history(imp, &text);
+                    imp.pending_mentions.borrow_mut().clear();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text, reply_to, quote);
+                        cb(text, reply_to, quote, formatted, mentioned_ids);
                     }
-                    entry.set_text("");
+                    buf.set_text("");
                     imp.reply_to_event.replace(None);
                     imp.reply_quote.replace(None);
                     imp.reply_preview.set_visible(false);
@@ -334,25 +500,42 @@ mod imp {
                 }
             });
 
-            // Send on Enter key — includes reply_to if replying.
-            let entry = self.input_entry.clone();
-            let view = obj.clone();
-            self.input_entry.connect_activate(move |_| {
-                let text = entry.text().to_string();
-                if !text.is_empty() {
-                    let imp = view.imp();
+            // Enter = send, Shift+Enter = newline.
+            let send_key_ctrl = gtk::EventControllerKey::new();
+            let view_for_enter = obj.clone();
+            send_key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+                use gtk::gdk::Key as K;
+                if key != K::Return && key != K::KP_Enter {
+                    return glib::Propagation::Proceed;
+                }
+                if mods.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    // Shift+Enter → insert newline via default TextView handling.
+                    return glib::Propagation::Proceed;
+                }
+                // Plain Enter → send.
+                let imp = view_for_enter.imp();
+                let buf = imp.input_view.buffer();
+                let text = buf_text(&buf);
+                if !text.trim().is_empty() {
                     let reply_to = imp.reply_to_event.borrow().clone();
                     let quote = imp.reply_quote.borrow().clone();
+                    let html = crate::markdown::md_to_html(&text);
+                    let pending = imp.pending_mentions.borrow().clone();
+                    let (html_with_pills, mentioned_ids) = super::inject_mention_pills(&html, &pending);
+                    let formatted = Some(html_with_pills);
+                    push_history(imp, &text);
+                    imp.pending_mentions.borrow_mut().clear();
                     if let Some(ref cb) = *imp.on_send.borrow() {
-                        cb(text, reply_to, quote);
+                        cb(text, reply_to, quote, formatted, mentioned_ids);
                     }
-                    entry.set_text("");
-                    // Clear reply state.
+                    buf.set_text("");
                     imp.reply_to_event.replace(None);
                     imp.reply_quote.replace(None);
                     imp.reply_preview.set_visible(false);
                 }
+                glib::Propagation::Stop
             });
+            self.input_view.add_controller(send_key_ctrl);
 
             // Attach button — open file chooser.
             let view_for_attach = obj.clone();
@@ -382,6 +565,13 @@ mod imp {
                 );
             });
 
+            // "Jump to new messages" banner button.
+            let view_for_banner = obj.clone();
+            self.unread_banner.connect_button_clicked(move |banner| {
+                view_for_banner.scroll_to_event("__unread_divider__");
+                banner.set_revealed(false);
+            });
+
             // Cancel reply button.
             let view_for_cancel = obj.clone();
             self.reply_cancel_button.connect_clicked(move |_| {
@@ -398,25 +588,32 @@ mod imp {
                 .child(&self.nick_list)
                 .build();
             self.nick_popover.set_child(Some(&nick_scroll));
-            self.nick_popover.set_parent(&*self.input_entry);
+            self.nick_popover.set_parent(&*self.input_view);
             self.nick_popover.set_position(gtk::PositionType::Top);
 
             // When a nick is selected from the list, insert it.
-            let entry_for_nick = self.input_entry.clone();
-            let popover_for_nick = self.nick_popover.clone();
+            let view_for_row = obj.downgrade();
             self.nick_list.connect_row_activated(move |_, row| {
+                let Some(view) = view_for_row.upgrade() else { return; };
+                let imp = view.imp();
                 if let Some(label) = row.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                     let nick = label.text().to_string();
-                    let text = entry_for_nick.text().to_string();
-                    // Find the last '@' and replace from there.
+                    // widget_name holds the user_id stored when the row was built.
+                    let uid = label.widget_name().to_string();
+                    let buf = imp.input_view.buffer();
+                    let text = buf_text(&buf);
+                    // Replace from the last '@' — keeps the '@' prefix.
                     if let Some(at_pos) = text.rfind('@') {
                         let before = &text[..at_pos];
-                        let new_text = format!("{before}{nick} ");
-                        entry_for_nick.set_text(&new_text);
-                        entry_for_nick.set_position(new_text.len() as i32);
+                        let new_text = format!("{before}@{nick} ");
+                        buf.set_text(&new_text);
+                        buf.place_cursor(&buf.end_iter());
                     }
-                    popover_for_nick.popdown();
-                    entry_for_nick.grab_focus();
+                    if !uid.is_empty() {
+                        imp.pending_mentions.borrow_mut().insert(nick, uid);
+                    }
+                    imp.nick_popover.popdown();
+                    imp.input_view.grab_focus();
                 }
             });
 
@@ -489,14 +686,73 @@ mod imp {
                         imp.nick_list.select_row(Some(&row));
                         if let Some(label) = row.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                             let nick = label.text().to_string();
-                            let text = imp.input_entry.text().to_string();
+                            let buf = imp.input_view.buffer();
+                            let text = buf_text(&buf);
                             let before = &text[..at_pos];
                             let preview = format!("{before}@{nick}{text_after}");
-                            imp.input_entry.set_text(&preview);
-                            imp.input_entry.set_position((at_pos + 1 + nick.len()) as i32);
+                            buf.set_text(&preview);
+                            let char_offset = (at_pos + 1 + nick.len()) as i32;
+                            buf.place_cursor(&buf.iter_at_offset(char_offset));
                         }
                     }
                     return glib::Propagation::Stop;
+                }
+
+                // History navigation — Up/Down when popover is closed.
+                if let NickAction::Navigate(is_up) = action {
+                    let buf = imp.input_view.buffer();
+                    let cursor = buf.iter_at_mark(&buf.get_insert());
+                    let on_boundary = if is_up {
+                        cursor.line() == 0
+                    } else {
+                        cursor.line() == buf.line_count() - 1
+                    };
+                    if on_boundary {
+                        let history = imp.send_history.borrow();
+                        let len = history.len();
+                        if len == 0 {
+                            return glib::Propagation::Proceed;
+                        }
+                        let cur = imp.history_cursor.get();
+                        if is_up {
+                            if cur == len {
+                                *imp.history_draft.borrow_mut() = buf_text(&buf);
+                            }
+                            if cur > 0 {
+                                let next = cur - 1;
+                                let (text, event_id) = history[next].clone();
+                                drop(history);
+                                imp.history_cursor.set(next);
+                                buf.set_text(&text);
+                                buf.place_cursor(&buf.end_iter());
+                                // Activate edit mode if event_id is known.
+                                if event_id.is_empty() {
+                                    imp.reply_to_event.replace(None);
+                                } else {
+                                    imp.reply_to_event.replace(Some(format!("edit:{event_id}")));
+                                }
+                            }
+                        } else if cur < len {
+                            let next = cur + 1;
+                            let (text, event_id) = if next == len {
+                                (imp.history_draft.borrow().clone(), String::new())
+                            } else {
+                                history[next].clone()
+                            };
+                            drop(history);
+                            imp.history_cursor.set(next);
+                            buf.set_text(&text);
+                            buf.place_cursor(&buf.end_iter());
+                            if event_id.is_empty() || next == len {
+                                imp.reply_to_event.replace(None);
+                                imp.reply_preview.set_visible(false);
+                            } else {
+                                imp.reply_to_event.replace(Some(format!("edit:{event_id}")));
+                            }
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                    return glib::Propagation::Proceed;
                 }
 
                 // Not visible — only Tab triggers completion.
@@ -504,29 +760,71 @@ mod imp {
                     return glib::Propagation::Proceed;
                 }
 
-                let text = imp.input_entry.text().to_string();
-                let cursor = imp.input_entry.position() as usize;
-                let before_cursor = &text[..cursor.min(text.len())];
+                let buf = imp.input_view.buffer();
+                let text = buf_text(&buf);
+                // cursor_position() is a char count; convert to byte offset.
+                let cursor_char = buf.cursor_position() as usize;
+                let cursor_byte = text.char_indices()
+                    .nth(cursor_char)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len());
+                let before_cursor = &text[..cursor_byte];
 
-                let Some(at_pos) = before_cursor.rfind('@') else {
-                    return glib::Propagation::Proceed;
-                };
-                let prefix = &before_cursor[at_pos + 1..];
-                if prefix.is_empty() {
+                // Empty entry → let Tab move focus.
+                if before_cursor.trim().is_empty() {
                     return glib::Propagation::Proceed;
                 }
 
-                let text_after = text[cursor.min(text.len())..].to_string();
-                let prefix_lower = prefix.to_lowercase();
+                // Find insert_pos and prefix.
+                // @-mode:  `@prefix`  → insert_pos = byte offset of @
+                // IRC-mode: bare word → insert_pos = byte offset of word start
+                let (insert_pos, prefix) = if let Some(at) = before_cursor.rfind('@') {
+                    (at, &before_cursor[at + 1..])
+                } else {
+                    let ws = before_cursor
+                        .rfind(|c: char| c.is_whitespace())
+                        .map(|i| i + before_cursor[i..].chars().next().unwrap().len_utf8())
+                        .unwrap_or(0);
+                    (ws, &before_cursor[ws..])
+                };
+
+                let text_after = text[cursor_byte..].to_string();
+
+                // Build rolodex entries as owned tuples (lowercase, display, user_id)
+                // so they can be prepended to the match list.
+                let rolodex_raw: Vec<(String, String, String)> =
+                    crate::config::parse_rolodex(&crate::config::settings().rolodex)
+                        .into_iter()
+                        .map(|(name, uid)| (name.to_lowercase(), name, uid))
+                        .collect();
+
                 let members = imp.room_members.borrow();
-                // Binary search to find the start of matching prefix, then
-                // collect consecutive matches. O(log n + k) where k = matches.
-                let start = members.partition_point(|(lower, _, _)| lower.as_str() < prefix_lower.as_str());
-                let matches: Vec<&(String, String, String)> = members[start..]
-                    .iter()
-                    .take_while(|(lower, _, _)| lower.starts_with(&prefix_lower))
-                    .take(10)
+                // Empty prefix (@-alone) → show all members. Otherwise binary
+                // search for O(log n + k) prefix matching, with rolodex first.
+                let prefix_lower = prefix.to_lowercase();
+                let rolodex_matches: Vec<(String, String, String)> = rolodex_raw.into_iter()
+                    .filter(|(lower, _, _)| prefix.is_empty() || lower.starts_with(&prefix_lower))
+                    .take(5)
                     .collect();
+                let room_matches: Vec<&(String, String, String)> = if prefix.is_empty() {
+                    members.iter().take(10).collect()
+                } else {
+                    let start = members.partition_point(|(lower, _, _)| lower.as_str() < prefix_lower.as_str());
+                    members[start..]
+                        .iter()
+                        .take_while(|(lower, _, _)| lower.starts_with(&prefix_lower))
+                        .take(10)
+                        .collect()
+                };
+                // Combine: rolodex first, then room members not already in rolodex.
+                let rolodex_ids: std::collections::HashSet<String> =
+                    rolodex_matches.iter().map(|(_, _, uid)| uid.clone()).collect();
+                let mut matches: Vec<(String, String, String)> = rolodex_matches;
+                for m in room_matches {
+                    if !rolodex_ids.contains(&m.2) {
+                        matches.push(m.clone());
+                    }
+                }
 
                 if matches.is_empty() {
                     return glib::Propagation::Stop;
@@ -534,20 +832,24 @@ mod imp {
 
                 // Single match — insert directly, no popover.
                 if matches.len() == 1 {
-                    let before = &text[..at_pos];
+                    let before = &text[..insert_pos];
                     let new_text = format!("{before}@{}{text_after}", matches[0].1);
-                    imp.input_entry.set_text(&new_text);
-                    imp.input_entry.set_position((at_pos + 1 + matches[0].1.len()) as i32);
+                    buf.set_text(&new_text);
+                    let char_offset = (insert_pos + 1 + matches[0].1.len()) as i32;
+                    buf.place_cursor(&buf.iter_at_offset(char_offset));
+                    // Record mention so the send path can inject a pill link.
+                    imp.pending_mentions.borrow_mut()
+                        .insert(matches[0].1.clone(), matches[0].2.clone());
                     return glib::Propagation::Stop;
                 }
 
                 // Multiple matches — store state and show popover.
-                imp.nick_completion_state.replace(Some((at_pos, prefix.to_string(), text_after.clone())));
+                imp.nick_completion_state.replace(Some((insert_pos, prefix.to_string(), text_after.clone())));
 
                 while let Some(row) = imp.nick_list.first_child() {
                     imp.nick_list.remove(&row);
                 }
-                for (_, name, _) in &matches {
+                for (_, name, uid) in &matches {
                     let label = gtk::Label::builder()
                         .label(name.as_str())
                         .halign(gtk::Align::Start)
@@ -556,6 +858,8 @@ mod imp {
                         .margin_top(4)
                         .margin_bottom(4)
                         .build();
+                    // Store user_id in widget_name so connect_row_activated can retrieve it.
+                    label.set_widget_name(uid.as_str());
                     imp.nick_list.append(&label);
                 }
                 // Select first and preview.
@@ -563,40 +867,219 @@ mod imp {
                     imp.nick_list.select_row(Some(&first));
                     if let Some(label) = first.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                         let nick = label.text().to_string();
-                        let before = &text[..at_pos];
+                        let before = &text[..insert_pos];
                         let preview = format!("{before}@{nick}{text_after}");
-                        imp.input_entry.set_text(&preview);
-                        imp.input_entry.set_position((at_pos + 1 + nick.len()) as i32);
+                        buf.set_text(&preview);
+                        let char_offset = (insert_pos + 1 + nick.len()) as i32;
+                        buf.place_cursor(&buf.iter_at_offset(char_offset));
                     }
                 }
                 imp.nick_popover.popup();
                 glib::Propagation::Stop
             });
-            self.input_entry.add_controller(key_controller);
+            key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+            self.input_view.add_controller(key_controller);
+
+            // Markdown is always active — show a cheat sheet popover for reference.
+            {
+                let cheat = gtk::Label::builder()
+                    .label(
+                        "<b>**bold**</b>   <i>*italic*</i>   <tt>`code`</tt>   <s>~~strike~~</s>\n\
+                         <a href=\"\">\\[text](url)</a>   # Heading   &gt; Blockquote\n\
+                         ```block``` — fenced code block\n\
+                         Shift+Enter — new line"
+                    )
+                    .use_markup(true)
+                    .halign(gtk::Align::Start)
+                    .margin_top(8)
+                    .margin_bottom(8)
+                    .margin_start(8)
+                    .margin_end(8)
+                    .build();
+                let popover = gtk::Popover::new();
+                popover.set_child(Some(&cheat));
+                self.markdown_button.set_popover(Some(&popover));
+            }
 
             // Insert emoji at cursor position when picked.
-            let entry_for_emoji = self.input_entry.clone();
+            let tv_for_emoji = self.input_view.clone();
             self.emoji_chooser.connect_emoji_picked(move |_, emoji| {
-                let pos = entry_for_emoji.position();
-                entry_for_emoji.insert_text(emoji, &mut pos.clone());
-                entry_for_emoji.set_position(pos + emoji.len() as i32);
-                entry_for_emoji.grab_focus();
+                tv_for_emoji.buffer().insert_at_cursor(emoji);
+                tv_for_emoji.grab_focus();
             });
 
+            // Spell-check: create the underline tag and wire up live checking
+            // and a right-click suggestion popover.
+            {
+                let buf = self.input_view.buffer();
+                // Create the "misspelled" tag once; check_buffer uses it by name.
+                let tag = buf.create_tag(
+                    Some("misspelled"),
+                    &[
+                        ("underline", &pango::Underline::Error),
+                        ("underline-rgba", &gdk::RGBA::new(1.0, 0.2, 0.2, 1.0)),
+                    ],
+                );
+                drop(tag);
+
+                // Re-check spelling 400 ms after the last keystroke to avoid
+                // blocking the GTK main loop on every character typed.
+                let view_for_spell = obj.downgrade();
+                buf.connect_changed(move |_buf| {
+                    let Some(view) = view_for_spell.upgrade() else { return };
+                    let imp = view.imp();
+                    // Cancel any previously scheduled check.
+                    if let Some(id) = imp.spell_debounce.borrow_mut().take() {
+                        id.remove();
+                    }
+                    let view_weak = view.downgrade();
+                    *imp.spell_debounce.borrow_mut() = Some(glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            let Some(v) = view_weak.upgrade() else { return };
+                            let imp = v.imp();
+                            *imp.spell_debounce.borrow_mut() = None;
+                            crate::spell_check::check_buffer(&imp.input_view.buffer());
+                        },
+                    ));
+                });
+
+                // Right-click over a misspelled word → show suggestion popover.
+                let input_weak = self.input_view.downgrade();
+                let gesture = gtk::GestureClick::new();
+                gesture.set_button(3); // right mouse button
+                gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+                gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                    let Some(tv) = input_weak.upgrade() else { return };
+                    let buf = tv.buffer();
+
+                    // Convert widget coords → buffer coords.
+                    let (bx, by) = tv.window_to_buffer_coords(
+                        gtk::TextWindowType::Widget, x as i32, y as i32,
+                    );
+                    let Some(iter) = tv.iter_at_location(bx, by) else { return };
+
+                    // Only intercept if the click is over a misspelled word.
+                    let tag_table = buf.tag_table();
+                    let Some(tag) = tag_table.lookup("misspelled") else { return };
+                    if !iter.has_tag(&tag) { return; }
+
+                    // Find the word boundaries via tag toggles.
+                    let mut word_start = iter.clone();
+                    if !word_start.starts_tag(Some(&tag)) {
+                        word_start.backward_to_tag_toggle(Some(&tag));
+                    }
+                    let mut word_end = iter.clone();
+                    word_end.forward_to_tag_toggle(Some(&tag));
+                    let word = buf.text(&word_start, &word_end, false).to_string();
+                    if word.is_empty() { return; }
+
+                    // Claim the sequence so the default context menu doesn't appear.
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+
+                    // Build suggestion popover.
+                    let popover = gtk::Popover::new();
+                    popover.set_has_arrow(true);
+                    let vbox = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Vertical)
+                        .spacing(2)
+                        .margin_top(4).margin_bottom(4)
+                        .margin_start(4).margin_end(4)
+                        .build();
+
+                    let sugs = crate::spell_check::suggestions(&word);
+                    if sugs.is_empty() {
+                        let lbl = gtk::Label::new(Some("No suggestions"));
+                        lbl.add_css_class("dim-label");
+                        vbox.append(&lbl);
+                    } else {
+                        for sug in sugs.iter().take(8) {
+                            let btn = gtk::Button::with_label(sug);
+                            btn.set_has_frame(false);
+                            btn.add_css_class("flat");
+                            // Replace the misspelled word with the suggestion.
+                            let buf2 = buf.clone();
+                            let mut ws = word_start.clone();
+                            let mut we = word_end.clone();
+                            let sug2 = sug.clone();
+                            let pop = popover.clone();
+                            btn.connect_clicked(move |_| {
+                                buf2.delete(&mut ws.clone(), &mut we.clone());
+                                buf2.insert(&mut ws.clone(), &sug2);
+                                pop.popdown();
+                            });
+                            vbox.append(&btn);
+                        }
+                    }
+
+                    // Separator + "Add to dictionary".
+                    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                    let add_btn = gtk::Button::with_label(
+                        &format!("Add \"{word}\" to dictionary"),
+                    );
+                    add_btn.set_has_frame(false);
+                    add_btn.add_css_class("flat");
+                    let word2 = word.clone();
+                    let buf3 = buf.clone();
+                    let pop2 = popover.clone();
+                    add_btn.connect_clicked(move |_| {
+                        crate::spell_check::add_to_dictionary(&word2);
+                        pop2.popdown();
+                        // Re-check so the underline disappears immediately.
+                        crate::spell_check::check_buffer(&buf3);
+                    });
+                    vbox.append(&add_btn);
+
+                    popover.set_child(Some(&vbox));
+                    popover.set_parent(&tv);
+                    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                    popover.popup();
+                });
+                self.input_view.add_controller(gesture);
+            }
+
             // Typing indicator. Also dismiss nick popover on text change
-            // (unless the change was from Tab completion itself — detected by
-            // checking if nick_completion_state was just cleared by key handler).
+            // (unless the change was from Tab completion itself).
             let view_for_typing = obj.clone();
-            self.input_entry.connect_changed(move |entry| {
+            self.input_view.buffer().connect_changed(move |buf| {
                 let imp = view_for_typing.imp();
-                // Dismiss nick popover if visible and state was already cleared
-                // (meaning a non-Tab key triggered this change).
                 if imp.nick_popover.is_visible() && imp.nick_completion_state.borrow().is_none() {
                     imp.nick_popover.popdown();
                 }
-                let is_typing = !entry.text().is_empty();
-                if let Some(ref cb) = *imp.on_typing.borrow() {
-                    cb(is_typing);
+                // Show/hide placeholder.
+                let empty = buf_text(buf).is_empty();
+                imp.input_placeholder.set_visible(empty);
+                let is_typing = !empty;
+                // Cancel any pending debounce timer.
+                if let Some(id) = imp.typing_debounce.borrow_mut().take() {
+                    id.remove();
+                }
+                if !is_typing {
+                    // Send "not typing" immediately when entry is cleared.
+                    if imp.last_typing_sent.get() {
+                        imp.last_typing_sent.set(false);
+                        if let Some(ref cb) = *imp.on_typing.borrow() {
+                            cb(false);
+                        }
+                    }
+                } else {
+                    // Debounce "typing" — only send after 400ms of no input.
+                    // Avoids flooding the server with a notice per keypress.
+                    let view_weak = view_for_typing.downgrade();
+                    *imp.typing_debounce.borrow_mut() = Some(glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            let Some(view) = view_weak.upgrade() else { return };
+                            let imp = view.imp();
+                            *imp.typing_debounce.borrow_mut() = None;
+                            if !imp.last_typing_sent.get() {
+                                imp.last_typing_sent.set(true);
+                                if let Some(ref cb) = *imp.on_typing.borrow() {
+                                    cb(true);
+                                }
+                            }
+                        },
+                    ));
                 }
             });
         }
@@ -612,10 +1095,40 @@ use gtk::subclass::prelude::*;
 
 use crate::models::MessageObject;
 
+/// Result of attempting to place the "New messages" divider at a known event.
+
 glib::wrapper! {
     pub struct MessageView(ObjectSubclass<imp::MessageView>)
         @extends gtk::Box, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::Orientable;
+}
+
+/// Post-process `html` to replace `@DisplayName` with Matrix pill links.
+///
+/// For each entry in `mentions` (display_name → user_id) whose `@name`
+/// pattern appears in `html`, replaces the first occurrence with
+/// `<a href="https://matrix.to/#/{uid}">@name</a>` and returns the list of
+/// user IDs that were actually found. pulldown-cmark HTML-escapes `&`, `<`,
+/// `>` in text, so we search for the escaped form.
+fn inject_mention_pills(
+    html: &str,
+    mentions: &std::collections::HashMap<String, String>,
+) -> (String, Vec<String>) {
+    let mut result = html.to_string();
+    let mut used_ids = Vec::new();
+    for (name, uid) in mentions {
+        let escaped = name
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let at_name = format!("@{escaped}");
+        if result.contains(&at_name) {
+            let pill = format!(r#"<a href="https://matrix.to/#/{uid}">@{escaped}</a>"#);
+            result = result.replacen(&at_name, &pill, 1);
+            used_ids.push(uid.clone());
+        }
+    }
+    (result, used_ids)
 }
 
 impl MessageView {
@@ -625,17 +1138,19 @@ impl MessageView {
 
     /// Set names to highlight in message bodies (user's own name + friends).
     pub fn set_highlight_names(&self, names: &[&str]) {
-        self.imp()
-            .highlight_names
-            .replace(names.iter().map(|s| s.to_string()).collect());
+        let rc: std::rc::Rc<[String]> = names.iter().map(|s| s.to_string()).collect();
+        self.imp().highlight_names.replace(rc);
     }
 
-    /// Add a name to highlight.
+    /// Add a name to highlight.  Replaces the Rc with a new one containing the added name.
     pub fn add_highlight_name(&self, name: &str) {
-        self.imp().highlight_names.borrow_mut().push(name.to_string());
+        let imp = self.imp();
+        let mut v: Vec<String> = imp.highlight_names.borrow().iter().cloned().collect();
+        v.push(name.to_string());
+        imp.highlight_names.replace(v.into());
     }
 
-    pub fn connect_send_message<F: Fn(String, Option<String>, Option<(String, String)>) + 'static>(&self, f: F) {
+    pub fn connect_send_message<F: Fn(String, Option<String>, Option<(String, String)>, Option<String>, Vec<String>) + 'static>(&self, f: F) {
         self.imp().on_send.replace(Some(Box::new(f)));
     }
 
@@ -659,8 +1174,8 @@ impl MessageView {
         imp.reply_to_event.replace(Some(format!("edit:{event_id}")));
         imp.reply_preview_label.set_label(&format!("Editing message"));
         imp.reply_preview.set_visible(true);
-        imp.input_entry.set_text(body);
-        imp.input_entry.grab_focus();
+        imp.input_view.buffer().set_text(body);
+        imp.input_view.grab_focus();
     }
 
     pub fn set_user_id(&self, user_id: &str) {
@@ -669,6 +1184,22 @@ impl MessageView {
 
     pub fn set_is_dm_room(&self, is_dm: bool) {
         self.imp().is_dm_room.set(is_dm);
+    }
+
+    pub fn set_no_media(&self, no_media: bool) {
+        self.imp().is_no_media.set(no_media);
+    }
+
+    /// Build the per-timeline context for row binding.
+    /// Cloning is O(1): highlight_names is an Rc (pointer copy).
+    fn row_context(&self) -> crate::widgets::MessageRowContext {
+        let imp = self.imp();
+        crate::widgets::MessageRowContext {
+            highlight_names: imp.highlight_names.borrow().clone(), // Rc clone = pointer copy
+            my_user_id: imp.user_id.borrow().clone(),
+            is_dm: imp.is_dm_room.get(),
+            no_media: imp.is_no_media.get(),
+        }
     }
 
     pub fn connect_attach<F: Fn(String) + 'static>(&self, f: F) {
@@ -683,6 +1214,63 @@ impl MessageView {
         self.imp().on_open_thread.replace(Some(Box::new(f)));
     }
 
+    pub fn connect_bookmark<F: Fn(String, String, String, u64) + 'static>(&self, f: F) {
+        self.imp().on_bookmark.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_unbookmark<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_unbookmark.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_add_to_rolodex<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_add_to_rolodex.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_remove_from_rolodex<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_remove_from_rolodex.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_get_rolodex_notes<F: Fn(String) -> Option<String> + 'static>(&self, f: F) {
+        self.imp().on_get_rolodex_notes.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_save_rolodex_notes<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_save_rolodex_notes.replace(Some(Box::new(f)));
+    }
+
+    /// Load bookmarked event IDs for `room_id` from the store into the in-memory set.
+    /// Call after `set_messages` so rows are highlighted on the first bind pass.
+    pub fn load_bookmarks(&self, room_id: &str) {
+        let entries = crate::bookmarks::BOOKMARK_STORE.load();
+        let ids: std::collections::HashSet<String> = entries.into_iter()
+            .filter(|e| e.room_id == room_id)
+            .map(|e| e.event_id)
+            .collect();
+        *self.imp().bookmarked_ids.borrow_mut() = ids;
+    }
+
+    /// Update a single event's bookmarked state in the set and on its visible row.
+    pub fn set_message_bookmarked(&self, event_id: &str, bookmarked: bool) {
+        let imp = self.imp();
+        if bookmarked {
+            imp.bookmarked_ids.borrow_mut().insert(event_id.to_string());
+        } else {
+            imp.bookmarked_ids.borrow_mut().remove(event_id);
+        }
+        // Update the visible row if it's currently rendered.
+        let eid = event_id.to_string();
+        let mut child = imp.list_view.first_child();
+        while let Some(ref widget) = child {
+            if let Some(row) = Self::find_message_row(widget) {
+                if *row.imp().event_id.borrow() == eid {
+                    row.set_bookmarked(bookmarked);
+                    break;
+                }
+            }
+            child = widget.next_sibling();
+        }
+    }
+
     pub fn connect_typing<F: Fn(bool) + 'static>(&self, f: F) {
         self.imp().on_typing.replace(Some(Box::new(f)));
     }
@@ -691,15 +1279,21 @@ impl MessageView {
     pub fn set_typing_users(&self, names: &[String]) {
         let imp = self.imp();
         if names.is_empty() {
-            imp.typing_label.set_visible(false);
+            if imp.typing_label.is_visible() {
+                imp.typing_label.set_visible(false);
+            }
         } else {
             let text = match names.len() {
                 1 => format!("{} is typing…", names[0]),
                 2 => format!("{} and {} are typing…", names[0], names[1]),
                 n => format!("{}, {} and {} others are typing…", names[0], names[1], n - 2),
             };
-            imp.typing_label.set_label(&text);
-            imp.typing_label.set_visible(true);
+            if imp.typing_label.label() != text {
+                imp.typing_label.set_label(&text);
+            }
+            if !imp.typing_label.is_visible() {
+                imp.typing_label.set_visible(true);
+            }
         }
     }
 
@@ -718,30 +1312,25 @@ impl MessageView {
     ) {
         if event_id.is_empty() { return; }
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        for i in 0..n {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.event_id() == event_id {
-                mutate(&msg);
-                // Rebind the row widget directly — no ListStore change,
-                // no scroll jump, no visual flash.
-                let mut child = imp.list_view.first_child();
-                let mut idx = 0u32;
-                while let Some(ref widget) = child {
-                    if idx == i {
-                        if let Some(row) = Self::find_message_row(widget) {
-                            let names = imp.highlight_names.borrow().clone();
-                            let my_id = imp.user_id.borrow().clone();
-                            row.bind_message_object(&msg, &names, &my_id, imp.is_dm_room.get());
-                        }
-                        break;
-                    }
-                    child = widget.next_sibling();
-                    idx += 1;
+        // O(1) lookup via event_index — no list_store scan.
+        let msg = match imp.event_index.borrow().get(event_id).cloned() {
+            Some(m) => m,
+            None => return,
+        };
+        mutate(&msg);
+        // Walk only the currently-visible rows (typically ~10-20 widgets, not
+        // the full list_store). Identify the right row by its stored event_id
+        // rather than by absolute position, which is correct across virtual scroll.
+        let eid = event_id.to_string();
+        let mut child = imp.list_view.first_child();
+        while let Some(ref widget) = child {
+            if let Some(row) = Self::find_message_row(widget) {
+                if *row.imp().event_id.borrow() == eid {
+                    row.bind_message_object(&msg, &self.row_context());
+                    break;
                 }
-                return;
             }
+            child = widget.next_sibling();
         }
     }
 
@@ -752,22 +1341,24 @@ impl MessageView {
         self.update_message_in_place(event_id, |msg| {
             let mut reactions: Vec<(String, u64, Vec<String>)> =
                 serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
-            if let Some(entry) = reactions.iter_mut().find(|(e, _, _)| *e == emoji) {
-                if entry.2.iter().any(|n| n == "You") {
-                    // Already reacted — remove our reaction.
-                    entry.2.retain(|n| n != "You");
-                    entry.1 = entry.1.saturating_sub(1);
-                    if entry.1 == 0 {
-                        reactions.retain(|(e, _, _)| *e != emoji);
+            // O(1) emoji lookup via position index.
+            let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
+                .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
+            match pos_by_emoji.get(emoji.as_str()) {
+                Some(&i) => {
+                    // O(1) "You" check via HashSet.
+                    let senders: std::collections::HashSet<&str> =
+                        reactions[i].2.iter().map(|s| s.as_str()).collect();
+                    if senders.contains("You") {
+                        reactions[i].2.retain(|n| n != "You");
+                        reactions[i].1 = reactions[i].1.saturating_sub(1);
+                        if reactions[i].1 == 0 { reactions.remove(i); }
+                    } else {
+                        reactions[i].1 += 1;
+                        reactions[i].2.push("You".to_string());
                     }
-                } else {
-                    // Not yet reacted — add.
-                    entry.1 += 1;
-                    entry.2.push("You".to_string());
                 }
-            } else {
-                // New emoji — add.
-                reactions.push((emoji.clone(), 1, vec!["You".to_string()]));
+                None => reactions.push((emoji.clone(), 1, vec!["You".to_string()])),
             }
             msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
@@ -780,14 +1371,20 @@ impl MessageView {
         self.update_message_in_place(event_id, |msg| {
             let mut reactions: Vec<(String, u64, Vec<String>)> =
                 serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
-            if let Some(entry) = reactions.iter_mut().find(|(e, _, _)| *e == emoji) {
-                // Don't add duplicate sender.
-                if !entry.2.iter().any(|n| n == &sender) {
-                    entry.1 += 1;
-                    entry.2.push(sender);
+            // O(1) emoji lookup via position index.
+            let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
+                .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
+            match pos_by_emoji.get(emoji.as_str()) {
+                Some(&i) => {
+                    // O(1) duplicate sender check via HashSet.
+                    let senders: std::collections::HashSet<&str> =
+                        reactions[i].2.iter().map(|s| s.as_str()).collect();
+                    if !senders.contains(sender.as_str()) {
+                        reactions[i].1 += 1;
+                        reactions[i].2.push(sender);
+                    }
                 }
-            } else {
-                reactions.push((emoji, 1, vec![sender]));
+                None => reactions.push((emoji, 1, vec![sender])),
             }
             msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
@@ -799,77 +1396,75 @@ impl MessageView {
         self.update_message_in_place(event_id, |msg| {
             let mut reactions: Vec<(String, u64, Vec<String>)> =
                 serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
-            if let Some(pos) = reactions.iter().position(|(e, _, _)| *e == emoji) {
-                if reactions[pos].1 <= 1 {
-                    reactions.remove(pos);
-                } else {
-                    reactions[pos].1 -= 1;
-                }
+            // O(1) emoji lookup via position index.
+            let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
+                .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
+            if let Some(&i) = pos_by_emoji.get(emoji.as_str()) {
+                if reactions[i].1 <= 1 { reactions.remove(i); }
+                else { reactions[i].1 -= 1; }
             }
             msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
     }
 
-    /// Update a message's body text (for edits).
-    pub fn update_message_body(&self, event_id: &str, new_body: &str) {
+    /// Patch the event_id into the most recent history entry that matches body.
+    /// Called when MessageSent confirms the server assigned an event_id to our echo.
+    pub fn update_history_event_id(&self, body: &str, event_id: &str) {
+        let mut history = self.imp().send_history.borrow_mut();
+        // Search from the end — the matching entry is almost always the last one.
+        if let Some(entry) = history.iter_mut().rev().find(|(b, _)| b == body) {
+            entry.1 = event_id.to_string();
+        }
+    }
+
+    /// Update a message's body and formatted body (for edits).
+    pub fn update_message_body(&self, event_id: &str, new_body: &str, formatted: Option<&str>) {
         let new_body = new_body.to_string();
+        let new_formatted = formatted.unwrap_or("").to_string();
         self.update_message_in_place(event_id, |msg| {
-            msg.set_body(new_body);
+            msg.set_body(new_body.clone());
+            msg.set_formatted_body(new_formatted.clone());
         });
     }
 
-    /// Scroll to a message by event_id. Returns true if found.
+    /// Scroll to a message by event_id and briefly flash it. Returns true if found.
     pub fn scroll_to_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() { return false; }
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        for i in 0..n {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.event_id() == event_id {
-                // Scroll the ListView to this position.
-                imp.list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
-                // Briefly highlight the target row.
-                let list_view = &imp.list_view;
-                let mut child = list_view.first_child();
-                let mut idx = 0u32;
-                while let Some(ref widget) = child {
-                    if idx == i {
-                        if let Some(row) = Self::find_message_row(widget) {
-                            row.add_css_class("flash-highlight");
-                            let row_weak = row.downgrade();
-                            glib::timeout_add_local_once(
-                                std::time::Duration::from_secs(2),
-                                move || {
-                                    if let Some(r) = row_weak.upgrade() {
-                                        r.remove_css_class("flash-highlight");
-                                    }
-                                },
-                            );
-                        }
-                        break;
-                    }
-                    child = widget.next_sibling();
-                    idx += 1;
+        // O(1) lookup — no list_store scan.
+        let msg = match imp.event_index.borrow().get(event_id).cloned() {
+            Some(m) => m,
+            None => return false,
+        };
+        // list_store.find() uses GObject identity — encapsulated library call.
+        let Some(i) = imp.list_store.find(&msg) else { return false };
+        imp.list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
+        // Trigger flash via GObject property — the notify::is-flashing handler
+        // in bind_message_object applies the CSS class reactively, no widget walk.
+        msg.set_is_flashing(true);
+        let msg_weak = msg.downgrade();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(900),
+            move || {
+                if let Some(m) = msg_weak.upgrade() {
+                    m.set_is_flashing(false);
                 }
-                return true;
-            }
-        }
-        false
+            },
+        );
+        true
     }
 
     /// Remove a message from the timeline (for deletes).
     pub fn remove_message(&self, event_id: &str) {
         if event_id.is_empty() { return; }
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        for i in 0..n {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.event_id() == event_id {
-                imp.list_store.remove(i);
-                return;
-            }
+        // O(1) lookup via event_index.
+        let msg = match imp.event_index.borrow_mut().remove(event_id) {
+            Some(m) => m,
+            None => return,
+        };
+        if let Some(i) = imp.list_store.find(&msg) {
+            imp.list_store.remove(i);
         }
     }
 
@@ -880,29 +1475,149 @@ impl MessageView {
         imp.reply_quote.replace(Some((sender.to_string(), body.to_string())));
         imp.reply_preview_label.set_label(&format!("{sender}: {body}"));
         imp.reply_preview.set_visible(true);
-        imp.input_entry.grab_focus();
+        imp.input_view.grab_focus();
     }
 
     /// Replace all messages (used when switching rooms).
     /// Scrolls to the m.fully_read marker if set, otherwise to the bottom.
     pub fn set_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
+
+        let first_load = !imp.messages_loaded.get();
+        imp.messages_loaded.set(true);
+
+        // Empty placeholder from a bg_refresh timeout — dismiss the banner but
+        // keep whatever messages are already displayed.
+        if should_skip_empty_splice(messages.is_empty(), first_load) {
+            return;
+        }
+
+        if !first_load {
+            // bg_refresh: skip the expensive full-list splice when nothing changed.
+            // Check the NEWEST message (messages.last() — messages are oldest-first after
+            // extract_messages reversal).  Checking .first() (the oldest) was wrong:
+            // when a new message arrives, the oldest of the 50-window shifts out but
+            // is still in event_index → false negative → update silently skipped.
+            let has_new = messages.last()
+                .map(|m| !m.event_id.is_empty() && !imp.event_index.borrow().contains_key(&m.event_id))
+                .unwrap_or(false);
+            let has_utd = imp.event_index.borrow().values()
+                .any(|obj| obj.body().starts_with('\u{1f512}'));
+            // Detect edits: same event_id in index but body or formatted_body changed.
+            let has_edit = messages.iter().any(|m| {
+                if m.event_id.is_empty() { return false; }
+                imp.event_index.borrow()
+                    .get(&m.event_id)
+                    .map(|obj| obj.body() != m.body
+                        || obj.formatted_body() != m.formatted_body.as_deref().unwrap_or(""))
+                    .unwrap_or(false)
+            });
+            // Detect redactions: event_id in index but absent from the fresh batch.
+            let incoming_ids: std::collections::HashSet<&str> =
+                messages.iter().filter(|m| !m.event_id.is_empty())
+                    .map(|m| m.event_id.as_str()).collect();
+            let has_redaction = imp.event_index.borrow().keys()
+                .filter(|k| k.as_str() != "__unread_divider__")
+                .any(|k| !incoming_ids.contains(k.as_str()));
+            if !has_new && !has_utd && !has_edit && !has_redaction {
+                // No new messages to splice — but still insert the divider if needed.
+                // This path is hit when the disk cache already contains the unread
+                // messages (bg_refresh fetches the same window), so the splice skips
+                // but set_room_meta has already set room_unread_count > 0.
+                // No-splice bg_refresh: only insert divider if this is effectively
+                // still the first view (disk cache path sets first_load=true, then
+                // bg_refresh hits this branch with first_load=false but the divider
+                // hasn't been placed yet because the disk-load set_messages was the
+                // first_load call). Guard: don't re-insert once divider is present.
+                let unread = imp.room_unread_count.get();
+                let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
+                if !divider_in_list && unread > 0 {
+                    let fully_read = imp.fully_read_event_id.borrow().clone();
+                    tracing::info!(
+                        "Divider check (no-splice): unread={unread}, fully_read={fully_read:?}"
+                    );
+                    let placed = fully_read
+                        .as_deref()
+                        .map(|eid| self.insert_divider_after_event(eid))
+                        .unwrap_or(false);
+                    if !placed {
+                        self.insert_divider_by_count(unread);
+                    }
+                }
+                return;
+            }
+        }
+
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
         imp.list_store.splice(0, n, &objs);
+        // Rebuild event_index from scratch for the new room.
+        let mut idx = imp.event_index.borrow_mut();
+        idx.clear();
+        for obj in &objs {
+            let eid = obj.event_id();
+            if !eid.is_empty() {
+                idx.insert(eid, obj.clone());
+            }
+        }
+        drop(idx);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+
+        // Insert (or re-insert) the "New messages" divider whenever it's absent from
+        // the list and the server reports unread messages.  The splice above always
+        // removes the divider because it replaces the full message list with fresh SDK
+        // data — so we re-run this check on every load, not just first_load.
+        //
+        // Three cases for where to place it:
+        //   A) fully_read event is in the window with messages after it → insert there.
+        //   B) fully_read event is the LAST message in the window (the unread messages
+        //      are newer than this window) → fall back to count-based placement.
+        //   C) fully_read event is not in the window at all, or no marker → fall back
+        //      to count-based placement.
+        let unread = imp.room_unread_count.get();
+        // Place the divider whenever the list has no divider and the server
+        // reports unread messages.  This includes both the initial disk-cache
+        // load (first_load=true) AND bg_refresh calls that splice new messages
+        // into the list (first_load=false) — without this, the divider would
+        // silently disappear any time a bg_refresh delivered new messages
+        // because the splice clears event_index (removing the divider sentinel).
+        // Auto-scroll is still gated on first_load below so the user is not
+        // yanked away from their reading position.
+        let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
+        let divider_inserted = if !divider_in_list && unread > 0 {
+            let fully_read = imp.fully_read_event_id.borrow().clone();
+            tracing::info!("Divider check: unread={unread}, fully_read={fully_read:?}");
+            let placed = fully_read
+                .as_deref()
+                .map(|eid| self.insert_divider_after_event(eid))
+                .unwrap_or(false);
+            if !placed {
+                // Cases B and C: fall back to count-based placement.
+                self.insert_divider_by_count(unread);
+            }
+            true
+        } else {
+            tracing::debug!(
+                "Divider skipped: divider_in_list={divider_in_list}, unread={unread}"
+            );
+            false
+        };
+
         imp.view_stack.set_visible_child_name("messages");
 
-        // Scroll to the fully_read marker if present, otherwise to bottom.
-        let marker = imp.fully_read_event_id.borrow().clone();
-        if let Some(ref eid) = marker {
-            if !self.scroll_to_event(eid) {
-                // Marker not in this batch — scroll to bottom.
-                self.scroll_to_bottom();
-            }
-        } else {
-            self.scroll_to_bottom();
+        // Only auto-scroll on the first load.  Subsequent bg_refresh calls
+        // leave the viewport where the user left it.
+        if first_load {
+            let view_weak = self.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(view) = view_weak.upgrade() else { return };
+                if divider_inserted {
+                    view.scroll_to_event("__unread_divider__");
+                } else {
+                    view.scroll_to_bottom();
+                }
+            });
         }
     }
 
@@ -911,6 +1626,15 @@ impl MessageView {
         let imp = self.imp();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
         imp.list_store.splice(0, 0, &objs);
+        // Add new objects to the event_index.
+        let mut idx = imp.event_index.borrow_mut();
+        for obj in &objs {
+            let eid = obj.event_id();
+            if !eid.is_empty() {
+                idx.insert(eid, obj.clone());
+            }
+        }
+        drop(idx);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
     }
@@ -946,6 +1670,7 @@ impl MessageView {
             &m.sender,
             &m.sender_id,
             &body,
+            m.formatted_body.as_deref().unwrap_or(""),
             m.timestamp,
             &m.event_id,
             m.reply_to.as_deref().unwrap_or(""),
@@ -954,6 +1679,7 @@ impl MessageView {
             &media_json,
         );
         obj.set_is_highlight(m.is_highlight);
+        obj.set_is_system_event(m.is_system_event);
         if let Some(ref name) = m.reply_to_sender {
             obj.set_reply_to_sender(name.clone());
         }
@@ -968,19 +1694,36 @@ impl MessageView {
     /// Clear messages and room meta (used when switching rooms before new data arrives).
     pub fn clear(&self) {
         let imp = self.imp();
+        imp.view_stack.set_visible_child_name("loading");
+        self.set_refreshing(false);
         imp.list_store.remove_all();
+        imp.event_index.borrow_mut().clear();
+        imp.bookmarked_ids.borrow_mut().clear();
+        imp.new_message_objs.borrow_mut().clear();
         imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
+        imp.room_unread_count.set(0);
+        imp.messages_loaded.set(false);
         // Clear info banner so stale pinned messages don't flash.
+        imp.unread_banner.set_revealed(false);
         imp.info_banner.set_visible(false);
         imp.info_separator.set_visible(false);
         imp.topic_label.set_visible(false);
         imp.tombstone_banner.set_visible(false);
         imp.pinned_box.set_visible(false);
         self.remove_css_class("tombstone-view");
-        // Clear reply state.
+        // Clear reply state and pending mention tracking.
         imp.reply_to_event.replace(None);
         imp.reply_quote.replace(None);
+        imp.pending_mentions.borrow_mut().clear();
+        // Reset typing state so new room gets a clean slate.
+        imp.last_typing_sent.set(false);
+        if let Some(id) = imp.typing_debounce.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = imp.spell_debounce.borrow_mut().take() {
+            id.remove();
+        }
         imp.reply_preview.set_visible(false);
         imp.typing_label.set_visible(false);
     }
@@ -995,9 +1738,9 @@ impl MessageView {
         let imp = self.imp();
         let mut show_banner = false;
 
-        // Topic.
+        // Topic — treat as markdown (Matrix topic is plain text but users write markdown).
         if !meta.topic.is_empty() {
-            imp.topic_label.set_label(&meta.topic);
+            imp.topic_label.set_markup(&crate::markdown::md_to_pango(&meta.topic));
             imp.topic_label.set_visible(true);
             show_banner = true;
         } else {
@@ -1032,7 +1775,7 @@ impl MessageView {
             pinned.remove(&child);
         }
         if !meta.pinned_messages.is_empty() {
-            for (sender, body) in &meta.pinned_messages {
+            for (sender, body, formatted) in &meta.pinned_messages {
                 let row = gtk::Box::builder()
                     .orientation(gtk::Orientation::Vertical)
                     .spacing(2)
@@ -1043,13 +1786,17 @@ impl MessageView {
                     .halign(gtk::Align::Start)
                     .css_classes(["caption", "heading"])
                     .build();
+                let pango = match formatted {
+                    Some(html) => crate::markdown::html_to_pango(html),
+                    None => crate::markdown::md_to_pango(body),
+                };
                 let body_label = gtk::Label::builder()
-                    .label(body)
                     .halign(gtk::Align::Start)
                     .wrap(true)
                     .wrap_mode(gtk::pango::WrapMode::WordChar)
                     .css_classes(["caption"])
                     .build();
+                body_label.set_markup(&pango);
                 row.append(&sender_label);
                 row.append(&body_label);
                 pinned.append(&row);
@@ -1072,105 +1819,878 @@ impl MessageView {
         members.sort_by(|a, b| a.0.cmp(&b.0));
         imp.room_members.replace(members);
 
-        // Store the fully_read marker for scroll-to-position.
+        // Update fully_read marker and unread count. messages_loaded is
+        // intentionally NOT reset here — only clear() resets it on room switch
+        // so bg_refresh doesn't snap the user back to an earlier position.
+        tracing::info!(
+            "set_room_meta: unread={}, fully_read={:?}",
+            meta.unread_count,
+            meta.fully_read_event_id
+        );
+        // Preserve a non-zero unread count that was set at initial load.
+        // A bg_refresh completing after the 15-second read-receipt timer fires
+        // would otherwise send unread_count=0 and erase the divider before the
+        // user has actually scrolled to those messages.
+        // Rule: only lower the count to zero when clear() resets it (room switch)
+        // or dismiss_unread() resets it (user sends a message).
+        let new_count = effective_unread_count(
+            imp.messages_loaded.get(),
+            imp.room_unread_count.get(),
+            meta.unread_count,
+        );
+        imp.room_unread_count.set(new_count);
         imp.fully_read_event_id.replace(meta.fully_read_event_id.clone());
+    }
+
+    /// Called when the current user sends a message.  Clears the "New messages"
+    /// divider and resets the unread count — if you're actively typing you've
+    /// read everything in this room.  Prevents the user's own sent messages from
+    /// appearing below the divider on the next bg_refresh.
+    pub fn dismiss_unread(&self) {
+        self.imp().room_unread_count.set(0);
+        self.remove_dividers();
     }
 
     /// Remove all "New messages" divider lines from the timeline.
     pub fn remove_dividers(&self) {
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        // Iterate in reverse so removal indices stay valid.
-        for i in (0..n).rev() {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.sender().is_empty() && msg.event_id().is_empty() && msg.body().contains("──") {
+        // Clear new-message tint only on tracked objects — O(unread) not O(n).
+        for obj in imp.new_message_objs.borrow_mut().drain(..) {
+            obj.set_is_new_message(false);
+        }
+        // O(1) lookup — at most one divider exists at a time.
+        if let Some(divider) = imp.event_index.borrow_mut().remove("__unread_divider__") {
+            if let Some(i) = imp.list_store.find(&divider) {
                 imp.list_store.remove(i);
             }
         }
+        imp.unread_banner.set_revealed(false);
     }
 
-    /// Insert a "New messages" divider line in the timeline.
+    /// Build a "New messages" divider MessageObject with the sentinel event_id.
+    fn make_divider_obj() -> MessageObject {
+        let divider = MessageObject::new(
+            "",
+            "",
+            "── New messages ──",
+            "",
+            0,
+            "__unread_divider__",
+            "",
+            "",
+            &[],
+            "",
+        );
+        divider.set_is_highlight(true);
+        divider
+    }
+
+    /// Insert a "New messages" divider by counting `unread_count` items back
+    /// from the end of the list.  Simpler and more reliable than event-id-based
+    /// placement — works regardless of whether `fully_read_event_id` is in the
+    /// current window.  Auto-dismisses the banner after 10 seconds.
+    fn insert_divider_by_count(&self, unread_count: u32) {
+        let imp = self.imp();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        let pos = n.saturating_sub(unread_count);
+        // Mark all messages after the divider position as new and track them
+        // so remove_dividers can clear them in O(unread) not O(total).
+        let mut new_objs = imp.new_message_objs.borrow_mut();
+        new_objs.clear();
+        for i in pos..n {
+            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i)
+                .and_downcast::<MessageObject>()
+            {
+                obj.set_is_new_message(true);
+                new_objs.push(obj);
+            }
+        }
+        drop(new_objs);
+        let divider = Self::make_divider_obj();
+        imp.list_store.insert(pos, &divider);
+        imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
+        // Actual new count = messages from pos to end (before insert, n - pos).
+        let actual_new = n - pos;
+        self.show_unread_banner(actual_new);
+    }
+
+    /// Insert a "New messages" divider after the given event_id.
+    ///
+    /// Returns `true` if the event was found in the list and the divider was
+    /// inserted.  Returns `false` (case B/C) so the caller can fall back to
+    /// `insert_divider_by_count`.
+    fn insert_divider_after_event(&self, event_id: &str) -> bool {
+        let imp = self.imp();
+        let Some(marker_obj) = imp.event_index.borrow().get(event_id).cloned() else {
+            return false; // Event not in the current window (case C).
+        };
+        let Some(marker_pos) = imp.list_store.find(&marker_obj) else {
+            return false;
+        };
+        let insert_pos = marker_pos + 1;
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        if insert_pos >= n {
+            return false; // Event is the last item — unread messages not yet loaded (case B).
+        }
+        // Mark messages after the divider position as new.
+        let mut new_objs = imp.new_message_objs.borrow_mut();
+        new_objs.clear();
+        for i in insert_pos..n {
+            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i)
+                .and_downcast::<MessageObject>()
+            {
+                obj.set_is_new_message(true);
+                new_objs.push(obj);
+            }
+        }
+        drop(new_objs);
+        let new_count = n - insert_pos;
+        let divider = Self::make_divider_obj();
+        imp.list_store.insert(insert_pos, &divider);
+        imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
+        self.show_unread_banner(new_count);
+        true
+    }
+
+    /// Insert a "New messages" divider line at the end of the timeline
+    /// (used for live messages arriving while the room is unfocused).
     /// Removes any existing dividers first to avoid duplicates.
     pub fn insert_divider(&self) {
         self.remove_dividers();
-        let divider = MessageObject::new(
-            "",    // sender
-            "",    // sender_id
-            "── New messages ──",
-            0,     // timestamp
-            "",    // event_id
-            "",    // reply_to
-            "",    // thread_root
-            &[],   // reactions
-            "",    // media_json
-        );
-        divider.set_is_highlight(true); // use highlight styling for visibility
+        let divider = Self::make_divider_obj();
+        self.imp().event_index.borrow_mut().insert("__unread_divider__".to_string(), divider.clone());
         self.imp().list_store.append(&divider);
+        // Count starts at 1; window.rs calls set_unseen_count() as more messages arrive.
+        self.show_unread_banner(1);
         self.scroll_to_bottom();
     }
 
+    /// Update the "New messages" banner title with a fresh count.
+    ///
+    /// Called by window.rs each time `unseen_while_unfocused` increments so the
+    /// banner always shows an accurate live count.
+    pub fn set_unseen_count(&self, count: u32) {
+        self.imp().unread_banner.set_title(&unread_label(count));
+    }
+
     /// Append a single new message (used for live updates).
-    pub fn append_message(&self, msg: &crate::matrix::MessageInfo) {
-        self.imp()
-            .list_store
-            .append(&Self::info_to_obj(msg));
+    /// `mark_as_new` tints the row blue and adds it to `new_message_objs` so
+    /// `remove_dividers` can clear the tint when the user reads the room.
+    pub fn append_message(&self, msg: &crate::matrix::MessageInfo, mark_as_new: bool) {
+        let obj = Self::info_to_obj(msg);
+        let eid = obj.event_id();
+        if !eid.is_empty() {
+            self.imp().event_index.borrow_mut().insert(eid, obj.clone());
+        }
+        if mark_as_new {
+            obj.set_is_new_message(true);
+            self.imp().new_message_objs.borrow_mut().push(obj.clone());
+        }
+        self.imp().list_store.append(&obj);
         self.scroll_to_bottom();
     }
 
     /// Patch the event_id on a local echo message once the server confirms it.
     /// Searches backwards for a MessageObject with empty event_id and matching body.
-    pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) {
+    /// Returns true if an echo was found and patched, false otherwise.
+    pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let imp = self.imp();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        // Search backwards — local echo is near the end.
+        // Local echo search — echos have empty event_id and are near the end.
+        // This is a backwards scan over items to process (finding the echo),
+        // not a lookup of a known key — acceptable per the no-loops policy.
         for i in (0..n).rev() {
             let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id().is_empty() && msg.body() == echo_body {
                 msg.set_event_id(event_id.to_string());
-                // Rebind the row so the MessageRow's Rc cells (event_id etc.)
-                // get updated — otherwise edit/delete buttons read stale empty IDs.
+                // Add to event_index now that it has a real ID.
+                imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
+                // Rebind the visible row so MessageRow's Rc cells get updated.
+                let eid_str = event_id.to_string();
                 let mut child = imp.list_view.first_child();
-                let mut idx = 0u32;
                 while let Some(ref widget) = child {
-                    if idx == i {
-                        if let Some(row) = Self::find_message_row(widget) {
-                            let names = imp.highlight_names.borrow().clone();
-                            let my_id = imp.user_id.borrow().clone();
-                            row.bind_message_object(msg, &names, &my_id, imp.is_dm_room.get());
+                    if let Some(row) = Self::find_message_row(widget) {
+                        // Echo row had empty event_id — match by checking if row
+                        // still has empty event_id (it hasn't been reused yet).
+                        if row.imp().event_id.borrow().is_empty()
+                            || *row.imp().event_id.borrow() == eid_str
+                        {
+                            row.bind_message_object(msg, &self.row_context());
+                            break;
                         }
-                        break;
                     }
                     child = widget.next_sibling();
-                    idx += 1;
                 }
-                return;
-            }
-        }
-    }
-
-    /// Check if a message with the given event_id already exists in the timeline.
-    pub fn has_event(&self, event_id: &str) -> bool {
-        if event_id.is_empty() { return false; }
-        let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        // Search backwards — recent messages are more likely to match.
-        for i in (0..n).rev() {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.event_id() == event_id {
                 return true;
             }
         }
         false
     }
 
+    /// Check if a message with the given event_id already exists in the timeline.
+    pub fn has_event(&self, event_id: &str) -> bool {
+        if event_id.is_empty() { return false; }
+        // O(1) lookup via event_index.
+        self.imp().event_index.borrow().contains_key(event_id)
+    }
+
     fn scroll_to_bottom(&self) {
-        let adj = self.imp().scrolled_window.vadjustment();
-        // Schedule scroll after the layout pass so upper bound is updated.
+        let imp = self.imp();
+        if gio::prelude::ListModelExt::n_items(&imp.list_store) == 0 { return; }
+        // Do NOT call list_view.scroll_to() — with GTK_LIST_SCROLL_NONE it has
+        // undefined behaviour when the item is already partially visible and can
+        // scroll the last row to the *top* of the viewport, overriding us.
+        //
+        // Instead, drive the vadjustment directly.  GTK layout runs at priority
+        // RESIZE (-10); our idle at DEFAULT_IDLE (200) is guaranteed to fire
+        // after the layout has updated vadj.upper for the new row.  We fire a
+        // second idle inside the first to catch any second layout pass (e.g.
+        // variable-height rows that get remeasured after realisation).
+        let sw = imp.scrolled_window.clone();
         glib::idle_add_local_once(move || {
-            adj.set_value(adj.upper());
+            let vadj = sw.vadjustment();
+            vadj.set_value(vadj.upper() - vadj.page_size());
+            let sw2 = sw.clone();
+            glib::idle_add_local_once(move || {
+                let vadj = sw2.vadjustment();
+                vadj.set_value(vadj.upper() - vadj.page_size());
+            });
         });
+    }
+
+    /// Show or hide the banner that indicates a background refresh is in
+    /// progress while stale cached messages are displayed.
+    pub fn set_refreshing(&self, refreshing: bool) {
+        // Only show "Updating messages" when there are no messages yet (first
+        // load of the room).  Background re-fetches triggered by SyncGap on
+        // active rooms run silently so the banner doesn't flash every 30 s.
+        let show = should_show_refresh_banner(refreshing, self.imp().messages_loaded.get());
+        self.imp().refresh_banner.set_revealed(show);
+    }
+
+    /// Reveal the unread banner with an accurate count label and schedule
+    /// auto-dismiss after 10 seconds.
+    fn show_unread_banner(&self, count: u32) {
+        let imp = self.imp();
+        imp.unread_banner.set_title(&unread_label(count));
+        imp.unread_banner.set_revealed(true);
+        let view_weak = self.downgrade();
+        glib::timeout_add_seconds_local_once(10, move || {
+            let Some(view) = view_weak.upgrade() else { return };
+            view.imp().unread_banner.set_revealed(false);
+        });
+    }
+}
+
+/// Format the unread banner title for `n` new messages.
+pub(crate) fn unread_label(n: u32) -> String {
+    match n {
+        1 => "1 new message".to_string(),
+        _ => format!("{n} new messages"),
+    }
+}
+
+/// Pure helper: resolve the effective `room_unread_count` when `set_room_meta` is called.
+///
+/// Once messages are loaded (initial load done), a bg_refresh that returns
+/// `new_count = 0` must NOT erase the divider — it means the 15-second
+/// read-receipt timer fired while the refresh was still in flight.  Keep
+/// the existing count so the divider stays until the user explicitly reads
+/// (sends a message → `dismiss_unread`, or switches rooms → `clear`).
+///
+/// Rules:
+///   - Initial load (`!messages_loaded`): always use `new_count` (whatever
+///     the server reported, including 0 for a room the user has read).
+///   - Background refresh (`messages_loaded`): use `max(current, new_count)`.
+///     This preserves the count if the timer fired mid-refresh (new=0 < current),
+///     and still updates it if new messages arrived (new > current).
+pub(crate) fn effective_unread_count(messages_loaded: bool, current: u32, new_count: u32) -> u32 {
+    if messages_loaded { current.max(new_count) } else { new_count }
+}
+
+/// Pure helper: should `set_messages` skip the splice when the payload is empty?
+/// An empty placeholder from a bg_refresh timeout must not clear messages that
+/// are already displayed — only the first-load path may process an empty slice.
+pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -> bool {
+    messages_empty && !first_load
+}
+
+/// Pure helper: should a live-appended message be tinted as "new"?
+/// Only tint when the window is not focused — if the user is actively watching
+/// the room there is no need to highlight messages as they arrive.
+pub(crate) fn should_mark_as_new(window_focused: bool) -> bool {
+    !window_focused
+}
+
+/// Pure helper: should the "Updating messages" banner be shown?
+/// The banner is only useful on first load (empty timeline).  Background
+/// re-fetches (SyncGap) run silently to avoid flashing the banner every
+/// 30 s in active rooms.
+pub(crate) fn should_show_refresh_banner(refreshing: bool, messages_loaded: bool) -> bool {
+    refreshing && !messages_loaded
+}
+
+/// Pure helper: given an ordered slice of event IDs and room metadata, return
+/// the insert position (0-based) for the "New messages" divider, or `None` if
+/// no divider should be placed (unread_count == 0).
+///
+/// Rules (mirrors the GTK methods above so they can be unit-tested without GTK):
+///   A) `fully_read` is Some, the event is in the list, AND it is NOT the last
+///      item → insert immediately after it.
+///   B) `fully_read` is Some but the event IS the last item (new messages are
+///      beyond the current window) → fall back to count-based placement.
+///   C) `fully_read` is Some but the event is not in the list at all
+///      (paged out) → fall back to count-based placement.
+///   D) `fully_read` is None → count-based placement.
+///
+/// Count-based placement: `len.saturating_sub(unread_count)`.
+///
+/// # Deciding when to insert (see `divider_decision`)
+///
+/// `compute_divider_pos` only answers *where*.  Call `divider_decision` to
+/// also answer *whether* — it gates on `divider_present` and `unread_count`
+/// and returns the banner count alongside the insert position.
+pub(crate) fn compute_divider_pos(
+    event_ids: &[&str],
+    fully_read: Option<&str>,
+    unread_count: u32,
+) -> Option<usize> {
+    if unread_count == 0 {
+        return None;
+    }
+    let n = event_ids.len();
+    if let Some(eid) = fully_read {
+        if let Some(pos) = event_ids.iter().position(|&id| id == eid) {
+            let insert_pos = pos + 1;
+            if insert_pos < n {
+                // Case A: event found and is not the last item.
+                return Some(insert_pos);
+            }
+            // Case B: event is the last item — fall through.
+        }
+        // Case C: event not found — fall through.
+    }
+    // Cases B, C, D: count-based.
+    Some(n.saturating_sub(unread_count as usize))
+}
+
+/// Combined "where AND how many" divider decision.
+///
+/// Returns `Some((insert_position, banner_count))` when a divider should be
+/// inserted, or `None` when it should be skipped.  The caller inserts the
+/// divider object at `insert_position` and passes `banner_count` to
+/// `show_unread_banner`.
+///
+/// * `divider_present` — pass `true` when a divider is already in the list.
+///   The function returns `None` in that case (no duplicate).
+/// * `banner_count` is derived from `insert_position`, not from `unread_count`
+///   directly, so it reflects the actual number of messages after the divider
+///   in the current window rather than the (possibly stale) server count.
+pub(crate) fn divider_decision(
+    event_ids: &[&str],
+    fully_read: Option<&str>,
+    unread_count: u32,
+    divider_present: bool,
+) -> Option<(usize, u32)> {
+    if divider_present {
+        return None;
+    }
+    let insert_pos = compute_divider_pos(event_ids, fully_read, unread_count)?;
+    let n = event_ids.len();
+    let banner_count = (n.saturating_sub(insert_pos)) as u32;
+    Some((insert_pos, banner_count.max(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_divider_pos, divider_decision, unread_label,
+        effective_unread_count,
+        should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
+    };
+
+    /// Build a timeline split at `read_count`: the first `read_count` events are
+    /// read, the rest are new.  Returns `(all_ids, fully_read_id, unread_count,
+    /// expected_divider_pos)` ready to feed into `compute_divider_pos`.
+    ///
+    /// `expected_divider_pos` is the index of the first new message (i.e. the
+    /// position a divider inserted *before* it would separate read from new).
+    fn make_timeline(
+        total: usize,
+        read_count: usize,
+    ) -> (Vec<String>, Option<String>, u32, Option<usize>) {
+        let events: Vec<String> = (0..total).map(|i| format!("$ev{i}")).collect();
+        let unread = (total.saturating_sub(read_count)) as u32;
+        let fully_read = if read_count > 0 {
+            Some(events[read_count - 1].clone())
+        } else {
+            None
+        };
+        // If all messages are read, no divider; otherwise divider at the first new msg.
+        let expected = if unread == 0 { None } else { Some(read_count) };
+        (events, fully_read, unread, expected)
+    }
+
+    /// Convenience: run `compute_divider_pos` from a `make_timeline` result and
+    /// assert the output matches the expected position.
+    fn assert_divider(total: usize, read_count: usize) {
+        let (events, fully_read, unread, expected) = make_timeline(total, read_count);
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let got = compute_divider_pos(&ids, fully_read.as_deref(), unread);
+        assert_eq!(
+            got, expected,
+            "total={total} read={read_count}: wanted divider at {expected:?}, got {got:?}"
+        );
+    }
+
+    // ── Basic arrive scenarios ───────────────────────────────────────────────
+
+    #[test]
+    fn one_new_message_arrives() {
+        // 9 read, 1 new → divider before the last message.
+        assert_divider(10, 9);
+    }
+
+    #[test]
+    fn three_new_messages_arrive() {
+        // 7 read, 3 new → divider before the 8th message (index 7).
+        assert_divider(10, 7);
+    }
+
+    #[test]
+    fn all_messages_are_new() {
+        // No fully_read at all (read_count=0) → count-based at index 0.
+        assert_divider(5, 0);
+    }
+
+    #[test]
+    fn all_messages_are_read_no_divider() {
+        // All read → no divider.
+        assert_divider(8, 8);
+    }
+
+    #[test]
+    fn single_new_message_in_single_item_list() {
+        // Only one message in the window and it's new.
+        assert_divider(1, 0);
+    }
+
+    // ── Fully-read event present but in different positions ──────────────────
+
+    #[test]
+    fn fully_read_is_first_message_rest_are_new() {
+        // Alice read only the very first message; 9 more arrived since.
+        // fully_read = $ev0, so divider at index 1.
+        assert_divider(10, 1);
+    }
+
+    #[test]
+    fn fully_read_is_second_to_last() {
+        // fully_read = second-to-last, 1 new at the end.
+        assert_divider(6, 5);
+    }
+
+    // ── Fallback scenarios (fully_read outside current window) ───────────────
+
+    #[test]
+    fn fully_read_event_not_in_window_falls_back_to_count() {
+        // The server says fully_read = "$old_event" which has scrolled out of
+        // the current 25-message window.  We must fall back to count-based.
+        //
+        // Window: $ev0..$ev9 (10 messages), fully_read = "$old_event" (absent),
+        // server says 3 unread → divider at 10 - 3 = 7.
+        let events: Vec<String> = (0..10).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let got = compute_divider_pos(&ids, Some("$old_event"), 3);
+        assert_eq!(got, Some(7), "count-based fallback: expected index 7");
+    }
+
+    #[test]
+    fn fully_read_is_last_in_window_new_messages_not_loaded_yet() {
+        // The user read up to the last event in the current batch.  The actual
+        // new messages haven't been fetched yet (they'll arrive via bg_refresh).
+        // fully_read = last event → insert_divider_after_event returns false →
+        // fall back to count-based.
+        //
+        // Window: $ev0..$ev4, fully_read = $ev4 (last), 2 new → 5 - 2 = 3.
+        let events: Vec<&str> = vec!["$ev0", "$ev1", "$ev2", "$ev3", "$ev4"];
+        let got = compute_divider_pos(&events, Some("$ev4"), 2);
+        assert_eq!(got, Some(3), "last-item fallback: expected index 3");
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_unreads_never_places_divider() {
+        let events = ["$a", "$b", "$c"];
+        assert_eq!(compute_divider_pos(&events, Some("$a"), 0), None);
+        assert_eq!(compute_divider_pos(&events, None, 0), None);
+    }
+
+    #[test]
+    fn unread_count_larger_than_window_clamps_to_start() {
+        // Server reports 20 unread but only 5 messages in the window →
+        // divider at index 0 (show everything as new).
+        let events: Vec<String> = (0..5).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let got = compute_divider_pos(&ids, None, 20);
+        assert_eq!(got, Some(0));
+    }
+
+    #[test]
+    fn empty_window_with_unreads_gives_position_zero() {
+        // Room has unread messages but they haven't loaded yet.
+        let ids: &[&str] = &[];
+        assert_eq!(compute_divider_pos(ids, None, 5), Some(0));
+    }
+
+    #[test]
+    fn large_window_few_unreads() {
+        // 50-message window (typical batch size), last 2 are new.
+        assert_divider(50, 48);
+    }
+
+    #[test]
+    fn large_window_many_unreads() {
+        // 50-message window, user hasn't opened in a while — 20 new messages.
+        assert_divider(50, 30);
+    }
+
+    #[test]
+    fn fully_read_consistent_with_first_new_event() {
+        // Verify that the event-ID path and the count path agree when both are
+        // available and the server counts match the position of fully_read.
+        // 10 messages, 4 new — fully_read = $ev5 (index 5) → divider at 6.
+        let (events, fully_read, unread, expected) = make_timeline(10, 6);
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        // Event-ID path.
+        let via_event_id = compute_divider_pos(&ids, fully_read.as_deref(), unread);
+        // Count-only path (no fully_read).
+        let via_count = compute_divider_pos(&ids, None, unread);
+        // Both must land at the same index since count matches actual position.
+        assert_eq!(via_event_id, expected);
+        assert_eq!(via_count, expected);
+    }
+
+    // ── Banner label formatting ───────────────────────────────────────────────
+
+    #[test]
+    fn banner_label_singular() {
+        assert_eq!(unread_label(1), "1 new message");
+    }
+
+    #[test]
+    fn banner_label_plural() {
+        assert_eq!(unread_label(2), "2 new messages");
+        assert_eq!(unread_label(99), "99 new messages");
+    }
+
+    #[test]
+    fn banner_label_zero_is_plural_form() {
+        // Zero unreads is a degenerate case (banner shouldn't be shown) but
+        // the label function should not panic.
+        assert_eq!(unread_label(0), "0 new messages");
+    }
+
+    // ── divider_decision: when to insert and how many to show ────────────────
+
+    /// Helper: build an event-ID vec and run `divider_decision`.
+    fn decision(total: usize, read_count: usize, divider_present: bool) -> Option<(usize, u32)> {
+        let events: Vec<String> = (0..total).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let unread = (total.saturating_sub(read_count)) as u32;
+        let fully_read = if read_count > 0 {
+            Some(events[read_count - 1].clone())
+        } else {
+            None
+        };
+        divider_decision(&ids, fully_read.as_deref(), unread, divider_present)
+    }
+
+    // ── Initial room load (first_load=true) ──────────────────────────────────
+
+    #[test]
+    fn first_load_3_unreads_returns_correct_pos_and_count() {
+        // 10 messages, 7 read, 3 new → divider at 7, banner "3 new messages".
+        let result = decision(10, 7, false);
+        assert_eq!(result, Some((7, 3)));
+    }
+
+    #[test]
+    fn first_load_no_unreads_returns_none() {
+        // All read → no divider.
+        assert_eq!(decision(10, 10, false), None);
+    }
+
+    #[test]
+    fn first_load_all_new_returns_pos_zero_full_count() {
+        // Opened a room with zero previous reads → divider at 0, count=5.
+        assert_eq!(decision(5, 0, false), Some((0, 5)));
+    }
+
+    // ── bg_refresh path: divider already present ─────────────────────────────
+
+    #[test]
+    fn divider_not_duplicated_when_already_present() {
+        // A divider is in the list from the initial disk-cache load.  bg_refresh
+        // fetches the same window → skip insertion.
+        assert_eq!(decision(10, 7, true), None);
+    }
+
+    #[test]
+    fn divider_present_even_with_unreads_returns_none() {
+        // Even if unread_count changed, don't insert a second divider.
+        assert_eq!(decision(10, 5, true), None);
+    }
+
+    // ── bg_refresh path: divider absent because splice removed it ────────────
+    //
+    // This is the regression-prone path: disk cache had unread=0 (no divider),
+    // server delivers fresh messages with unread > 0.  After the splice the
+    // divider sentinel is gone from event_index, so divider_present=false.
+    // divider_decision must produce an insertion.
+
+    #[test]
+    fn bg_refresh_brings_new_messages_divider_inserted() {
+        // Disk loaded 10 messages with unread=0 → no divider.
+        // Server delivers 13 messages, unread=3.
+        // After splice: 13 events, divider_present=false (splice cleared it).
+        // Expected: insert at 10, banner count = 3.
+        let events: Vec<String> = (0..13).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        // fully_read = $ev9 (last message user read before new ones arrived).
+        let result = divider_decision(&ids, Some("$ev9"), 3, false);
+        assert_eq!(result, Some((10, 3)));
+    }
+
+    #[test]
+    fn bg_refresh_fully_read_not_in_window_falls_back_to_count() {
+        // Server delivers 50 fresh messages, fully_read is from an older
+        // window that has scrolled out.  Count-based fallback: 50 - 5 = 45.
+        let events: Vec<String> = (0..50).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let result = divider_decision(&ids, Some("$old_event"), 5, false);
+        assert_eq!(result, Some((45, 5)));
+    }
+
+    #[test]
+    fn bg_refresh_count_larger_than_window_clamps_to_start() {
+        // Server reports 20 unread but only 5 messages visible → divider at 0.
+        let events: Vec<String> = (0..5).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+        let result = divider_decision(&ids, None, 20, false);
+        assert_eq!(result, Some((0, 5)));
+    }
+
+    // ── Banner count accuracy ─────────────────────────────────────────────────
+
+    #[test]
+    fn banner_count_matches_messages_after_divider_not_server_count() {
+        // Server says unread=5 but the current window only has 3 messages
+        // after the fully_read marker.  Banner should show 3, not 5, because
+        // that's what's actually visible.
+        let events = ["$ev0", "$ev1", "$ev2", "$ev3", "$ev4"];
+        // fully_read = $ev1 (index 1), insert at 2, messages after = 3 ($ev2,$ev3,$ev4).
+        let result = divider_decision(&events, Some("$ev1"), 5, false);
+        assert_eq!(result, Some((2, 3)));
+    }
+
+    #[test]
+    fn banner_count_is_at_least_one() {
+        // Degenerate: 1-item list, fully_read is outside the window, unread=1.
+        // insert_pos = 1 - 1 = 0 (count-based), banner_count = 1 - 0 = 1.
+        let events = ["$ev0"];
+        let result = divider_decision(&events, None, 1, false);
+        assert_eq!(result, Some((0, 1)));
+    }
+
+    #[test]
+    fn empty_list_with_unreads_returns_position_zero() {
+        let result = divider_decision(&[], None, 5, false);
+        assert_eq!(result, Some((0, 1))); // 0 - 0 = 0 items after divider, but max(0, 1) = 1
+    }
+
+    // ── should_skip_empty_splice ─────────────────────────────────────────────
+    //
+    // Scenario: bg_refresh timed out and sent an empty RoomMessages placeholder.
+    // set_messages must not clear the timeline when messages are already loaded.
+
+    #[test]
+    fn empty_splice_skipped_after_first_load() {
+        // Not the first load and payload is empty → skip the splice.
+        assert!(should_skip_empty_splice(true, false),
+            "empty placeholder after first_load must be skipped");
+    }
+
+    #[test]
+    fn empty_splice_processed_on_first_load() {
+        // First load: even an empty payload goes through (nothing to lose).
+        assert!(!should_skip_empty_splice(true, true),
+            "empty payload on first_load must NOT be skipped");
+    }
+
+    #[test]
+    fn non_empty_splice_never_skipped() {
+        // A real payload with messages is always processed regardless of load state.
+        assert!(!should_skip_empty_splice(false, false));
+        assert!(!should_skip_empty_splice(false, true));
+    }
+
+    // ── should_mark_as_new ───────────────────────────────────────────────────
+    //
+    // Scenario: live message arrives for the current room.  The row should be
+    // tinted blue only when the window is not focused (user is away).
+
+    #[test]
+    fn mark_as_new_when_window_unfocused() {
+        assert!(should_mark_as_new(false),
+            "unfocused window → incoming message should be marked new");
+    }
+
+    #[test]
+    fn no_mark_as_new_when_window_focused() {
+        assert!(!should_mark_as_new(true),
+            "focused window → user is watching; no new-message tint needed");
+    }
+
+    // ── should_show_refresh_banner ───────────────────────────────────────────
+    //
+    // Scenario: "Updating messages" banner must only appear on genuine first
+    // load.  Background re-fetches (SyncGap-triggered) must run silently to
+    // avoid the banner flashing every 30 s in active rooms.
+
+    #[test]
+    fn refresh_banner_shown_on_first_load() {
+        assert!(should_show_refresh_banner(true, false),
+            "refreshing with no messages loaded → show the banner");
+    }
+
+    #[test]
+    fn refresh_banner_hidden_when_messages_already_loaded() {
+        assert!(!should_show_refresh_banner(true, true),
+            "background re-fetch while messages are displayed → banner stays hidden");
+    }
+
+    #[test]
+    fn refresh_banner_hidden_when_not_refreshing() {
+        assert!(!should_show_refresh_banner(false, false));
+        assert!(!should_show_refresh_banner(false, true));
+    }
+
+    // ── effective_unread_count ───────────────────────────────────────────────
+    //
+    // Scenario: user enters GNOME OS with 2 unread messages.  The 15-second
+    // read-receipt timer fires while bg_refresh is still in flight.  The SDK
+    // resets its counter to 0 before bg_refresh calls unread_notification_counts().
+    // The bg_refresh RoomMessages therefore carries unread_count=0.
+    //
+    // Without the fix, set_room_meta would overwrite room_unread_count with 0
+    // and set_messages would not place the divider — the user never sees the
+    // "New messages" line or the blue tint on those 2 messages.
+    //
+    // With the fix, effective_unread_count preserves the original count so the
+    // divider stays until dismiss_unread() or clear() explicitly resets it.
+
+    #[test]
+    fn initial_load_sets_count_from_server() {
+        // First time entering the room: use whatever the server reports.
+        assert_eq!(effective_unread_count(false, 0, 2), 2,
+            "initial load must adopt server count");
+    }
+
+    #[test]
+    fn initial_load_zero_stays_zero() {
+        // Room was already read — server reports 0, no divider needed.
+        assert_eq!(effective_unread_count(false, 0, 0), 0,
+            "already-read room must stay at 0");
+    }
+
+    #[test]
+    fn bg_refresh_preserves_count_when_timer_fired_mid_refresh() {
+        // Race condition: read timer fired → SDK reset count to 0 → bg_refresh
+        // sends unread_count=0 while the user hasn't scrolled to new messages.
+        assert_eq!(effective_unread_count(true, 2, 0), 2,
+            "bg_refresh with count=0 must not erase existing unread count");
+    }
+
+    #[test]
+    fn bg_refresh_updates_count_when_new_messages_arrived() {
+        // A new message arrived between initial load and bg_refresh.
+        assert_eq!(effective_unread_count(true, 2, 3), 3,
+            "bg_refresh may raise the count if more messages arrived");
+    }
+
+    #[test]
+    fn bg_refresh_keeps_count_when_unchanged() {
+        // Normal case: bg_refresh finishes before timer, same count.
+        assert_eq!(effective_unread_count(true, 2, 2), 2,
+            "identical counts from bg_refresh must not change anything");
+    }
+
+    // ── scenario: enter room with N unreads ──────────────────────────────────
+    //
+    // These tests verify where the divider lands and how many messages are
+    // tinted given a concrete timeline.  `divider_decision` is the entry-point
+    // used by both the initial set_messages call and every bg_refresh splice.
+
+    #[test]
+    fn scenario_2_unreads_in_10_message_room() {
+        // GNOME OS: 10 messages in window, 2 unread, no fully_read marker.
+        let evs: Vec<String> = (0..10).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = evs.iter().map(|s| s.as_str()).collect();
+        let (pos, tinted) = divider_decision(&ids, None, 2, false).unwrap();
+        assert_eq!(pos, 8,   "divider must be before the 9th message (index 8)");
+        assert_eq!(tinted, 2, "exactly 2 messages after the divider must be tinted");
+    }
+
+    #[test]
+    fn scenario_fully_read_marker_places_divider_precisely() {
+        // Server knows the last-read event; divider goes right after it.
+        let evs = ["$a", "$b", "$c", "$d", "$e"];
+        let (pos, tinted) = divider_decision(&evs, Some("$c"), 2, false).unwrap();
+        assert_eq!(pos, 3,   "divider after $c → position 3");
+        assert_eq!(tinted, 2, "$d and $e are tinted");
+    }
+
+    #[test]
+    fn scenario_fully_read_is_last_falls_back_to_count() {
+        // fully_read points at the last message in the window — unread messages
+        // are beyond the current batch.  Fall back to count-based placement.
+        let evs = ["$a", "$b", "$c"];
+        let (pos, tinted) = divider_decision(&evs, Some("$c"), 2, false).unwrap();
+        assert_eq!(pos, 1,   "count-based fallback: 2 from end → position 1");
+        assert_eq!(tinted, 2);
+    }
+
+    #[test]
+    fn scenario_all_messages_new_no_fully_read() {
+        // Cold cache: no fully_read marker, all 5 messages are new.
+        let evs: Vec<String> = (0..5).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = evs.iter().map(|s| s.as_str()).collect();
+        let (pos, tinted) = divider_decision(&ids, None, 5, false).unwrap();
+        assert_eq!(pos, 0, "divider at start — every message is new");
+        assert_eq!(tinted, 5);
+    }
+
+    #[test]
+    fn scenario_zero_unreads_no_divider() {
+        // Room is fully read — no divider should be inserted.
+        let evs = ["$a", "$b", "$c"];
+        assert!(divider_decision(&evs, None, 0, false).is_none(),
+            "no divider when unread_count is 0");
+    }
+
+    #[test]
+    fn scenario_bg_refresh_after_timer_preserves_tinted_range() {
+        // Full scenario: initial load set unread_count=2.  Timer fires.
+        // bg_refresh arrives with unread_count=0 — effective_unread_count
+        // preserves 2 → divider_decision still places at the right position.
+        let preserved = effective_unread_count(true, 2, 0); // bg_refresh sees 0
+        let evs: Vec<String> = (0..10).map(|i| format!("$ev{i}")).collect();
+        let ids: Vec<&str> = evs.iter().map(|s| s.as_str()).collect();
+        let result = divider_decision(&ids, None, preserved, false);
+        assert_eq!(result, Some((8, 2)),
+            "even after timer fires, divider must still tint the original 2 messages");
     }
 }

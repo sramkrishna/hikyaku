@@ -1,11 +1,22 @@
 [package]
-name = "matx"
+name = "hikyaku"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["ai", "rolodex", "pinning", "motd"]
+## AI summaries via Ollama + semantic interest watcher (fastembed).
+ai = ["dep:fastembed"]
+## Personal contact book with notes and @-completion.
+rolodex = []
+## Local message bookmarks (not synced to the Matrix server).
+pinning = []
+## Room topic change tracker — toasts and sidebar icon.
+motd = []
+
 [dependencies]
 gtk = { package = "gtk4", version = "0.9", features = ["v4_14", "blueprint"] }
-adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_6"] }
 glib = "0.20"
 gio = "0.20"
 
@@ -21,7 +32,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 dirs = "6"
+rusqlite = "0.32"
+fastembed = { version = "4", optional = true, default-features = false, features = ["hf-hub", "ort-download-binaries"] }
 mime = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+soup3 = "0.7"
 futures-util = "0.3"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+sourceview5 = "0.9"
+enchant = "0.3"
+# Used only in matrix/client.rs for media download, which runs on the tokio thread.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 oo7 = { version = "0.3", default-features = false, features = ["tokio", "native_crypto"] }

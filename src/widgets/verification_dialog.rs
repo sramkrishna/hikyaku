@@ -46,12 +46,6 @@ pub fn show_waiting_dialog(
     dialog.add_response("cancel", "Cancel");
     dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
 
-    dialog.connect_response(None, move |_dialog, response| {
-        if response == "cancel" {
-            tracing::info!("User cancelled verification wait");
-        }
-    });
-
     dialog.present(Some(parent));
     dialog
 }
@@ -94,8 +88,23 @@ pub fn show_recovery_key_dialog(
     let tx = command_tx.clone();
     dialog.connect_response(None, move |_dialog, response| {
         if response == "recover" {
-            let key = entry.text().to_string();
-            if !key.is_empty() {
+            let raw = entry.text().to_string();
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                // Collapse whitespace (handles copy-paste with extra spaces/newlines).
+                let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                // If every character is alphanumeric or a space, treat as a recovery
+                // key and fix base58 lookalikes (I→1, O→0, l→1) that scanners and
+                // fonts commonly confuse.  Passphrases containing punctuation pass
+                // through unchanged.
+                let key = if collapsed.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric()) {
+                    collapsed
+                        .replace('I', "1")
+                        .replace('O', "0")
+                        .replace('l', "1")
+                } else {
+                    collapsed
+                };
                 let tx = tx.clone();
                 glib::spawn_future_local(async move {
                     let _ = tx

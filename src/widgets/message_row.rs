@@ -1,5 +1,27 @@
 // MessageRow — a single message bubble in the message view.
 
+/// Per-timeline context passed to every row bind.
+/// Owned by MessageView; cloning is cheap — highlight_names is Rc (pointer copy).
+#[derive(Clone)]
+pub struct RowContext {
+    /// Rc so cloning the context is O(1) regardless of how many names are tracked.
+    pub highlight_names: std::rc::Rc<[String]>,
+    pub my_user_id: String,
+    pub is_dm: bool,
+    pub no_media: bool,
+}
+
+impl Default for RowContext {
+    fn default() -> Self {
+        Self {
+            highlight_names: std::rc::Rc::from([]),
+            my_user_id: String::new(),
+            is_dm: false,
+            no_media: false,
+        }
+    }
+}
+
 mod imp {
     use gtk::glib;
     use gtk::prelude::*;
@@ -42,16 +64,33 @@ mod imp {
         pub media_source_json: std::rc::Rc<std::cell::RefCell<String>>,
         /// Cached local file path after download.
         pub media_cached_path: std::rc::Rc<std::cell::RefCell<Option<String>>>,
-        /// Edit, delete, and DM buttons — visibility toggled per message.
+        /// Callback: bookmark clicked → (event_id, sender, body, timestamp).
+        pub on_bookmark: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, String, u64)>>>>,
+        /// Callback: unbookmark clicked → (event_id).
+        pub on_unbookmark: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: add sender to rolodex → (user_id, display_name).
+        pub on_add_to_rolodex: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
+        /// Callback: remove sender from rolodex → (user_id).
+        pub on_remove_from_rolodex: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: fetch notes for a contact → (user_id) → Option<notes>.
+        pub on_get_rolodex_notes: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String) -> Option<String>>>>>,
+        /// Callback: save updated notes for a contact → (user_id, notes).
+        pub on_save_rolodex_notes: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
+        /// Current message timestamp — updated on each bind.
+        pub timestamp_val: std::rc::Rc<std::cell::RefCell<u64>>,
+        /// Whether this row is currently bookmarked — drives icon + CSS class.
+        pub is_bookmarked: std::cell::Cell<bool>,
+        /// Edit, delete, DM, and bookmark buttons — visibility/icon toggled per message.
         pub edit_button: std::cell::RefCell<Option<gtk::Button>>,
         pub delete_button: std::cell::RefCell<Option<gtk::Button>>,
         pub dm_button: std::cell::RefCell<Option<gtk::Button>>,
+        pub bookmark_button: std::cell::RefCell<Option<gtk::Button>>,
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
         #[template_child]
-        pub body_label: TemplateChild<gtk::Label>,
+        pub body_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub reply_box: TemplateChild<gtk::Box>,
         #[template_child]
@@ -70,6 +109,16 @@ mod imp {
         pub action_bar: gtk::Box,
         pub reply_button: gtk::Button,
         pub react_button: gtk::Button,
+        /// Cache key for the last rendered body: "{body}\0{formatted_body}".
+        /// When unchanged, body widget recreation is skipped on rebind.
+        pub last_body_key: std::cell::RefCell<String>,
+        /// Cache key for the last rendered reactions JSON.
+        pub last_reactions_key: std::cell::RefCell<String>,
+        /// Signal handler IDs for notify connections on the currently bound
+        /// MessageObject. Disconnected on unbind to prevent stale handlers
+        /// accumulating as rows are recycled by the ListView factory.
+        pub flash_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        pub new_message_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
     }
 
     #[glib::object_subclass]
@@ -124,27 +173,37 @@ mod imp {
             dm_button.add_css_class("flat");
             dm_button.add_css_class("circular");
 
+            let bookmark_button = gtk::Button::builder()
+                .icon_name("bookmark-new-symbolic")
+                .tooltip_text("Save for later")
+                .build();
+            bookmark_button.add_css_class("flat");
+            bookmark_button.add_css_class("circular");
+            self.bookmark_button.replace(Some(bookmark_button.clone()));
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
             self.action_bar.append(&dm_button);
             self.action_bar.append(&self.react_button);
+            self.action_bar.append(&bookmark_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
             self.edit_button.replace(Some(edit_button.clone()));
             self.delete_button.replace(Some(delete_button.clone()));
             self.dm_button.replace(Some(dm_button.clone()));
 
-            // Add action bar inside the vertical content box, below the
-            // message body. Uses CSS class toggle for gentle fade on hover.
+            // Keep the action bar in the normal vbox flow so there is no
+            // layout shift on hover. It's always present but invisible
+            // (opacity 0) when not hovered. Compact CSS keeps its height
+            // small so the reserved space is minimal.
             self.action_bar.add_css_class("msg-action-bar");
-            if let Some(content_box) = self.obj().first_child() {
-                if let Some(vbox) = content_box.downcast_ref::<gtk::Box>() {
-                    vbox.append(&self.action_bar);
-                }
+            let obj = self.obj();
+            if let Some(vbox) = obj.first_child().and_downcast::<gtk::Box>() {
+                vbox.append(&self.action_bar);
             }
 
-            // Toggle visibility via CSS class on hover.
+            // Fade in/out on hover via CSS class — no layout change.
             let action_bar = self.action_bar.clone();
             let hover = gtk::EventControllerMotion::new();
             let ab_enter = action_bar.clone();
@@ -155,7 +214,7 @@ mod imp {
             hover.connect_leave(move |_| {
                 ab_leave.remove_css_class("msg-action-bar-visible");
             });
-            self.obj().add_controller(hover);
+            obj.add_controller(hover);
 
             // Reply button — reads current event_id/sender/body from row state.
             let event_id = self.event_id.clone();
@@ -183,10 +242,36 @@ mod imp {
                 }
             });
 
-            // Click sender name to start DM.
+            // Bookmark button — toggles add/remove based on current bookmarked state.
+            let obj_weak = self.obj().downgrade();
+            let ev = self.event_id.clone();
+            let st = self.sender_text.clone();
+            let bt = self.body_text.clone();
+            let ts_val = self.timestamp_val.clone();
+            let on_bm = self.on_bookmark.clone();
+            let on_ubm = self.on_unbookmark.clone();
+            bookmark_button.connect_clicked(move |_| {
+                let Some(obj) = obj_weak.upgrade() else { return };
+                let eid = ev.borrow().clone();
+                if eid.is_empty() { return; }
+                if obj.imp().is_bookmarked.get() {
+                    if let Some(ref cb) = *on_ubm.borrow() {
+                        cb(eid);
+                    }
+                } else {
+                    let sender = st.borrow().clone();
+                    let body = bt.borrow().clone();
+                    let ts = *ts_val.borrow();
+                    if let Some(ref cb) = *on_bm.borrow() {
+                        cb(eid, sender, body, ts);
+                    }
+                }
+            });
+
+            // Left-click sender name to start DM.
             let sender_id = self.sender_id_text.clone();
             let on_dm_ref = self.on_dm.clone();
-            let sender_click = gtk::GestureClick::new();
+            let sender_click = gtk::GestureClick::builder().button(1).build();
             sender_click.connect_released(move |_, _, _, _| {
                 let uid = sender_id.borrow().clone();
                 if !uid.is_empty() {
@@ -197,6 +282,132 @@ mod imp {
             });
             self.sender_label.add_controller(sender_click);
             self.sender_label.set_cursor_from_name(Some("pointer"));
+
+            // Right-click sender name: contact card (if in rolodex) or "Add to contacts".
+            let sender_id = self.sender_id_text.clone();
+            let sender_name = self.sender_text.clone();
+            let on_add = self.on_add_to_rolodex.clone();
+            let on_remove = self.on_remove_from_rolodex.clone();
+            let on_get_notes = self.on_get_rolodex_notes.clone();
+            let on_save_notes = self.on_save_rolodex_notes.clone();
+            let right_click = gtk::GestureClick::builder().button(3).build();
+            let label_ref = self.sender_label.clone();
+            right_click.connect_released(move |gesture, _, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let uid = sender_id.borrow().clone();
+                let name = sender_name.borrow().clone();
+                if uid.is_empty() { return; }
+
+                let in_rolodex = label_ref.has_css_class("rolodex-contact");
+                let popover = gtk::Popover::new();
+                popover.set_parent(&label_ref as &gtk::Label);
+                let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                popover.set_pointing_to(Some(&rect));
+
+                if in_rolodex {
+                    // Contact card: name, id, editable notes, remove button.
+                    let notes_text = on_get_notes.borrow().as_ref()
+                        .and_then(|cb| cb(uid.clone()))
+                        .unwrap_or_default();
+
+                    let vbox = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Vertical)
+                        .spacing(6)
+                        .margin_top(8).margin_bottom(8)
+                        .margin_start(10).margin_end(10)
+                        .build();
+
+                    let name_label = gtk::Label::builder()
+                        .label(&name)
+                        .halign(gtk::Align::Start)
+                        .build();
+                    name_label.add_css_class("heading");
+
+                    let id_label = gtk::Label::builder()
+                        .label(&uid)
+                        .halign(gtk::Align::Start)
+                        .build();
+                    id_label.add_css_class("dim-label");
+                    id_label.add_css_class("caption");
+
+                    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+
+                    let notes_label = gtk::Label::builder()
+                        .label("Notes")
+                        .halign(gtk::Align::Start)
+                        .build();
+                    notes_label.add_css_class("caption");
+
+                    let notes_entry = gtk::Entry::builder()
+                        .text(&notes_text)
+                        .placeholder_text("Add a note…")
+                        .hexpand(true)
+                        .build();
+
+                    let btn_row = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(6)
+                        .homogeneous(true)
+                        .build();
+
+                    let save_btn = gtk::Button::builder().label("Save").build();
+                    save_btn.add_css_class("flat");
+                    save_btn.add_css_class("suggested-action");
+
+                    let remove_btn = gtk::Button::builder().label("Remove contact").build();
+                    remove_btn.add_css_class("flat");
+                    remove_btn.add_css_class("destructive-action");
+
+                    btn_row.append(&save_btn);
+                    btn_row.append(&remove_btn);
+
+                    vbox.append(&name_label);
+                    vbox.append(&id_label);
+                    vbox.append(&sep);
+                    vbox.append(&notes_label);
+                    vbox.append(&notes_entry);
+                    vbox.append(&btn_row);
+                    popover.set_child(Some(&vbox));
+
+                    // Save notes.
+                    let save_uid = uid.clone();
+                    let on_save2 = on_save_notes.clone();
+                    let notes_ref = notes_entry.clone();
+                    let popover_weak = popover.downgrade();
+                    save_btn.connect_clicked(move |_| {
+                        let text = notes_ref.text().to_string();
+                        if let Some(ref cb) = *on_save2.borrow() { cb(save_uid.clone(), text); }
+                        if let Some(p) = popover_weak.upgrade() { p.popdown(); }
+                    });
+
+                    // Remove from contacts.
+                    let rm_uid = uid.clone();
+                    let on_remove2 = on_remove.clone();
+                    let label_weak: glib::WeakRef<gtk::Label> = label_ref.downgrade();
+                    let popover_weak2 = popover.downgrade();
+                    remove_btn.connect_clicked(move |_| {
+                        if let Some(ref cb) = *on_remove2.borrow() { cb(rm_uid.clone()); }
+                        if let Some(l) = label_weak.upgrade() { l.remove_css_class("rolodex-contact"); }
+                        if let Some(p) = popover_weak2.upgrade() { p.popdown(); }
+                    });
+                } else {
+                    // Non-contact: simple "Add to contacts" button.
+                    let btn = gtk::Button::builder().label("Add to contacts").build();
+                    btn.add_css_class("flat");
+                    popover.set_child(Some(&btn));
+                    let on_add2 = on_add.clone();
+                    let label_weak: glib::WeakRef<gtk::Label> = label_ref.downgrade();
+                    let popover_weak = popover.downgrade();
+                    btn.connect_clicked(move |_| {
+                        if let Some(ref cb) = *on_add2.borrow() { cb(uid.clone(), name.clone()); }
+                        if let Some(l) = label_weak.upgrade() { l.add_css_class("rolodex-contact"); }
+                        if let Some(p) = popover_weak.upgrade() { p.popdown(); }
+                    });
+                }
+
+                popover.popup();
+            });
+            self.sender_label.add_controller(right_click);
 
             // Click thread icon to open thread sidebar.
             let event_id = self.event_id.clone();
@@ -327,8 +538,49 @@ mod imp {
 }
 
 use adw::prelude::*;
+use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
+
+/// Derive a stable display color from a Matrix user ID.
+/// Result is cached so each unique user ID is computed only once per session.
+fn nick_color(user_id: &str) -> String {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if let Some(color) = c.get(user_id) {
+            return color.clone();
+        }
+        let hash = user_id.bytes().fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
+        let hue = (hash % 360) as f64;
+        let color = hsl_to_hex(hue, 0.65, 0.50);
+        c.insert(user_id.to_string(), color.clone());
+        color
+    })
+}
+
+/// Convert HSL (h in [0,360], s and l in [0,1]) to a CSS hex color.
+fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = match (h as u32) / 60 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let r = ((r1 + m) * 255.0) as u8;
+    let g = ((g1 + m) * 255.0) as u8;
+    let b = ((b1 + m) * 255.0) as u8;
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
 
 /// Format a Unix timestamp (seconds) into a human-readable string.
 /// Shows "HH:MM" for today, "Yesterday HH:MM", or "Mon DD HH:MM" for older.
@@ -456,6 +708,133 @@ fn linkify_urls(text: &str) -> String {
     result
 }
 
+/// Remove all children from the body_box before repopulating it.
+fn clear_body_box(body_box: &gtk::Box) {
+    while let Some(child) = body_box.first_child() {
+        body_box.remove(&child);
+    }
+}
+
+/// Extract a Matrix room ID or alias from a matrix.to or matrix: URI.
+/// Returns `Some("!roomid:server")`, `Some("#alias:server")`, or `None`.
+fn parse_matrix_uri(uri: &str) -> Option<String> {
+    // https://matrix.to/#/!roomid:server or https://matrix.to/#/#alias:server
+    if let Some(rest) = uri.strip_prefix("https://matrix.to/#/") {
+        // URL-decode the first component.
+        let id = rest.split('?').next().unwrap_or(rest);
+        let id = percent_decode(id);
+        if id.starts_with('!') || id.starts_with('#') {
+            return Some(id);
+        }
+    }
+    // matrix:r/alias.server  or  matrix:roomid/!room:server
+    if let Some(rest) = uri.strip_prefix("matrix:r/") {
+        let alias = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("#{}", alias.replacen('/', ":", 1)));
+    }
+    if let Some(rest) = uri.strip_prefix("matrix:roomid/") {
+        let id = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("!{}", id.replacen('/', ":", 1)));
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    // Minimal percent-decoding for %21 (!) and %23 (#) common in matrix.to links.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16) {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Create a text label with the standard message body styling.
+fn make_text_label(markup: &str) -> gtk::Label {
+    let lbl = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .selectable(true)
+        .hexpand(true)
+        .css_classes(["mx-message-body"])
+        .build();
+    lbl.set_markup(markup);
+
+    // Intercept matrix.to / matrix: links — navigate in-app instead of opening a browser.
+    lbl.connect_activate_link(|_lbl, uri| {
+        if let Some(matrix_id) = parse_matrix_uri(uri) {
+            if let Some(app) = gio::Application::default() {
+                if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                    if let Some(window) = gtk_app.active_window() {
+                        if let Some(win) = window.downcast_ref::<crate::widgets::MxWindow>() {
+                            win.handle_matrix_link(&matrix_id);
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
+    lbl
+}
+
+/// Create a GtkSourceView widget for a syntax-highlighted code block.
+fn make_code_view(code: &str, lang: &str) -> gtk::Widget {
+    use gtk::prelude::*;
+    use sourceview5::prelude::*;
+
+    let lm = sourceview5::LanguageManager::default();
+
+    // Look up language by its ID (e.g. "rust", "javascript", "python3").
+    // Fall back to guessing via a fake filename when the ID doesn't match directly.
+    let lang_obj = if lang.is_empty() {
+        None
+    } else {
+        lm.language(lang).or_else(|| {
+            // Code fences use names like "js" → try guessing from extension.
+            let fake_name = format!("code.{lang}");
+            lm.guess_language(Some(fake_name.as_str()), None)
+        })
+    };
+
+    let buffer = sourceview5::Buffer::builder()
+        .highlight_syntax(true)
+        .build();
+
+    buffer.set_language(lang_obj.as_ref());
+
+    // Pick a style scheme based on dark/light mode.
+    let is_dark = adw::StyleManager::default().is_dark();
+    let scheme_name = if is_dark { "oblivion" } else { "classic" };
+    let scheme = sourceview5::StyleSchemeManager::default().scheme(scheme_name);
+    buffer.set_style_scheme(scheme.as_ref());
+
+    // Set text after language + scheme are configured so the initial
+    // tokenisation uses the correct rules.
+    buffer.set_text(code);
+
+    let view = sourceview5::View::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_show_line_numbers(false);
+    view.set_monospace(true);
+    view.add_css_class("code-block");
+    view.upcast::<gtk::Widget>()
+}
+
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
         @extends gtk::Box, gtk::Widget,
@@ -499,37 +878,112 @@ impl MessageRow {
         self.imp().on_open_thread.borrow_mut().replace(Box::new(f));
     }
 
-    /// Bind a MessageObject to this row — sets all visual elements.
+    pub fn set_on_bookmark<F: Fn(String, String, String, u64) + 'static>(&self, f: F) {
+        self.imp().on_bookmark.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_unbookmark<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_unbookmark.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_add_to_rolodex<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_add_to_rolodex.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_remove_from_rolodex<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_remove_from_rolodex.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_get_rolodex_notes<F: Fn(String) -> Option<String> + 'static>(&self, f: F) {
+        self.imp().on_get_rolodex_notes.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_save_rolodex_notes<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_save_rolodex_notes.borrow_mut().replace(Box::new(f));
+    }
+
+    /// Update the bookmarked visual state: CSS class + button icon.
+    pub fn set_bookmarked(&self, bookmarked: bool) {
+        self.imp().is_bookmarked.set(bookmarked);
+        if bookmarked {
+            self.add_css_class("bookmarked-message");
+        } else {
+            self.remove_css_class("bookmarked-message");
+        }
+        if let Some(ref btn) = *self.imp().bookmark_button.borrow() {
+            if bookmarked {
+                btn.set_icon_name("bookmark-remove-symbolic");
+                btn.set_tooltip_text(Some("Remove bookmark"));
+            } else {
+                btn.set_icon_name("bookmark-new-symbolic");
+                btn.set_tooltip_text(Some("Save for later"));
+            }
+        }
+    }
+
+    /// Bind a MessageObject to this row.
+    /// `ctx` is the timeline-level context owned by MessageView.
     pub fn bind_message_object(
         &self,
         msg: &crate::models::MessageObject,
-        highlight_names: &[String],
-        my_user_id: &str,
-        is_dm_room: bool,
+        ctx: &crate::widgets::MessageRowContext,
     ) {
         let sender = msg.sender();
         let body = msg.body();
+        let formatted_body = msg.formatted_body();
         let timestamp = msg.timestamp();
         let reply_to = msg.reply_to();
         let thread_root = msg.thread_root();
         let reactions_json = msg.reactions_json();
         let imp = self.imp();
+        let highlight_names = &ctx.highlight_names;
+        let my_user_id = ctx.my_user_id.as_str();
+        let is_dm_room = ctx.is_dm;
+        let show_media = !ctx.no_media;
 
-        // Divider row — "New messages" separator, not a real message.
-        if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
+        // System event row — join/leave/invite/kick/ban inline text.
+        if msg.is_system_event() {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
-            imp.body_label.set_label(&body);
-            imp.body_label.set_halign(gtk::Align::Center);
-            imp.body_label.set_selectable(false);
-            imp.body_label.add_css_class("dim-label");
-            imp.body_label.add_css_class("caption");
+            clear_body_box(&imp.body_box);
+            let lbl = gtk::Label::builder()
+                .label(&body)
+                .halign(gtk::Align::Center)
+                .selectable(false)
+                .hexpand(true)
+                .css_classes(["dim-label", "caption", "message-system-event"])
+                .build();
+            imp.body_box.append(&lbl);
             imp.reply_box.set_visible(false);
             imp.thread_icon.set_visible(false);
             imp.reactions_box.set_visible(false);
             imp.media_button.set_visible(false);
             imp.action_bar.set_visible(false);
-            // Add a separator line effect via CSS.
+            self.remove_css_class("message-divider");
+            self.add_css_class("message-system-event");
+            return;
+        }
+        // Reset system event styling.
+        self.remove_css_class("message-system-event");
+
+        // Divider row — "New messages" separator, not a real message.
+        if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
+            imp.sender_label.set_visible(false);
+            imp.timestamp_label.set_visible(false);
+            clear_body_box(&imp.body_box);
+            let lbl = gtk::Label::builder()
+                .label(&body)
+                .halign(gtk::Align::Center)
+                .selectable(false)
+                .hexpand(true)
+                .css_classes(["dim-label", "caption"])
+                .build();
+            imp.body_box.append(&lbl);
+            imp.reply_box.set_visible(false);
+            imp.thread_icon.set_visible(false);
+            imp.reactions_box.set_visible(false);
+            imp.media_button.set_visible(false);
+            imp.action_bar.set_visible(false);
             self.add_css_class("message-divider");
             return;
         }
@@ -537,10 +991,6 @@ impl MessageRow {
         self.remove_css_class("message-divider");
         imp.sender_label.set_visible(true);
         imp.timestamp_label.set_visible(true);
-        imp.body_label.set_halign(gtk::Align::Start);
-        imp.body_label.set_selectable(true);
-        imp.body_label.remove_css_class("dim-label");
-        imp.body_label.remove_css_class("caption");
         imp.action_bar.set_visible(true);
 
         // Store current message data for action buttons.
@@ -549,6 +999,7 @@ impl MessageRow {
         imp.sender_id_text.replace(msg.sender_id());
         imp.body_text.replace(body.clone());
         imp.reply_to.replace(reply_to.clone());
+        imp.timestamp_val.replace(timestamp);
 
         // Reply indicator — show who they're replying to.
         if !reply_to.is_empty() {
@@ -592,9 +1043,11 @@ impl MessageRow {
             btn.set_visible(!is_own && !is_dm_room);
         }
 
-        // Media attachment.
+        // Media attachment — skip entirely when the room has media previews disabled.
         let media_json = msg.media_json();
-        if !media_json.is_empty() {
+        if !show_media {
+            imp.media_button.set_visible(false);
+        } else if !media_json.is_empty() {
             if let Ok(media) = serde_json::from_str::<crate::matrix::MediaInfo>(&media_json) {
                 use std::sync::LazyLock;
                 static MEDIA_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
@@ -648,12 +1101,12 @@ impl MessageRow {
             }
         }
 
-        // Reactions — use Labels instead of Buttons to avoid closure
-        // reference cycles that cause double-free on rebind. Click handling
-        // is done via a GestureClick on the reactions_box itself.
-        while let Some(child) = imp.reactions_box.first_child() {
-            imp.reactions_box.remove(&child);
-        }
+        // Reactions — skip full rebuild if unchanged since last bind.
+        if *imp.last_reactions_key.borrow() != reactions_json {
+            imp.last_reactions_key.replace(reactions_json.clone());
+            while let Some(child) = imp.reactions_box.first_child() {
+                imp.reactions_box.remove(&child);
+            }
         if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(&reactions_json) {
             if !reactions.is_empty() {
                 for (emoji, count, names) in &reactions {
@@ -678,62 +1131,155 @@ impl MessageRow {
         } else {
             imp.reactions_box.set_visible(false);
         }
+        } // end reactions cache guard
 
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(&sender, &body, timestamp, highlight_names, force_highlight);
+        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, timestamp, highlight_names, force_highlight);
+
+        // Disconnect old flash handler before connecting to the new object.
+        self.clear_flash_handler();
+        // Reflect initial is_flashing state (row may be rebound while flashing).
+        if msg.is_flashing() {
+            self.add_css_class("message-flash");
+        } else {
+            self.remove_css_class("message-flash");
+        }
+        // Disconnect any previous is-new-message handler before rebinding.
+        if let Some((obj, id)) = self.imp().new_message_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        // Apply new-message tint immediately, then track changes reactively.
+        if msg.is_new_message() {
+            self.add_css_class("new-message");
+        } else {
+            self.remove_css_class("new-message");
+        }
+        let nm_id = msg.connect_notify_local(Some("is-new-message"), {
+            let row_weak = self.downgrade();
+            move |obj, _| {
+                use crate::models::MessageObject;
+                if let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>()) {
+                    if msg.is_new_message() { row.add_css_class("new-message"); }
+                    else { row.remove_css_class("new-message"); }
+                }
+            }
+        });
+        *self.imp().new_message_handler.borrow_mut() = Some((msg.clone().upcast(), nm_id));
+
+        // Connect reactive flash handler to this MessageObject.
+        let row_weak = self.downgrade();
+        let id = msg.connect_notify_local(Some("is-flashing"), move |obj, _| {
+            use crate::models::MessageObject;
+            if let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>()) {
+                if msg.is_flashing() {
+                    row.add_css_class("message-flash");
+                } else {
+                    row.remove_css_class("message-flash");
+                }
+            }
+        });
+        *self.imp().flash_handler.borrow_mut() = Some((msg.clone().upcast(), id));
+    }
+
+    /// Disconnect and clear the `notify::is-flashing` handler from the bound MessageObject.
+    pub fn clear_flash_handler(&self) {
+        if let Some((obj, id)) = self.imp().flash_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        if let Some((obj, id)) = self.imp().new_message_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
     }
 
     fn render_body(
         &self,
         sender: &str,
+        sender_id: &str,
         body: &str,
+        formatted_body: &str,
         timestamp: u64,
         highlight_names: &[String],
         force_highlight: bool,
     ) {
         let imp = self.imp();
-        imp.sender_label.set_label(sender);
 
-        // Check if any highlight name appears in the body,
-        // or if this message is flagged as a reply-to-us.
-        let body_lower = body.to_lowercase();
-        let has_highlight = force_highlight || highlight_names
-            .iter()
-            .any(|n| !n.is_empty() && body_lower.contains(&n.to_lowercase()));
-
-        // Escape markup, linkify URLs, then apply highlights.
-        let mut escaped = glib::markup_escape_text(body).to_string();
-
-        // Linkify URLs — find http(s):// patterns and wrap in <a> tags.
-        escaped = linkify_urls(&escaped);
-
-        if has_highlight {
-            self.add_css_class("mention-row");
-            for name in highlight_names {
-                if name.is_empty() {
-                    continue;
-                }
-                let lower = escaped.to_lowercase();
-                let name_lower = name.to_lowercase();
-                let mut result = String::new();
-                let mut pos = 0;
-                while let Some(idx) = lower[pos..].find(&name_lower) {
-                    result.push_str(&escaped[pos..pos + idx]);
-                    let end = pos + idx + name_lower.len();
-                    result.push_str("<b>");
-                    result.push_str(&escaped[pos + idx..end]);
-                    result.push_str("</b>");
-                    pos = end;
-                }
-                result.push_str(&escaped[pos..]);
-                escaped = result;
-            }
+        // Sender label — always cheap to update.
+        if crate::config::settings().appearance.colorize_nicks && !sender_id.is_empty() {
+            let color = nick_color(sender_id);
+            let escaped = glib::markup_escape_text(sender);
+            imp.sender_label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
         } else {
-            self.remove_css_class("mention-row");
+            imp.sender_label.set_label(sender);
         }
-        imp.body_label.set_markup(&escaped);
+
+        // Rolodex contact indicator: subtle glow on sender name.
+        if !sender_id.is_empty() {
+            let in_rolodex = crate::config::settings().rolodex.iter().any(|entry| {
+                entry.split_once('|').map(|(_, uid)| uid.trim()) == Some(sender_id)
+            });
+            if in_rolodex { imp.sender_label.add_css_class("rolodex-contact"); }
+            else { imp.sender_label.remove_css_class("rolodex-contact"); }
+        }
+
+        // Pre-lowercase names once for both the check and the highlight loop.
+        let highlight_lower: Vec<String> = highlight_names.iter()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_lowercase())
+            .collect();
+        let body_lower = body.to_lowercase();
+        let has_highlight = force_highlight
+            || highlight_lower.iter().any(|n| body_lower.contains(n.as_str()));
+
+        if has_highlight { self.add_css_class("mention-row"); }
+        else { self.remove_css_class("mention-row"); }
+
+        // Skip expensive body widget recreation if body content is unchanged.
+        // Reactions are handled separately; only body + formatted_body matter here.
+        let body_key = format!("{body}\0{formatted_body}");
+        if *imp.last_body_key.borrow() != body_key {
+            imp.last_body_key.replace(body_key);
+            clear_body_box(&imp.body_box);
+
+            if !formatted_body.is_empty() {
+                // HTML path — split into text + code segments.
+                // Links are already <a> tags — do NOT linkify again.
+                let segments = crate::markdown::html_to_segments(formatted_body);
+                for seg in segments {
+                    match seg {
+                        crate::markdown::Segment::Text(markup) => {
+                            imp.body_box.append(&make_text_label(&markup));
+                        }
+                        crate::markdown::Segment::Code { content, lang } => {
+                            imp.body_box.append(&make_code_view(&content, &lang));
+                        }
+                    }
+                }
+            } else {
+                // Plain-text path — escape, highlight names, linkify URLs.
+                let mut escaped = glib::markup_escape_text(body).to_string();
+                if has_highlight {
+                    // Use pre-lowercased names; build lower of escaped once per loop.
+                    for name_lower in &highlight_lower {
+                        let escaped_lower = escaped.to_lowercase();
+                        let mut result = String::new();
+                        let mut pos = 0;
+                        while let Some(idx) = escaped_lower[pos..].find(name_lower.as_str()) {
+                            result.push_str(&escaped[pos..pos + idx]);
+                            let end = pos + idx + name_lower.len();
+                            result.push_str("<b>");
+                            result.push_str(&escaped[pos + idx..end]);
+                            result.push_str("</b>");
+                            pos = end;
+                        }
+                        result.push_str(&escaped[pos..]);
+                        escaped = result;
+                    }
+                }
+                imp.body_box.append(&make_text_label(&linkify_urls(&escaped)));
+            }
+        }
 
         if timestamp > 0 {
             imp.timestamp_label.set_label(&format_timestamp(timestamp));

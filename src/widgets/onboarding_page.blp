@@ -1,0 +1,48 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $MxOnboardingPage : Gtk.Box {
+  orientation: vertical;
+  spacing: 0;
+
+  Adw.StatusPage {
+    vexpand: true;
+    icon-name: "system-lock-screen-symbolic";
+    title: "Welcome to Hikyaku";
+    description: "A simple, privacy-first Matrix chat client.";
+
+    child: Gtk.Box {
+      orientation: vertical;
+      spacing: 16;
+      halign: center;
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 8;
+        margin-bottom: 8;
+
+        Gtk.Label {
+          label: "Hikyaku uses end-to-end encryption (E2EE) to keep your messages private.";
+          wrap: true;
+          max-width-chars: 52;
+          justify: center;
+          styles ["body"]
+        }
+
+        Gtk.Label {
+          label: "After signing in you will be asked to verify this device and connect your key backup. This ensures your messages stay readable across sessions.";
+          wrap: true;
+          max-width-chars: 52;
+          justify: center;
+          styles ["body", "dim-label"]
+        }
+      }
+
+      Gtk.Button get_started_button {
+        label: "Sign In";
+        halign: center;
+        styles ["pill", "suggested-action"]
+      }
+    };
+  }
+}

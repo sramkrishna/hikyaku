@@ -6,6 +6,7 @@
 
 mod imp {
     use adw::subclass::prelude::*;
+    use gtk::gio;
     use gtk::prelude::*;
     use gtk::glib;
 
@@ -13,21 +14,17 @@ mod imp {
     use crate::matrix;
     use crate::widgets::MxWindow;
 
-    use async_channel::{Receiver, Sender};
+    use async_channel::Receiver;
     use std::cell::OnceCell;
 
     pub struct MxApplication {
         pub event_rx: OnceCell<Receiver<matrix::MatrixEvent>>,
-        pub command_tx: OnceCell<Sender<matrix::MatrixCommand>>,
-        pub shutdown_tx: OnceCell<tokio::sync::watch::Sender<bool>>,
     }
 
     impl Default for MxApplication {
         fn default() -> Self {
             Self {
                 event_rx: OnceCell::new(),
-                command_tx: OnceCell::new(),
-                shutdown_tx: OnceCell::new(),
             }
         }
     }
@@ -63,42 +60,108 @@ mod imp {
             let (command_tx, command_rx) = async_channel::unbounded::<matrix::MatrixCommand>();
 
             // Spawn the background tokio thread that runs matrix-sdk.
-            let shutdown_tx = matrix::spawn_matrix_thread(event_tx, command_rx);
+            // Shutdown is initiated by sending MatrixCommand::Shutdown — all
+            // commands before it are guaranteed to run first (no race condition).
+            matrix::spawn_matrix_thread(event_tx, command_rx);
 
-            // Store channels and shutdown handle.
+            // Store event channel (command_tx lives only in the window).
             let _ = self.event_rx.set(event_rx.clone());
-            let _ = self.command_tx.set(command_tx.clone());
-            let _ = self.shutdown_tx.set(shutdown_tx);
 
-            // Signal the Matrix thread on app shutdown (window close or Ctrl-C).
-            app.connect_shutdown(|app| {
-                tracing::info!("Application shutting down, signaling Matrix thread");
-                let imp = app.imp();
-                if let Some(tx) = imp.shutdown_tx.get() {
-                    let _ = tx.send(true);
-                }
-                // Failsafe: force exit after 3 seconds if sync hangs.
+            // On app shutdown: flush pending read receipt then send Shutdown.
+            // The tokio command loop processes commands in FIFO order, so
+            // MarkRead is guaranteed to complete before Shutdown terminates the loop.
+            app.connect_shutdown(|_app| {
+                tracing::info!("Application shutting down");
+                crate::intelligence::ollama_manager::stop();
+                // Failsafe: force exit after 5 seconds if the sync loop hangs.
                 std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                     tracing::warn!("Force exiting — sync did not stop in time");
                     std::process::exit(0);
                 });
             });
+
+            // Register keyboard accelerators (GNOME HIG).
+            app.set_accels_for_action("win.preferences",  &["<Control>comma"]);
+            app.set_accels_for_action("win.shortcuts",    &["<Control>question"]);
+            app.set_accels_for_action("win.join-room",    &["<Control><Shift>j"]);
+            app.set_accels_for_action("win.prev-room",    &["<Alt>Up"]);
+            app.set_accels_for_action("win.next-room",    &["<Alt>Down"]);
+
+            // For dev builds (cargo run), register the local icon directory so
+            // GTK can find the app icon without a system install.
+            if let Some(display) = gtk::gdk::Display::default() {
+                let theme = gtk::IconTheme::for_display(&display);
+                // Prefer exe-relative path (handles both cargo run and installed).
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        let p = dir.join("../../../data/icons");
+                        if p.exists() { theme.add_search_path(&p); }
+                    }
+                }
+                // Fallback: working-directory relative (cargo run from workspace root).
+                if let Ok(cwd) = std::env::current_dir() {
+                    let p = cwd.join("data/icons");
+                    if p.exists() { theme.add_search_path(&p); }
+                }
+            }
 
             // Create and present the main window.
             let window = MxWindow::new(&app, event_rx, command_tx);
             window.set_title(Some(config::APP_NAME));
             window.set_default_size(1000, 700);
 
-            // Ensure closing the window quits the app.
+            // On close: flush pending read receipt, send Shutdown, then quit the app.
+            // We do this in connect_close_request (not connect_shutdown) because the
+            // window is still alive here — connect_shutdown fires after it's destroyed.
             let app_weak = app.downgrade();
-            window.connect_close_request(move |_| {
+            window.connect_close_request(move |win| {
+                let wimp = win.imp();
+                tracing::info!("close_request: window closing");
+                if let Some(cmd_tx) = wimp.command_tx.get() {
+                    // If the 15-second read-receipt timer hasn't fired yet, cancel
+                    // it and send MarkRead now so it reaches the server before shutdown.
+                    match wimp.read_timer.borrow_mut().take() {
+                        Some((src, fired, rid)) if !fired.get() => {
+                            tracing::info!("close_request: timer unfired, sending MarkRead for {rid}");
+                            src.remove();
+                            let _ = cmd_tx.try_send(
+                                crate::matrix::MatrixCommand::MarkRead { room_id: rid }
+                            );
+                        }
+                        Some((_, _, rid)) => {
+                            tracing::info!("close_request: timer already fired for {rid}, no MarkRead needed");
+                        }
+                        None => {
+                            tracing::info!("close_request: no active read timer");
+                        }
+                    }
+                    tracing::info!("close_request: sending Shutdown");
+                    let _ = cmd_tx.try_send(crate::matrix::MatrixCommand::Shutdown);
+                } else {
+                    tracing::warn!("close_request: no command_tx — MarkRead/Shutdown not sent");
+                }
                 if let Some(app) = app_weak.upgrade() {
                     app.quit();
                 }
                 glib::Propagation::Proceed
             });
             window.present();
+        }
+
+        // Handle matrix: URI scheme (invoked by the browser or other apps).
+        fn open(&self, files: &[gio::File], _hint: &str) {
+            // Ensure the window is up.
+            self.activate();
+            let app = self.obj();
+            let Some(window) = app.active_window() else { return };
+            let Some(win) = window.downcast_ref::<crate::widgets::MxWindow>() else { return };
+            for file in files {
+                let uri = file.uri();
+                if let Some(matrix_id) = super::parse_matrix_uri(uri.as_str()) {
+                    win.handle_matrix_link(&matrix_id);
+                }
+            }
         }
     }
 
@@ -107,6 +170,20 @@ mod imp {
 }
 
 use gtk::glib;
+use gtk::gio;
+
+/// Extract a Matrix room ID or alias from a matrix: URI.
+fn parse_matrix_uri(uri: &str) -> Option<String> {
+    if let Some(rest) = uri.strip_prefix("matrix:r/") {
+        let alias = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("#{}", alias.replacen('/', ":", 1)));
+    }
+    if let Some(rest) = uri.strip_prefix("matrix:roomid/") {
+        let id = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("!{}", id.replacen('/', ":", 1)));
+    }
+    None
+}
 
 glib::wrapper! {
     pub struct MxApplication(ObjectSubclass<imp::MxApplication>)
@@ -118,6 +195,7 @@ impl MxApplication {
     pub fn new() -> Self {
         glib::Object::builder()
             .property("application-id", crate::config::APP_ID)
+            .property("flags", gio::ApplicationFlags::HANDLES_OPEN)
             .build()
     }
 }
