@@ -1,0 +1,60 @@
+{
+  "id": "me.ramkrishna.hikyaku.OpenVINO",
+  "branch": "2024.6",
+  "runtime": "me.ramkrishna.hikyaku",
+  "runtime-version": "stable",
+  "sdk": "org.gnome.Sdk//47",
+  "build-extension": true,
+  "separate-locales": false,
+  "appstream-compose": false,
+  "build-options": {
+    "prefix": "/app/extensions/OpenVINO",
+    "env": {
+      "PKG_CONFIG_PATH": "/app/extensions/OpenVINO/lib/pkgconfig:/app/lib/pkgconfig"
+    }
+  },
+  "modules": [
+    {
+      "name": "tbb",
+      "buildsystem": "cmake-ninja",
+      "config-opts": [
+        "-DTBB_TEST=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_INSTALL_PREFIX=/app/extensions/OpenVINO"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/oneapi-src/oneTBB/archive/refs/tags/v2021.13.0.tar.gz",
+          "sha256": "3ad5dd08954b39d113dc5b3f8a8dc6dc1fd5250032b7c491eb07aed5c94133e1"
+        }
+      ],
+      "cleanup": [
+        "/include",
+        "/lib/pkgconfig",
+        "/lib/cmake",
+        "*.a"
+      ]
+    },
+    {
+      "name": "openvino",
+      "buildsystem": "simple",
+      "build-commands": [
+        "mkdir -p /app/extensions/OpenVINO/lib",
+        "mkdir -p /app/extensions/OpenVINO/lib/openvino-plugins",
+        "cp -r runtime/lib/intel64/libopenvino*.so* /app/extensions/OpenVINO/lib/",
+        "cp -r runtime/lib/intel64/plugins.xml /app/extensions/OpenVINO/lib/openvino-plugins/",
+        "cp -r runtime/3rdparty/tbb/lib/*.so* /app/extensions/OpenVINO/lib/ 2>/dev/null || true",
+        "chmod 755 /app/extensions/OpenVINO/lib/*.so*"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://storage.openvinotoolkit.org/repositories/openvino/packages/2024.6/linux/l_openvino_toolkit_ubuntu24_2024.6.0.17404.4c0f47d2335_x86_64.tgz",
+          "sha256": "d47281e02644d93fa299853f660dec63b787f0a101aa393b4cde71d1c8c00c18",
+          "strip-components": 1
+        }
+      ]
+    }
+  ]
+}

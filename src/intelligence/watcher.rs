@@ -9,6 +9,44 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::path::PathBuf;
 
+/// When running under Flatpak with the `me.ramkrishna.hikyaku.OpenVINO`
+/// extension installed, set up the OpenVINO execution provider so ORT uses
+/// the Intel CPU/GPU/NPU instead of the plain CPU EP.
+///
+/// Must be called once before any `TextEmbedding::try_new` call.
+/// No-op when:
+///   - not built with the `ai-flatpak` feature (ort-load-dynamic)
+///   - the extension directory doesn't exist
+///   - ORT initialisation fails (falls back to CPU silently)
+pub fn try_init_openvino_ep() {
+    #[cfg(feature = "ai-flatpak")]
+    {
+        let ext_lib = std::path::Path::new("/app/extensions/OpenVINO/lib");
+        if !ext_lib.exists() {
+            tracing::debug!("OpenVINO extension not installed — using CPU EP");
+            return;
+        }
+        tracing::info!("OpenVINO extension found at {:?} — enabling OpenVINO EP", ext_lib);
+        // Point ORT at the extension's plugin directory so it can find the
+        // OpenVINO backend .so files.
+        std::env::set_var(
+            "ORT_OPENVINO_PROVIDERS_PATH",
+            ext_lib.join("openvino-plugins"),
+        );
+        let result = ort::init()
+            .with_execution_providers([
+                ort::execution_providers::OpenVINOExecutionProvider::default()
+                    .build()
+                    .error_on_failure(),
+            ])
+            .commit();
+        match result {
+            Ok(_) => tracing::info!("ORT initialised with OpenVINO EP"),
+            Err(e) => tracing::warn!("OpenVINO EP init failed, falling back to CPU: {e}"),
+        }
+    }
+}
+
 pub struct Watcher {
     model: TextEmbedding,
     /// (term_text, normalised_embedding)
@@ -27,6 +65,8 @@ impl Watcher {
         if terms.is_empty() {
             return None;
         }
+
+        try_init_openvino_ep();
 
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::AllMiniLML6V2)

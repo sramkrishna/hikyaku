@@ -1,0 +1,101 @@
+{
+  "app-id": "me.ramkrishna.hikyaku",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "47",
+  "sdk": "org.gnome.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "command": "hikyaku",
+  "finish-args": [
+    "--share=ipc",
+    "--share=network",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--device=dri",
+    "--talk-name=org.freedesktop.Notifications",
+    "--talk-name=org.freedesktop.secrets",
+    "--talk-name=org.kde.StatusNotifierWatcher",
+    "--filesystem=xdg-run/at-spi:ro"
+  ],
+  "add-extensions": {
+    "me.ramkrishna.hikyaku.OpenVINO": {
+      "directory": "extensions/OpenVINO",
+      "version": "2024.6",
+      "autodelete": true,
+      "no-autodownload": true,
+      "add-ld-path": "lib"
+    }
+  },
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/hikyaku/cargo",
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  "modules": [
+    {
+      "name": "enchant",
+      "config-opts": [
+        "--disable-static",
+        "--with-hunspell",
+        "--without-aspell"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/rrthomas/enchant/releases/download/v2.8.2/enchant-2.8.2.tar.gz",
+          "sha256": "8f19535adb5577b83b00e02f330fe9b9eb40dd21f19e2899636fc4d3a7696375"
+        }
+      ],
+      "cleanup": [
+        "/include",
+        "/lib/pkgconfig",
+        "*.la"
+      ]
+    },
+    {
+      "name": "onnxruntime",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 lib/libonnxruntime.so.1.20.0 /app/lib/libonnxruntime.so.1.20.0",
+        "ln -sf libonnxruntime.so.1.20.0 /app/lib/libonnxruntime.so"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.20.0/onnxruntime-linux-x64-1.20.0.tgz",
+          "sha256": "aa70d48b22e264b82e83f63245b51ddc9a47ae4a3a66903efaff1ba68b7b5930",
+          "strip-components": 1
+        }
+      ]
+    },
+    {
+      "name": "hikyaku",
+      "buildsystem": "simple",
+      "build-commands": [
+        "mkdir -p .cargo",
+        "printf '[source.crates-io]\\nreplace-with = \"vendored-sources\"\\n\\n[source.vendored-sources]\\ndirectory = \"/run/build/hikyaku/cargo/vendor\"\\n' > .cargo/config.toml",
+        "cargo build --release --locked --no-default-features --features rolodex,pinning,motd,ai-flatpak",
+        "install -Dm755 target/release/hikyaku /app/bin/hikyaku",
+        "install -Dm644 data/me.ramkrishna.hikyaku.desktop /app/share/applications/me.ramkrishna.hikyaku.desktop",
+        "install -Dm644 data/me.ramkrishna.hikyaku.gschema.xml /app/share/glib-2.0/schemas/me.ramkrishna.hikyaku.gschema.xml",
+        "install -Dm644 data/icons/hicolor/scalable/apps/me.ramkrishna.hikyaku.svg /app/share/icons/hicolor/scalable/apps/me.ramkrishna.hikyaku.svg",
+        "install -Dm644 data/icons/hicolor/scalable/actions/mention-symbolic.svg /app/share/icons/hicolor/scalable/actions/mention-symbolic.svg",
+        "install -Dm644 data/icons/hicolor/scalable/actions/tombstone-symbolic.svg /app/share/icons/hicolor/scalable/actions/tombstone-symbolic.svg",
+        "mkdir -p /app/extensions/OpenVINO"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        },
+        {
+          "type": "file",
+          "path": "cargo-sources.json"
+        }
+      ]
+    }
+  ]
+}

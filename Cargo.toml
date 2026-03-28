@@ -6,7 +6,10 @@ edition = "2021"
 [features]
 default = ["ai", "rolodex", "pinning", "motd"]
 ## AI summaries via Ollama + semantic interest watcher (fastembed).
+## Use ort-download-binaries for development builds (cargo run).
+## Use ort-load-dynamic for Flatpak builds — ORT is dlopen'd at runtime.
 ai = ["dep:fastembed"]
+ai-flatpak = ["dep:fastembed", "dep:ort", "fastembed/ort-load-dynamic"]
 ## Personal contact book with notes and @-completion.
 rolodex = []
 ## Local message bookmarks (not synced to the Matrix server).
@@ -34,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 rusqlite = "0.32"
 fastembed = { version = "4", optional = true, default-features = false, features = ["hf-hub", "ort-download-binaries"] }
+# ort is pulled in by fastembed; expose it directly so we can call ort::init()
+# for OpenVINO EP registration when the Flatpak extension is present.
+ort = { version = "2.0.0-rc.9", optional = true, default-features = false }
 mime = "0.3"
 soup3 = "0.7"
 futures-util = "0.3"
