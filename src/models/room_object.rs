@@ -103,6 +103,11 @@ mod imp {
         /// A watch term matched a recent message in this room.
         #[property(get, set)]
         watch_alert: Cell<bool>,
+
+        /// Community health alert level: 0 = hidden, 1 = none/green,
+        /// 2 = watch/amber, 3 = warning/red.
+        #[property(get, set)]
+        health_alert: Cell<u8>,
     }
 
     // These trait impls register our type with GObject's type system.

@@ -126,6 +126,10 @@
       <default>true</default>
       <summary>Whether the room topic change (MOTD) tracker plugin is active</summary>
     </key>
+    <key name="plugin-community-health-enabled" type="b">
+      <default>false</default>
+      <summary>Whether the community health monitor plugin is active</summary>
+    </key>
 
     <!-- First-run flag — set to false after onboarding completes -->
     <key name="first-start" type="b">

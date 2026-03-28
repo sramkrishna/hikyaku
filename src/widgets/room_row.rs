@@ -33,6 +33,8 @@ mod imp {
         pub motd_icon: TemplateChild<gtk::Image>,
         #[template_child]
         pub watch_alert_icon: TemplateChild<gtk::Image>,
+        #[template_child]
+        pub health_dot: TemplateChild<gtk::Box>,
         /// GObject property bindings — auto-disconnect on unbind.
         pub signal_handlers: RefCell<Vec<glib::Binding>>,
         /// Signal handler IDs for `connect_notify_local` that need manual disconnect.
@@ -117,6 +119,7 @@ impl RoomRow {
             imp.tombstone_icon.set_visible(false);
             imp.motd_icon.set_visible(false);
             imp.watch_alert_icon.set_visible(false);
+            imp.health_dot.set_visible(false);
             return;
         }
 
@@ -202,6 +205,17 @@ impl RoomRow {
         });
         imp.signal_ids.borrow_mut().push(id);
 
+        // React to community health score changes.
+        #[cfg(feature = "community-health")]
+        {
+            let row_weak = self.downgrade();
+            let id = room.connect_notify_local(Some("health-alert"), move |obj, _| {
+                let Some(row) = row_weak.upgrade() else { return };
+                row.set_health(obj.health_alert());
+            });
+            imp.signal_ids.borrow_mut().push(id);
+        }
+
         // Watch avatar-path: when the tokio thread downloads the avatar and
         // sets the path on the RoomObject, load the texture and display it.
         let row_weak = self.downgrade();
@@ -215,5 +229,21 @@ impl RoomRow {
             }
         });
         imp.signal_ids.borrow_mut().push(id);
+    }
+
+    /// Update the community health dot colour and visibility.
+    /// `alert`: 0 = hide, 1 = none (green), 2 = watch (amber), 3 = warning (red).
+    #[cfg(feature = "community-health")]
+    pub fn set_health(&self, alert: u8) {
+        let dot = self.imp().health_dot.get();
+        dot.remove_css_class("health-none");
+        dot.remove_css_class("health-watch");
+        dot.remove_css_class("health-warning");
+        match alert {
+            1 => { dot.add_css_class("health-none"); dot.set_visible(true); }
+            2 => { dot.add_css_class("health-watch"); dot.set_visible(true); }
+            3 => { dot.add_css_class("health-warning"); dot.set_visible(true); }
+            _ => { dot.set_visible(false); }
+        }
     }
 }

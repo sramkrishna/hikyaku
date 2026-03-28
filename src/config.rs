@@ -39,6 +39,8 @@ pub struct PluginsSettings {
     pub pinning: bool,
     /// Whether the room topic change (MOTD) tracker is active.
     pub motd: bool,
+    /// Whether the community health monitor is active (community-health feature).
+    pub community_health: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +135,7 @@ pub fn settings() -> Settings {
             rolodex: gs.boolean("plugin-rolodex-enabled"),
             pinning: gs.boolean("plugin-pinning-enabled"),
             motd: gs.boolean("plugin-motd-enabled"),
+            community_health: gs.boolean("plugin-community-health-enabled"),
         },
         watch: WatchSettings {
             enabled: gs.boolean("watch-enabled"),
@@ -171,6 +174,7 @@ pub fn save_settings(settings: &Settings) -> Result<(), Box<dyn std::error::Erro
     gs.set_boolean("plugin-rolodex-enabled", settings.plugins.rolodex)?;
     gs.set_boolean("plugin-pinning-enabled", settings.plugins.pinning)?;
     gs.set_boolean("plugin-motd-enabled", settings.plugins.motd)?;
+    gs.set_boolean("plugin-community-health-enabled", settings.plugins.community_health)?;
     gs.set_boolean("watch-enabled", settings.watch.enabled)?;
     let watch_terms: Vec<&str> = settings.watch.terms.iter().map(|s| s.as_str()).collect();
     gs.set_strv("watch-terms", watch_terms.as_slice())?;
@@ -241,7 +245,7 @@ mod tests {
                 detect_conflict: false,
                 detect_coc: false,
             },
-            plugins: PluginsSettings { rolodex: true, pinning: true, motd: true },
+            plugins: PluginsSettings { rolodex: true, pinning: true, motd: true, community_health: false },
             rolodex: Vec::new(),
             watch: WatchSettings { enabled: false, terms: Vec::new(), threshold: 0.65 },
         };

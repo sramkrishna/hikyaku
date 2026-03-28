@@ -77,6 +77,16 @@ template $MxRoomRow : Gtk.Box {
       tooltip-text: "A watched term matched a recent message";
       styles ["warning"]
     }
+
+    // Community health dot — coloured circle (green/amber/red).
+    // Visible only when the community-health plugin is active.
+    Gtk.Box health_dot {
+      width-request: 8;
+      height-request: 8;
+      valign: center;
+      visible: false;
+      styles ["health-dot"]
+    }
   }
 
   // Unread badge in its own column — never shifts when status icons toggle.

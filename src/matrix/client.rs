@@ -316,6 +316,15 @@ pub enum MatrixEvent {
     /// A watch term semantically matched a new message in this room.
     #[cfg(feature = "ai")]
     RoomAlert { room_id: String, room_name: String, matched_term: String },
+    /// Community health score updated for a room (community-health plugin).
+    #[cfg(feature = "community-health")]
+    HealthUpdate {
+        room_id: String,
+        score: f32,
+        /// +1 improving, 0 stable, −1 declining.
+        trend: i8,
+        alert: crate::plugins::community_health::AlertLevel,
+    },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.
@@ -2226,6 +2235,14 @@ async fn start_sync(
     #[cfg(feature = "ai")]
     let watcher_arc: std::sync::Arc<std::sync::Mutex<WatcherState>> =
         std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new(), 0.0)));
+
+    // Community health monitor state. Initialised lazily on the first
+    // eligible message when the plugin is enabled.
+    #[cfg(feature = "community-health")]
+    type HealthState = Option<crate::plugins::community_health::HealthMonitor>;
+    #[cfg(feature = "community-health")]
+    let health_arc: std::sync::Arc<std::sync::Mutex<HealthState>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     #[cfg(feature = "ai")]
     {
         let settings = crate::config::settings();
@@ -2475,10 +2492,40 @@ async fn start_sync(
                     }).await.ok().flatten();
                     if let Some(term) = matched {
                         let _ = tx.send(MatrixEvent::RoomAlert {
-                            room_id: room_id_str,
+                            room_id: room_id_str.clone(),
                             room_name: room_name_str,
                             matched_term: term,
                         }).await;
+                    }
+                }
+
+                // Community health monitor — score the message and emit an
+                // update so the room row can show a health indicator.
+                #[cfg(feature = "community-health")]
+                {
+                    use crate::plugins::community_health::HealthMonitor;
+                    let cfg = crate::config::settings();
+                    if cfg.plugins.community_health {
+                        let monitor = health_arc.clone();
+                        let body_check = body.clone();
+                        let rid = room_id_str.to_string();
+                        let health_tx = tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut guard = monitor.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = HealthMonitor::new();
+                            }
+                            if let Some(ref mut m) = *guard {
+                                if let Some(h) = m.record(&rid, &body_check) {
+                                    let _ = health_tx.send_blocking(MatrixEvent::HealthUpdate {
+                                        room_id: rid,
+                                        score: h.score,
+                                        trend: h.trend,
+                                        alert: h.alert,
+                                    });
+                                }
+                            }
+                        });
                     }
                 }
             }

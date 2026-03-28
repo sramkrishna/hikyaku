@@ -10,6 +10,9 @@ default = ["ai", "rolodex", "pinning", "motd"]
 ## Use ort-load-dynamic for Flatpak builds — ORT is dlopen'd at runtime.
 ai = ["dep:fastembed"]
 ai-flatpak = ["dep:fastembed", "dep:ort", "fastembed/ort-load-dynamic"]
+## Community health monitor: emotion scoring per room for community managers.
+## Depends on the same embedding model as the AI watcher.
+community-health = ["dep:fastembed"]
 ## Personal contact book with notes and @-completion.
 rolodex = []
 ## Local message bookmarks (not synced to the Matrix server).

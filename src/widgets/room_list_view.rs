@@ -818,6 +818,23 @@ impl RoomListView {
         self.update_parent_space_badge(room_id);
     }
 
+    /// Update the community health dot for `room_id` via the RoomObject property.
+    /// The bound RoomRow reacts via `connect_notify_local`.
+    #[cfg(feature = "community-health")]
+    pub fn set_room_health(&self, room_id: &str, alert: u8) {
+        if let Some(obj) = self.imp().room_registry.borrow().get(room_id) {
+            obj.set_health_alert(alert);
+        }
+    }
+
+    /// Hide all community health dots (called when the plugin is disabled).
+    #[cfg(feature = "community-health")]
+    pub fn clear_all_health_dots(&self) {
+        for obj in self.imp().room_registry.borrow().values() {
+            obj.set_health_alert(0);
+        }
+    }
+
     /// Increment unread count for a room (when a message arrives for a
     /// room we're not viewing). O(1) via room_registry.
     /// The RoomRow's property bindings auto-update the badge.

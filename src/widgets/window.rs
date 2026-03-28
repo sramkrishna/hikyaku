@@ -452,7 +452,11 @@ thread_local! {
                font-weight: bold; \
                text-decoration: underline; \
                filter: drop-shadow(0 0 4px alpha(@accent_color, 0.5)); \
-             }"
+             } \
+             .health-dot { border-radius: 50%; } \
+             .health-dot.health-none    { background-color: #26a269; } \
+             .health-dot.health-watch   { background-color: #e5a50a; } \
+             .health-dot.health-warning { background-color: #e01b24; }"
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -1542,6 +1546,26 @@ impl MxWindow {
                                 &message.sender,
                                 &message.body,
                                 is_dm,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "community-health")]
+                    MatrixEvent::HealthUpdate { room_id, score: _, trend: _, alert } => {
+                        use crate::plugins::community_health::AlertLevel;
+                        let alert_code: u8 = match alert {
+                            AlertLevel::None    => 1,
+                            AlertLevel::Watch   => 2,
+                            AlertLevel::Warning => 3,
+                        };
+                        window.imp().room_list_view.set_room_health(&room_id, alert_code);
+                        // Toast only on new warnings to avoid spamming.
+                        if alert == AlertLevel::Warning {
+                            toast_or_notify(
+                                &window,
+                                &toast_overlay,
+                                &format!("health-{room_id}"),
+                                "Community health warning",
+                                &format!("Sustained tension detected in {room_id}"),
                             );
                         }
                     }
@@ -4528,6 +4552,26 @@ impl MxWindow {
                 let _ = gs.set_boolean("plugin-motd-enabled", sw.is_active());
                 if !sw.is_active() {
                     rl_view.clear_all_topic_changed();
+                }
+            });
+        }
+
+        // Community health monitor plugin.
+        #[cfg(feature = "community-health")]
+        {
+            let rl_view = self.imp().room_list_view.clone();
+            let health_switch = adw::SwitchRow::builder()
+                .title("Community Health Monitor")
+                .subtitle("Show an emotional tone indicator on each room (uses local NPU/GPU via OpenVINO)")
+                .active(cfg.plugins.community_health)
+                .build();
+            plugins_group.add(&health_switch);
+            health_switch.connect_active_notify(move |sw| {
+                let gs = crate::config::gsettings();
+                let _ = gs.set_boolean("plugin-community-health-enabled", sw.is_active());
+                if !sw.is_active() {
+                    // Clear all health dots when the plugin is disabled.
+                    rl_view.clear_all_health_dots();
                 }
             });
         }
