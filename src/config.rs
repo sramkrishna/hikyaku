@@ -18,6 +18,9 @@ pub struct Settings {
     pub watch: WatchSettings,
     /// Pinned contacts for @ completion: "Display Name|@user:server" entries.
     pub rolodex: Vec<String>,
+    /// Known Matrix homeservers (without leading colon, e.g. "gnome.org").
+    /// Shown as @name:server suggestions when user directory search finds nothing.
+    pub known_servers: Vec<String>,
 }
 
 /// Room interest watcher settings.
@@ -143,6 +146,7 @@ pub fn settings() -> Settings {
             threshold: gs.double("watch-threshold").clamp(0.0, 1.0),
         },
         rolodex: gs.strv("rolodex").iter().map(|s| s.to_string()).collect(),
+        known_servers: gs.strv("known-servers").iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -181,6 +185,8 @@ pub fn save_settings(settings: &Settings) -> Result<(), Box<dyn std::error::Erro
     gs.set_double("watch-threshold", settings.watch.threshold)?;
     let rolodex: Vec<&str> = settings.rolodex.iter().map(|s| s.as_str()).collect();
     gs.set_strv("rolodex", rolodex.as_slice())?;
+    let known: Vec<&str> = settings.known_servers.iter().map(|s| s.as_str()).collect();
+    gs.set_strv("known-servers", known.as_slice())?;
     tracing::info!("Settings saved to dconf");
     Ok(())
 }
@@ -248,6 +254,7 @@ mod tests {
             plugins: PluginsSettings { rolodex: true, pinning: true, motd: true, community_health: false },
             rolodex: Vec::new(),
             watch: WatchSettings { enabled: false, terms: Vec::new(), threshold: 0.65 },
+            known_servers: vec!["matrix.org".to_string(), "gnome.org".to_string()],
         };
         assert!(s.rooms.pinned_rooms.is_empty());
         assert_eq!(s.sync.timeline_limit, 10);

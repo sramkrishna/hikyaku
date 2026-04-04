@@ -120,6 +120,10 @@ mod imp {
         /// Local unread-message broker — counts every new message per room and
         /// persists across restarts so badges survive quit/reopen.
         pub local_unread: crate::local_unread::LocalUnreadStore,
+        /// Callback registered by the active invite dialog.  Called with
+        /// `UserSearchResults` so the dialog can update its results list without
+        /// going through the full event channel.  Cleared when the dialog closes.
+        pub user_search_cb: RefCell<Option<Box<dyn Fn(Vec<(String, String)>) + 'static>>>,
     }
 
     impl Default for MxWindow {
@@ -213,6 +217,7 @@ mod imp {
                     store
                 },
                 local_unread: crate::local_unread::LocalUnreadStore::new(),
+                user_search_cb: RefCell::new(None),
             }
         }
     }
@@ -1978,6 +1983,11 @@ impl MxWindow {
                     MatrixEvent::InviteFailed { error } => {
                         toast_error(&toast_overlay, "Invite failed", &error);
                     }
+                    MatrixEvent::UserSearchResults { results } => {
+                        if let Some(cb) = window.imp().user_search_cb.borrow().as_ref() {
+                            cb(results);
+                        }
+                    }
                     MatrixEvent::DmReady { user_id: _, room_id, room_name } => {
                         // Navigate to the DM room — same as clicking it in the sidebar.
                         window.imp().current_room_id.replace(Some(room_id.clone()));
@@ -3604,54 +3614,19 @@ impl MxWindow {
                 .build();
             let tx = imp.command_tx.get().unwrap().clone();
             let rid = room_id.clone();
+            // Local members (lowercase_name, display_name, user_id) for instant search.
+            let local_members: Vec<(String, String, String)> = meta.members.iter()
+                .map(|(uid, name)| (name.to_lowercase(), name.clone(), uid.clone()))
+                .collect();
             let win_weak = self.downgrade();
             invite_btn.connect_clicked(move |btn| {
-                let entry = adw::EntryRow::builder()
-                    .title("Matrix user ID")
-                    .show_apply_button(true)
-                    .build();
-                let content = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(8)
-                    .margin_top(8)
-                    .build();
-                let hint = gtk::Label::builder()
-                    .label("e.g. @user:matrix.org")
-                    .css_classes(["caption", "dim-label"])
-                    .halign(gtk::Align::Start)
-                    .build();
-                content.append(&entry);
-                content.append(&hint);
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Invite User")
-                    .extra_child(&content)
-                    .build();
-                dialog.add_response("cancel", "Cancel");
-                dialog.add_response("invite", "Invite");
-                dialog.set_response_appearance("invite", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("invite"));
-                let tx2 = tx.clone();
-                let rid2 = rid.clone();
-                dialog.connect_response(None, move |_, response| {
-                    if response == "invite" {
-                        let uid = entry.text().to_string();
-                        if !uid.is_empty() {
-                            let tx = tx2.clone();
-                            let room_id = rid2.clone();
-                            glib::spawn_future_local(async move {
-                                let _ = tx.send(MatrixCommand::InviteUser {
-                                    room_id,
-                                    user_id: uid,
-                                }).await;
-                            });
-                        }
-                    }
-                });
-                if let Some(w) = win_weak.upgrade() {
-                    dialog.present(Some(&w));
-                } else {
-                    dialog.present(Some(btn));
-                }
+                build_invite_dialog(
+                    btn,
+                    &win_weak,
+                    &tx,
+                    &rid,
+                    &local_members,
+                );
             });
             container.append(&invite_btn);
         }
@@ -5280,4 +5255,227 @@ fn show_export_metrics_dialog(
     });
 
     dialog.present(Some(parent));
+}
+
+/// Build the "Invite User" dialog with live name-based search.
+///
+/// The user types a display name (or partial Matrix ID); local room members are
+/// searched instantly and the Matrix user directory is queried asynchronously.
+/// Selecting a result fills in the Matrix ID, so the user never has to type it.
+fn build_invite_dialog(
+    fallback_parent: &gtk::Button,
+    win_weak: &glib::WeakRef<MxWindow>,
+    tx: &async_channel::Sender<MatrixCommand>,
+    room_id: &str,
+    local_members: &[(String, String, String)], // (lowercase_name, display_name, user_id)
+) {
+    // The selected Matrix user ID — updated when a result row is chosen.
+    let selected_uid: std::rc::Rc<std::cell::RefCell<String>> = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+
+    // ── Search entry ──────────────────────────────────────────────────────────
+    let search_entry = adw::EntryRow::builder()
+        .title("Name or @user:server")
+        .build();
+
+    // ── Results list ─────────────────────────────────────────────────────────
+    let results_list = gtk::ListBox::new();
+    results_list.set_selection_mode(gtk::SelectionMode::Single);
+    results_list.add_css_class("boxed-list");
+
+    // Scrollable wrapper so large result sets don't overflow the dialog.
+    let results_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(0)
+        .max_content_height(220)
+        .propagate_natural_height(true)
+        .child(&results_list)
+        .visible(false)
+        .build();
+
+    // Hint shown when directory search returns nothing.
+    let no_results_label = gtk::Label::builder()
+        .label("No results found")
+        .css_classes(["dim-label", "caption"])
+        .halign(gtk::Align::Center)
+        .margin_top(4)
+        .visible(false)
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(4)
+        .build();
+    content.append(&search_entry);
+    content.append(&results_scroll);
+    content.append(&no_results_label);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Invite User")
+        .extra_child(&content)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("invite", "Invite");
+    dialog.set_response_appearance("invite", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("invite", false); // enabled only when a user is selected
+    dialog.set_default_response(Some("invite"));
+
+    // ── Populate results_list from a Vec<(display_name, user_id)> ────────────
+    let populate_results = {
+        let results_list = results_list.clone();
+        let results_scroll = results_scroll.clone();
+        let no_results_label = no_results_label.clone();
+        let selected_uid = selected_uid.clone();
+        let dialog_weak = dialog.downgrade();
+        move |results: Vec<(String, String)>| {
+            while let Some(child) = results_list.first_child() { results_list.remove(&child); }
+            if results.is_empty() {
+                results_scroll.set_visible(false);
+                no_results_label.set_visible(true);
+                return;
+            }
+            no_results_label.set_visible(false);
+            for (name, uid) in &results {
+                let row = adw::ActionRow::builder()
+                    .title(name)
+                    .subtitle(uid)
+                    .activatable(true)
+                    .build();
+                results_list.append(&row);
+            }
+            results_scroll.set_visible(true);
+            // Auto-select the first result so pressing Enter immediately works.
+            if let Some(first) = results_list.first_child() {
+                if let Some(row) = first.downcast_ref::<gtk::ListBoxRow>() {
+                    results_list.select_row(Some(row));
+                    *selected_uid.borrow_mut() = results[0].1.clone();
+                    if let Some(d) = dialog_weak.upgrade() {
+                        d.set_response_enabled("invite", true);
+                    }
+                }
+            }
+        }
+    };
+
+    // Row selection → update selected_uid.
+    {
+        let selected_uid = selected_uid.clone();
+        let dialog_weak = dialog.downgrade();
+        let results_list2 = results_list.clone();
+        results_list.connect_row_selected(move |_, row| {
+            let Some(row) = row else {
+                *selected_uid.borrow_mut() = String::new();
+                if let Some(d) = dialog_weak.upgrade() { d.set_response_enabled("invite", false); }
+                return;
+            };
+            // Match row position back to subtitle (user_id).
+            let mut pos = 0u32;
+            let mut child = results_list2.first_child();
+            while let Some(w) = child {
+                if let Some(lbr) = w.downcast_ref::<gtk::ListBoxRow>() {
+                    if lbr == row { break; }
+                }
+                child = w.next_sibling();
+                pos += 1;
+            }
+            if let Some(action_row) = row.child().and_downcast::<adw::ActionRow>() {
+                *selected_uid.borrow_mut() = action_row.subtitle().unwrap_or_default().to_string();
+                if let Some(d) = dialog_weak.upgrade() { d.set_response_enabled("invite", true); }
+            }
+        });
+    }
+
+    // ── Keystroke handler: local search + directory search ───────────────────
+    {
+        let local_members: Vec<(String, String, String)> = local_members.to_vec();
+        let tx = tx.clone();
+        let populate = populate_results.clone();
+        let win_weak = win_weak.clone();
+        let known_servers = crate::config::settings().known_servers.clone();
+        search_entry.connect_changed(move |entry| {
+            let query = entry.text().to_string();
+            if query.is_empty() {
+                populate(vec![]);
+                return;
+            }
+            let q_lower = query.to_lowercase();
+
+            // Instant local search (binary search on sorted members).
+            let start = local_members.partition_point(|(lower, _, _)| lower.as_str() < q_lower.as_str());
+            let local_results: Vec<(String, String)> = local_members[start..]
+                .iter()
+                .take_while(|(lower, _, _)| lower.starts_with(&q_lower))
+                .take(10)
+                .map(|(_, name, uid)| (name.clone(), uid.clone()))
+                .collect();
+
+            // If the query looks like a Matrix ID, add server suggestions from known_servers.
+            let server_hints: Vec<(String, String)> = if !query.starts_with('@') && !query.contains(':') {
+                known_servers.iter()
+                    .map(|srv| (format!("@{query}:{srv}"), format!("@{query}:{srv}")))
+                    .filter(|(_, uid)| !local_results.iter().any(|(_, u)| u == uid))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            // Show local results immediately; directory search will overwrite.
+            let combined: Vec<(String, String)> = local_results.iter().cloned()
+                .chain(server_hints)
+                .collect();
+            populate(combined.clone());
+
+            // Register this dialog's result callback in the window.
+            let populate2 = populate.clone();
+            let local2 = local_results.clone();
+            let q2 = query.clone();
+            if let Some(win) = win_weak.upgrade() {
+                *win.imp().user_search_cb.borrow_mut() = Some(Box::new(move |dir_results| {
+                    // Merge: local results first (deduplicated), then directory results.
+                    let local_uids: std::collections::HashSet<String> =
+                        local2.iter().map(|(_, u)| u.clone()).collect();
+                    let merged: Vec<(String, String)> = local2.iter().cloned()
+                        .chain(dir_results.into_iter().filter(|(_, u)| !local_uids.contains(u)))
+                        .take(20)
+                        .collect();
+                    populate2(merged);
+                }));
+            }
+
+            // Fire directory search (results arrive asynchronously via UserSearchResults event).
+            let tx2 = tx.clone();
+            let q3 = query.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx2.send(MatrixCommand::SearchUsers { query: q3 }).await;
+            });
+        });
+    }
+
+    // ── Confirm invite ────────────────────────────────────────────────────────
+    let tx2 = tx.clone();
+    let rid2 = room_id.to_string();
+    let win_weak2 = win_weak.clone();
+    dialog.connect_response(None, move |_, response| {
+        // Always unregister the search callback when the dialog closes.
+        if let Some(win) = win_weak2.upgrade() {
+            *win.imp().user_search_cb.borrow_mut() = None;
+        }
+        if response == "invite" {
+            let uid = selected_uid.borrow().clone();
+            if !uid.is_empty() {
+                let tx = tx2.clone();
+                let room_id = rid2.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::InviteUser { room_id, user_id: uid }).await;
+                });
+            }
+        }
+    });
+
+    if let Some(w) = win_weak.upgrade() {
+        dialog.present(Some(&w));
+    } else {
+        dialog.present(Some(fallback_parent));
+    }
 }

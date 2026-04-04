@@ -138,6 +138,17 @@
       <description>Set to false once the user completes initial login and E2EE setup.</description>
     </key>
 
+    <!-- Known Matrix servers for user-search suggestions.
+         Listed without leading colon, e.g. "matrix.org", "gnome.org".
+         Used by the invite dialog: if a display-name search returns no results
+         the UI suggests "@name:server" combinations for each server listed. -->
+    <key name="known-servers" type="as">
+      <default>['matrix.org', 'gnome.org']</default>
+      <summary>Matrix homeservers to suggest in user search</summary>
+      <description>When the user directory search finds no match, hikyaku
+      suggests "@name:server" completions for each server in this list.</description>
+    </key>
+
     <!-- Hidden moderation analysis modes (not exposed in UI).
          Enable via: gsettings set me.ramkrishna.hikyaku ai-detect-conflict true -->
     <key name="ai-detect-conflict" type="b">

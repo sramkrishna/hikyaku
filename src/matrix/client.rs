@@ -281,6 +281,8 @@ pub enum MatrixEvent {
     InviteFailed { error: String },
     /// DM room is ready — navigate to it.
     DmReady { user_id: String, room_id: String, room_name: String },
+    /// Results from a user directory search (display_name, user_id).
+    UserSearchResults { results: Vec<(String, String)> },
     /// Users currently typing in a room.
     TypingUsers { room_id: String, names: Vec<String> },
     /// A sync gap was detected — the room's timeline was limited.
@@ -410,6 +412,8 @@ pub enum MatrixCommand {
     LeaveRoom { room_id: String },
     /// Invite a Matrix user to a room.
     InviteUser { room_id: String, user_id: String },
+    /// Search the homeserver user directory by display name or Matrix ID prefix.
+    SearchUsers { query: String },
     /// Send read receipt for the latest message in a room.
     MarkRead { room_id: String },
     /// Open or create a DM with a user. Finds existing DM room or creates one.
@@ -1124,6 +1128,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::InviteUser { room_id, user_id }) => {
                         handle_invite_user(&client, &event_tx, &room_id, &user_id).await;
+                    }
+                    Ok(MatrixCommand::SearchUsers { query }) => {
+                        handle_search_users(&client, &event_tx, &query).await;
                     }
                     Ok(MatrixCommand::MarkRead { room_id }) => {
                         tracing::info!("MarkRead command received for {room_id}");
@@ -4357,6 +4364,35 @@ async fn handle_invite_user(
             let _ = event_tx.send(MatrixEvent::InviteFailed {
                 error: e.to_string(),
             }).await;
+        }
+    }
+}
+
+/// Search the homeserver's user directory by display name or Matrix ID prefix.
+/// Sends `UserSearchResults` with up to 20 matching (display_name, user_id) pairs.
+async fn handle_search_users(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    query: &str,
+) {
+    use matrix_sdk::ruma::api::client::user_directory::search_users::v3::Request as SearchRequest;
+    let mut req = SearchRequest::new(query.to_owned());
+    req.limit = 20u32.into();
+    match client.send(req).await {
+        Ok(resp) => {
+            let results: Vec<(String, String)> = resp.results
+                .iter()
+                .map(|u| (
+                    u.display_name.clone().unwrap_or_else(|| u.user_id.localpart().to_string()),
+                    u.user_id.to_string(),
+                ))
+                .collect();
+            tracing::debug!("SearchUsers \"{query}\": {} results", results.len());
+            let _ = event_tx.send(MatrixEvent::UserSearchResults { results }).await;
+        }
+        Err(e) => {
+            tracing::warn!("SearchUsers \"{query}\" failed: {e}");
+            let _ = event_tx.send(MatrixEvent::UserSearchResults { results: vec![] }).await;
         }
     }
 }
