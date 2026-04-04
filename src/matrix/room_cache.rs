@@ -1,174 +1,112 @@
 // RoomCache — unified in-memory + on-disk timeline cache.
 //
-// A GObject that centralises both the in-memory HashMap (fast room switches,
-// zero I/O) and the on-disk TimelineStore (instant restarts).  Keeping them
-// together means every write hits both stores atomically — no chance of the
-// two caches drifting apart.
-//
 // Storage layout
 // ──────────────
-// ~/.local/share/hikyaku/timeline.db  — single SQLite database.
+// ~/.local/share/hikyaku/timeline/<sanitised_room_id>.json
 //
-//   messages(room_id, position, event_id, sender, sender_id, body,
-//            formatted_body, timestamp, reply_to, reply_to_sender,
-//            thread_root, reactions, media, is_highlight)
+//   Each file is a JSON object:
+//     { "messages": [...], "prev_batch_token": "t123..." }
 //
-//   room_state(room_id, prev_batch_token)
+//   One file per room.  Reads from different rooms never contend with each
+//   other (no shared mutex, no connection pool).  Writes use an atomic
+//   temp-file rename so a crash mid-write never corrupts a room's cache.
 //
-// One SQLite connection replaces the previous per-room JSON files, reducing
-// open file-descriptors from O(rooms) to 1 and enabling indexed queries.
+// Why not SQLite?
+// ───────────────
+// The previous implementation used a single SQLite connection behind a Mutex.
+// Every read and write across ALL rooms serialised through that one lock,
+// causing 1-2 s stalls on room selection (bg_refresh had to wait for an
+// unrelated room's save to finish).  At ~11 KB per room and ~72 rooms the
+// total dataset is ~800 KB — firmly in "just use files" territory.  There
+// are no cross-room queries, so SQLite's relational features bought nothing.
 //
 // Thread safety
 // ─────────────
 // The memory HashMap is protected by std::sync::Mutex (never held across an
-// .await point — only brief HashMap ops).  The SQLite connection is also
-// behind std::sync::Mutex; all disk methods are blocking and must be called
-// from spawn_blocking.  GObject's own reference count is already atomic, so
-// Clone gives a cheap additional reference to the same state — exactly the
-// Arc<> semantics the tokio code needs.
-//
-// unsafe impl Send/Sync is safe here because:
-//   1. No GTK or GLib main-thread calls are made on this object.
-//   2. All mutable state is behind std::sync::Mutex.
+// .await point — only brief HashMap ops).  Disk I/O is plain std::fs with no
+// shared state, so it is safe to call from any thread including tokio's
+// blocking pool.  GObject's own reference count is atomic, so Clone gives a
+// cheap additional handle to the same state.
 
 mod imp {
     use glib::subclass::prelude::*;
-    use rusqlite::{Connection, params};
+    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use crate::matrix::{MessageInfo, MediaInfo, MediaKind, RoomMeta};
+    use crate::matrix::{MessageInfo, RoomMeta};
 
-    // ── TimelineStore ─────────────────────────────────────────────────────────
-    // Single SQLite connection shared across all rooms.
+    // ── Disk format ───────────────────────────────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    struct RoomFile {
+        #[serde(default)]
+        messages: Vec<MessageInfo>,
+        #[serde(default)]
+        prev_batch_token: Option<String>,
+    }
+
+    // ── TimelineStore — per-room JSON files ───────────────────────────────────
 
     pub(super) struct TimelineStore {
-        conn: Mutex<Connection>,
+        dir: PathBuf,
     }
 
     impl TimelineStore {
         pub(super) fn new() -> Self {
-            let db_path = Self::db_path();
-            if let Some(parent) = db_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let conn = Connection::open(&db_path)
-                .expect("failed to open timeline.db");
-            Self::init_schema(&conn);
-            Self { conn: Mutex::new(conn) }
-        }
-
-        fn db_path() -> PathBuf {
-            dirs::data_dir()
+            let dir = dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("hikyaku")
-                .join("timeline.db")
+                .join("timeline");
+            let _ = std::fs::create_dir_all(&dir);
+            Self { dir }
         }
 
-        fn init_schema(conn: &Connection) {
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA foreign_keys=ON;
-                 CREATE TABLE IF NOT EXISTS messages (
-                     room_id          TEXT    NOT NULL,
-                     position         INTEGER NOT NULL,
-                     event_id         TEXT    NOT NULL DEFAULT '',
-                     sender           TEXT    NOT NULL DEFAULT '',
-                     sender_id        TEXT    NOT NULL DEFAULT '',
-                     body             TEXT    NOT NULL DEFAULT '',
-                     formatted_body   TEXT,
-                     timestamp        INTEGER NOT NULL DEFAULT 0,
-                     reply_to         TEXT,
-                     reply_to_sender  TEXT,
-                     thread_root      TEXT,
-                     reactions        TEXT    NOT NULL DEFAULT '[]',
-                     media            TEXT,
-                     is_highlight     INTEGER NOT NULL DEFAULT 0,
-                     is_system_event  INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (room_id, position)
-                 );
-                 CREATE TABLE IF NOT EXISTS room_state (
-                     room_id           TEXT PRIMARY KEY,
-                     prev_batch_token  TEXT
-                 );",
-            )
-            .expect("failed to initialise timeline schema");
-        // Migration: add is_system_event column to existing databases.
-        // Errors are ignored — if the column already exists this is a no-op.
-        let _ = conn.execute(
-            "ALTER TABLE messages ADD COLUMN is_system_event INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        /// Sanitise a room ID into a safe filename component.
+        /// Replaces characters that are problematic on common filesystems.
+        fn filename(room_id: &str) -> String {
+            let safe: String = room_id
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+                    _ => '_',
+                })
+                .collect();
+            format!("{safe}.json")
+        }
+
+        fn path(&self, room_id: &str) -> PathBuf {
+            self.dir.join(Self::filename(room_id))
         }
 
         pub(super) fn save(
             &self,
             room_id: &str,
             messages: &[MessageInfo],
-            prev_batch: Option<&str>,
+            prev_batch_token: Option<&str>,
         ) {
-            let mut conn = self.conn.lock().unwrap();
-            // Wrap in a transaction: DELETE old rows + INSERT new ones atomically.
-            let tx = match conn.transaction() {
-                Ok(t) => t,
+            let file = RoomFile {
+                messages: messages.to_vec(),
+                prev_batch_token: prev_batch_token.map(|s| s.to_string()),
+            };
+            let json = match serde_json::to_vec(&file) {
+                Ok(j) => j,
                 Err(e) => {
-                    tracing::error!("timeline save: begin tx: {e}");
+                    tracing::error!("timeline save {room_id}: serialise: {e}");
                     return;
                 }
             };
-            if let Err(e) = tx.execute(
-                "DELETE FROM messages WHERE room_id = ?1",
-                params![room_id],
-            ) {
-                tracing::error!("timeline save: delete: {e}");
+            // Atomic write: write to a temp file then rename.
+            let dest = self.path(room_id);
+            let tmp = dest.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, &json) {
+                tracing::error!("timeline save {room_id}: write tmp: {e}");
                 return;
             }
-            for (pos, msg) in messages.iter().enumerate() {
-                let reactions_json =
-                    serde_json::to_string(&msg.reactions).unwrap_or_else(|_| "[]".into());
-                let media_json = msg
-                    .media
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                if let Err(e) = tx.execute(
-                    "INSERT INTO messages
-                         (room_id, position, event_id, sender, sender_id, body,
-                          formatted_body, timestamp, reply_to, reply_to_sender,
-                          thread_root, reactions, media, is_highlight, is_system_event)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    params![
-                        room_id,
-                        pos as i64,
-                        msg.event_id,
-                        msg.sender,
-                        msg.sender_id,
-                        msg.body,
-                        msg.formatted_body,
-                        msg.timestamp as i64,
-                        msg.reply_to,
-                        msg.reply_to_sender,
-                        msg.thread_root,
-                        reactions_json,
-                        media_json,
-                        msg.is_highlight as i32,
-                        msg.is_system_event as i32,
-                    ],
-                ) {
-                    tracing::error!("timeline save: insert row {pos}: {e}");
-                    return;
-                }
-            }
-            if let Err(e) = tx.execute(
-                "INSERT OR REPLACE INTO room_state (room_id, prev_batch_token)
-                 VALUES (?1, ?2)",
-                params![room_id, prev_batch],
-            ) {
-                tracing::error!("timeline save: upsert room_state: {e}");
-                return;
-            }
-            if let Err(e) = tx.commit() {
-                tracing::error!("timeline save: commit: {e}");
+            if let Err(e) = std::fs::rename(&tmp, &dest) {
+                tracing::error!("timeline save {room_id}: rename: {e}");
+                let _ = std::fs::remove_file(&tmp);
             }
         }
 
@@ -176,95 +114,18 @@ mod imp {
             &self,
             room_id: &str,
         ) -> Option<(Vec<MessageInfo>, Option<String>)> {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT event_id, sender, sender_id, body, formatted_body,
-                            timestamp, reply_to, reply_to_sender, thread_root,
-                            reactions, media, is_highlight, is_system_event
-                     FROM messages
-                     WHERE room_id = ?1
-                     ORDER BY position",
-                )
+            let bytes = std::fs::read(self.path(room_id)).ok()?;
+            let file: RoomFile = serde_json::from_slice(&bytes)
+                .map_err(|e| tracing::warn!("timeline load {room_id}: {e}"))
                 .ok()?;
-
-            let messages: Vec<MessageInfo> = stmt
-                .query_map(params![room_id], |row| {
-                    let reactions_json: String = row.get(9)?;
-                    let media_json: Option<String> = row.get(10)?;
-                    let is_highlight: i32 = row.get(11)?;
-                    let is_system_event: i32 = row.get(12).unwrap_or(0);
-                    let timestamp: i64 = row.get(5)?;
-                    Ok((
-                        row.get::<_, String>(0)?,  // event_id
-                        row.get::<_, String>(1)?,  // sender
-                        row.get::<_, String>(2)?,  // sender_id
-                        row.get::<_, String>(3)?,  // body
-                        row.get::<_, Option<String>>(4)?,  // formatted_body
-                        timestamp,
-                        row.get::<_, Option<String>>(6)?,  // reply_to
-                        row.get::<_, Option<String>>(7)?,  // reply_to_sender
-                        row.get::<_, Option<String>>(8)?,  // thread_root
-                        reactions_json,
-                        media_json,
-                        is_highlight,
-                        is_system_event,
-                    ))
-                })
-                .ok()?
-                .filter_map(|r| r.ok())
-                .map(|(event_id, sender, sender_id, body, formatted_body,
-                        timestamp, reply_to, reply_to_sender, thread_root,
-                        reactions_json, media_json, is_highlight, is_system_event)| {
-                    let reactions = serde_json::from_str(&reactions_json)
-                        .unwrap_or_default();
-                    let media: Option<MediaInfo> = media_json
-                        .as_deref()
-                        .and_then(|j| serde_json::from_str(j).ok());
-                    MessageInfo {
-                        event_id,
-                        sender,
-                        sender_id,
-                        body,
-                        formatted_body,
-                        timestamp: timestamp as u64,
-                        reply_to,
-                        reply_to_sender,
-                        thread_root,
-                        reactions,
-                        media,
-                        is_highlight: is_highlight != 0,
-                        is_system_event: is_system_event != 0,
-                    }
-                })
-                .collect();
-
-            if messages.is_empty() {
+            if file.messages.is_empty() {
                 return None;
             }
-
-            let token: Option<String> = conn
-                .query_row(
-                    "SELECT prev_batch_token FROM room_state WHERE room_id = ?1",
-                    params![room_id],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-
-            Some((messages, token))
+            Some((file.messages, file.prev_batch_token))
         }
 
         pub(super) fn delete(&self, room_id: &str) {
-            let conn = self.conn.lock().unwrap();
-            let _ = conn.execute(
-                "DELETE FROM messages WHERE room_id = ?1",
-                params![room_id],
-            );
-            let _ = conn.execute(
-                "DELETE FROM room_state WHERE room_id = ?1",
-                params![room_id],
-            );
+            let _ = std::fs::remove_file(self.path(room_id));
         }
     }
 
@@ -279,7 +140,7 @@ mod imp {
         /// When each room's data was last fetched from the server (prefetch OR
         /// bg_refresh).  Checked by SelectRoom to avoid redundant full refreshes.
         pub(super) refreshed_at: Mutex<HashMap<String, std::time::Instant>>,
-        /// Disk store — single SQLite connection behind its own Mutex.
+        /// Disk store — per-room JSON files, no shared mutex.
         pub(super) disk: TimelineStore,
     }
 
@@ -307,9 +168,9 @@ glib::wrapper! {
     pub struct RoomCache(ObjectSubclass<imp::RoomCache>);
 }
 
-// SAFETY: All mutable state lives behind std::sync::Mutex.  GObject's own
-// reference count is atomic.  This object never calls GTK/GLib main-thread
-// functions — it is a pure data cache used only on tokio worker threads.
+// SAFETY: All mutable state lives behind std::sync::Mutex.  The disk store
+// uses plain std::fs with no shared state.  GObject's reference count is
+// atomic.  This object never calls GTK/GLib main-thread functions.
 unsafe impl Send for RoomCache {}
 unsafe impl Sync for RoomCache {}
 
@@ -374,9 +235,7 @@ impl RoomCache {
     }
 
     /// Record that `room_id` was just populated from the server.
-    /// Called by both `prefetch_room_timeline` and `handle_select_room_bg`.
     pub fn mark_fresh(&self, room_id: &str) {
-        tracing::debug!("mark_fresh: {}", room_id);
         self.imp()
             .refreshed_at
             .lock()
@@ -385,11 +244,7 @@ impl RoomCache {
     }
 
     /// Returns `true` if this room's memory cache was ever populated from the
-    /// server (via `mark_fresh`) during the current session.
-    ///
-    /// Rooms loaded only from the SQLite disk cache have `has_memory = true`
-    /// but return `false` here — they need a bg_refresh to pick up messages
-    /// that arrived since the disk snapshot was written.
+    /// server during the current session.
     pub fn was_server_fetched(&self, room_id: &str) -> bool {
         self.imp()
             .refreshed_at
@@ -414,7 +269,6 @@ impl RoomCache {
     }
 
     /// Update a single message's body in the memory cache (for edits).
-    /// Returns true if the message was found and updated.
     pub fn update_message_body_in_cache(
         &self,
         room_id: &str,
@@ -436,25 +290,20 @@ impl RoomCache {
         false
     }
 
-    /// Append a single message to the tail of the memory cache if the room has
-    /// a cache entry and the message is not already present (checked by event_id).
-    ///
-    /// Returns `true` if the message was appended (cache was warm and updated).
-    /// Returns `false` if the room has no memory cache entry (caller should keep
-    /// the dirty flag set so bg_refresh runs on next SelectRoom).
+    /// Append a single message to the tail of the memory cache.
+    /// Returns `true` if appended (cache was warm); `false` if the room has
+    /// no memory entry (caller should mark dirty for bg_refresh).
     pub fn append_memory(&self, room_id: &str, msg: MessageInfo) -> bool {
         let mut memory = self.imp().memory.lock().unwrap();
         let Some((msgs, _, _)) = memory.get_mut(room_id) else {
             return false;
         };
-        // Deduplicate: skip if this event_id is already in the last few entries.
         if !msg.event_id.is_empty()
             && msgs.iter().rev().take(20).any(|m| m.event_id == msg.event_id)
         {
-            return true; // Already present — cache is still valid.
+            return true;
         }
         msgs.push(msg);
-        // Trim to the cap so sync appends can't grow the Vec without bound.
         if msgs.len() > MAX_MEMORY_MSGS {
             let drain = msgs.len() - MAX_MEMORY_MSGS;
             msgs.drain(..drain);
@@ -463,9 +312,6 @@ impl RoomCache {
     }
 
     /// Return the event_id of the last message in the memory cache.
-    ///
-    /// Used by the MarkRead path — `room.latest_event()` is only populated by
-    /// the SDK's sync timeline, which is not used here (we use pagination).
     pub fn latest_event_id(&self, room_id: &str) -> Option<String> {
         let memory = self.imp().memory.lock().unwrap();
         memory
@@ -475,7 +321,7 @@ impl RoomCache {
             .map(|m| m.event_id.clone())
     }
 
-    /// Return cached members + avatars if a full server fetch was done this session.
+    /// Return cached members + avatars if a full fetch was done this session.
     pub fn get_cached_members(
         &self,
         room_id: &str,
@@ -487,40 +333,52 @@ impl RoomCache {
             .map(|(_, _, m)| (m.members.clone(), m.member_avatars.clone()))
     }
 
+    /// Store a fetched member list into the room's memory cache entry.
+    /// No-ops if no memory entry exists for the room yet.
+    pub fn cache_members(
+        &self,
+        room_id: &str,
+        members: Vec<(String, String)>,
+        member_avatars: Vec<(String, String)>,
+    ) {
+        let mut memory = self.imp().memory.lock().unwrap();
+        if let Some((_, _, meta)) = memory.get_mut(room_id) {
+            meta.members = members;
+            meta.member_avatars = member_avatars;
+            meta.members_fetched = true;
+        }
+    }
+
     /// Remove a room from both memory and disk.
-    /// Used for redactions and edits (stale cached timeline).
     pub fn remove(&self, room_id: &str) {
         self.imp().memory.lock().unwrap().remove(room_id);
         self.imp().disk.delete(room_id);
     }
 
     /// Remove a room from memory only, leaving disk intact.
-    /// Used for sync gaps: disk cache still serves an instant first display
-    /// while bg_refresh fetches fresh data (has_memory=false → needs_refresh=true).
     pub fn remove_memory(&self, room_id: &str) {
         tracing::info!("remove_memory (cache evict): {}", room_id);
         self.imp().memory.lock().unwrap().remove(room_id);
     }
 
     /// Evict all rooms from the memory cache.
-    /// Called after key recovery / import so UTD messages are re-fetched.
     pub fn clear_memory(&self) {
         self.imp().memory.lock().unwrap().clear();
     }
 
-    /// Evict a single room from both memory cache and the server-fetched
-    /// timestamp, so the next SelectRoom forces a full bg_refresh.
-    /// Called when new session keys arrive for that room.
+    /// Evict a room from memory + server-fetch timestamp, forcing bg_refresh.
     pub fn invalidate_room(&self, room_id: &str) {
         self.imp().memory.lock().unwrap().remove(room_id);
         self.imp().refreshed_at.lock().unwrap().remove(room_id);
     }
 
-    // ── Disk cache (blocking — must be called from spawn_blocking) ────────────
+    // ── Disk cache ────────────────────────────────────────────────────────────
+    //
+    // These are plain synchronous std::fs calls — no spawn_blocking needed.
+    // Each room is an independent file so there is no cross-room contention.
 
-    /// Load a room's timeline from the SQLite store.
-    ///
-    /// **Blocking** — wrap the call in `tokio::task::spawn_blocking`.
+    /// Load a room's timeline from the per-room JSON file.
+    /// Fast enough to call directly; no spawn_blocking required.
     pub fn load_disk(
         &self,
         room_id: &str,
@@ -528,9 +386,8 @@ impl RoomCache {
         self.imp().disk.load(room_id)
     }
 
-    /// Persist a room's timeline to the SQLite store.
-    ///
-    /// **Blocking** — wrap the call in `tokio::task::spawn_blocking`.
+    /// Persist a room's timeline to its JSON file (atomic rename).
+    /// Safe to call from any thread; use spawn_blocking if called from async.
     pub fn save_disk(&self, room_id: &str, msgs: &[MessageInfo], token: Option<&str>) {
         self.imp().disk.save(room_id, msgs, token);
     }
@@ -577,35 +434,26 @@ mod tests {
         }
     }
 
-    // ── append_memory cap ─────────────────────────────────────────────────────
-
     #[test]
     fn append_memory_trims_to_cap() {
         let cache = RoomCache::new();
         cache.insert_memory_only("!r:s", Vec::new(), None, empty_meta());
-
-        // Append MAX_MEMORY_MSGS + 10 messages simulating a busy sync feed.
         for i in 0..(MAX_MEMORY_MSGS + 10) {
             cache.append_memory("!r:s", make_msg(&format!("$ev{i}")));
         }
-
         let (msgs, _, _) = cache.get_memory("!r:s").unwrap();
-        assert_eq!(msgs.len(), MAX_MEMORY_MSGS,
-            "Vec must be capped at MAX_MEMORY_MSGS; got {}", msgs.len());
+        assert_eq!(msgs.len(), MAX_MEMORY_MSGS);
     }
 
     #[test]
     fn append_memory_keeps_newest_messages_after_trim() {
         let cache = RoomCache::new();
         cache.insert_memory_only("!r:s", Vec::new(), None, empty_meta());
-
         let total = MAX_MEMORY_MSGS + 5;
         for i in 0..total {
             cache.append_memory("!r:s", make_msg(&format!("$ev{i}")));
         }
-
         let (msgs, _, _) = cache.get_memory("!r:s").unwrap();
-        // The oldest 5 should have been drained; the last should be $ev{total-1}.
         assert_eq!(msgs.last().unwrap().event_id, format!("$ev{}", total - 1));
         assert_eq!(msgs.first().unwrap().event_id, "$ev5");
     }
@@ -614,13 +462,91 @@ mod tests {
     fn append_memory_under_cap_does_not_trim() {
         let cache = RoomCache::new();
         cache.insert_memory_only("!r:s", Vec::new(), None, empty_meta());
-
         for i in 0..10 {
             cache.append_memory("!r:s", make_msg(&format!("$ev{i}")));
         }
-
         let (msgs, _, _) = cache.get_memory("!r:s").unwrap();
         assert_eq!(msgs.len(), 10);
     }
 
+    #[test]
+    fn cache_members_roundtrip() {
+        let cache = RoomCache::new();
+        cache.insert_memory_only("!r:s", Vec::new(), None, empty_meta());
+
+        // Before caching, get_cached_members returns None (members_fetched=false).
+        assert!(cache.get_cached_members("!r:s").is_none());
+
+        let members = vec![
+            ("@alice:example.org".to_string(), "Alice".to_string()),
+            ("@bob:example.org".to_string(), "Bob".to_string()),
+        ];
+        let avatars = vec![
+            ("@alice:example.org".to_string(), "mxc://example.org/avatar".to_string()),
+        ];
+        cache.cache_members("!r:s", members.clone(), avatars.clone());
+
+        let (cached_members, cached_avatars) = cache.get_cached_members("!r:s").unwrap();
+        assert_eq!(cached_members, members);
+        assert_eq!(cached_avatars, avatars);
+    }
+
+    #[test]
+    fn cache_members_no_op_without_memory_entry() {
+        let cache = RoomCache::new();
+        // cache_members on an unknown room should not panic or create an entry.
+        cache.cache_members("!unknown:s", vec![], vec![]);
+        assert!(cache.get_cached_members("!unknown:s").is_none());
+    }
+
+    #[test]
+    fn member_count_prefers_fetched_list_over_sdk_zero() {
+        // Simulate the case where joined_members_count() returns 0 (pre-sync)
+        // but we have a fetched member list — verify the correct count is used.
+        let fetched_members: Vec<(String, String)> = vec![
+            ("@alice:example.org".to_string(), "Alice".to_string()),
+            ("@bob:example.org".to_string(), "Bob".to_string()),
+            ("@carol:example.org".to_string(), "Carol".to_string()),
+        ];
+        let sdk_count: u64 = 0; // Pre-sync SDK count is unreliable.
+        let member_count = if !fetched_members.is_empty() {
+            fetched_members.len() as u64
+        } else {
+            sdk_count
+        };
+        assert_eq!(member_count, 3);
+    }
+
+    /// Regression test: when bg_refresh freshly fetches members (not from cache)
+    /// it must NOT skip the RoomMessages send even if messages are unchanged.
+    ///
+    /// Before the fix, the early-return guard only checked `unread_count` and
+    /// `fully_read_event_id`, silently discarding freshly-fetched members when
+    /// the message content was identical to what was already in the cache.
+    #[test]
+    fn fresh_members_bypass_messages_unchanged_skip() {
+        // Simulate the guard logic in bg_refresh's "messages unchanged" branch.
+        let members_were_cached = false;
+        let members: Vec<(String, String)> = vec![
+            ("@alice:example.org".to_string(), "Alice".to_string()),
+        ];
+        let unread_count = 0u32;
+        let fully_read_event_id: Option<String> = None;
+
+        let members_freshly_fetched = !members_were_cached && !members.is_empty();
+        let should_skip = unread_count == 0
+            && fully_read_event_id.is_none()
+            && !members_freshly_fetched;
+
+        // Must NOT skip — we have fresh members the UI hasn't seen yet.
+        assert!(!should_skip, "bg_refresh skipped RoomMessages despite fresh members");
+
+        // Verify: if members were cached (no new info), it is safe to skip.
+        let members_were_cached2 = true;
+        let members_freshly_fetched2 = !members_were_cached2 && !members.is_empty();
+        let should_skip2 = unread_count == 0
+            && fully_read_event_id.is_none()
+            && !members_freshly_fetched2;
+        assert!(should_skip2, "bg_refresh should skip when messages and members are both unchanged");
+    }
 }

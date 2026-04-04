@@ -118,13 +118,11 @@ template $MxMessageView : Gtk.Box {
           revealed: false;
         }
 
-        Gtk.ScrolledWindow scrolled_window {
-          hscrollbar-policy: never;
+        // Per-room ScrolledWindow+ListView widgets are added here
+        // programmatically via MessageView::ensure_room_view().
+        Gtk.Box room_list_placeholder {
           vexpand: true;
-          styles ["mx-tinted-bg"]
-
-          Gtk.ListView list_view {
-          }
+          orientation: vertical;
         }
 
         Gtk.Separator {

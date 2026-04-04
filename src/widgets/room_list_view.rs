@@ -1133,6 +1133,7 @@ impl RoomListView {
     /// ListStore rebuilds are skipped when the sorted room_id sequence hasn't
     /// changed (the most common sync case), saving 3-8 ms of GObject work.
     fn rebuild_stores(&self, rooms: &[RoomInfo]) {
+        let _t0 = std::time::Instant::now();
         let imp = self.imp();
 
         let registry = imp.room_registry.borrow();
@@ -1272,40 +1273,93 @@ impl RoomListView {
         }
         imp.last_structural_sig.replace(sig);
 
-        // DMs tab.
+        // DMs tab — synchronous, always.  This is the default visible tab; the
+        // user is waiting for DMs to appear, so we render them first.
         let dm_ids: Vec<String> = dms.iter().map(|r| r.room_id.clone()).collect();
         if *imp.last_dm_order.borrow() != dm_ids {
             let objects: Vec<RoomObject> = dms.iter().map(|r| lookup(r)).collect();
+            let _td = std::time::Instant::now();
             Self::patch_store(&imp.dm_store, &objects);
+            tracing::info!("rebuild_stores: dm_store patch(n={}) took {:?}", objects.len(), _td.elapsed());
             imp.last_dm_order.replace(dm_ids);
         }
 
-        // Rooms tab (ungrouped + cleanup section).
+        // Pre-compute IDs for the remaining tabs (cheap string ops).
         let mut room_ids: Vec<String> = ungrouped.iter().map(|r| r.room_id.clone()).collect();
         if !cleanup.is_empty() {
             room_ids.push("__header__".to_string());
             room_ids.extend(cleanup.iter().map(|r| r.room_id.clone()));
         }
+        let fav_ids: Vec<String> = favourites.iter().map(|r| r.room_id.clone()).collect();
+        let space_ids: Vec<String> = spaces.iter().map(|r| r.room_id.clone()).collect();
+
+        // On the very first populate (room store is empty), defer the room/fav/space
+        // stores to the next idle slot.  This lets the DM list render before the GTK
+        // thread is frozen again for the remaining stores (~400ms on a 70-room list).
+        if imp.last_room_order.borrow().is_empty() {
+            let mut room_objects: Vec<RoomObject> = ungrouped.iter().map(|r| lookup(r)).collect();
+            if !cleanup.is_empty() {
+                room_objects.push(RoomObject::new_header("Suggested Cleanup"));
+                room_objects.extend(cleanup.iter().map(|r| lookup(r)));
+            }
+            let fav_objects: Vec<RoomObject> = favourites.iter().map(|r| lookup(r)).collect();
+            let space_objects: Vec<RoomObject> = spaces.iter().map(|r| lookup(r)).collect();
+
+            // Claim order slots before yielding — prevents a concurrent update_rooms
+            // from re-entering this branch and double-scheduling the idle.
+            imp.last_room_order.replace(room_ids);
+            imp.last_fav_order.replace(fav_ids);
+            imp.last_space_order.replace(space_ids);
+
+            let room_store = imp.room_store.clone();
+            let fav_store = imp.fav_store.clone();
+            let space_store = imp.space_store.clone();
+            let room_gobs: Vec<glib::Object> = room_objects.iter()
+                .map(|o| o.clone().upcast::<glib::Object>()).collect();
+            let fav_gobs: Vec<glib::Object> = fav_objects.iter()
+                .map(|o| o.clone().upcast::<glib::Object>()).collect();
+            let space_gobs: Vec<glib::Object> = space_objects.iter()
+                .map(|o| o.clone().upcast::<glib::Object>()).collect();
+
+            glib::idle_add_local_once(move || {
+                let _tr = std::time::Instant::now();
+                room_store.splice(0, 0, &room_gobs);
+                tracing::info!(
+                    "rebuild_stores (idle): room_store init(n={}) took {:?}",
+                    room_gobs.len(), _tr.elapsed()
+                );
+                if !fav_gobs.is_empty() {
+                    fav_store.splice(0, 0, &fav_gobs);
+                }
+                for obj in &space_gobs {
+                    space_store.append(obj);
+                }
+            });
+
+            tracing::info!("rebuild_stores: total {:?} (room/fav/space deferred to idle)", _t0.elapsed());
+            return;
+        }
+
+        // Subsequent updates: diff-patch all stores.  Structural changes are rare
+        // after startup, so these splices are typically O(1) items.
         if *imp.last_room_order.borrow() != room_ids {
             let mut objects: Vec<RoomObject> = ungrouped.iter().map(|r| lookup(r)).collect();
             if !cleanup.is_empty() {
                 objects.push(RoomObject::new_header("Suggested Cleanup"));
                 objects.extend(cleanup.iter().map(|r| lookup(r)));
             }
+            let _tr = std::time::Instant::now();
             Self::patch_store(&imp.room_store, &objects);
+            tracing::info!("rebuild_stores: room_store patch(n={}) took {:?}", objects.len(), _tr.elapsed());
             imp.last_room_order.replace(room_ids);
         }
 
-        // Bookmarks tab.
-        let fav_ids: Vec<String> = favourites.iter().map(|r| r.room_id.clone()).collect();
         if *imp.last_fav_order.borrow() != fav_ids {
             let objects: Vec<RoomObject> = favourites.iter().map(|r| lookup(r)).collect();
             Self::patch_store(&imp.fav_store, &objects);
             imp.last_fav_order.replace(fav_ids);
         }
 
-        // Spaces tab ListStore.
-        let space_ids: Vec<String> = spaces.iter().map(|r| r.room_id.clone()).collect();
         if *imp.last_space_order.borrow() != space_ids {
             imp.space_store.remove_all();
             for r in &spaces {
@@ -1313,6 +1367,7 @@ impl RoomListView {
             }
             imp.last_space_order.replace(space_ids);
         }
+        tracing::info!("rebuild_stores: total {:?}", _t0.elapsed());
     }
 
     /// Drill into a space: show its child rooms in the space child view.

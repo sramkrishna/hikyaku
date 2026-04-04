@@ -188,6 +188,9 @@ pub enum MatrixEvent {
         prev_batch_token: Option<String>,
         /// Room metadata for the content header.
         room_meta: RoomMeta,
+        /// True when sent from bg_refresh (server fetch).  Window defers the
+        /// set_messages splice to an idle so it doesn't block the GTK frame.
+        is_background: bool,
     },
     /// Older messages prepended at the top (pagination result).
     OlderMessages {
@@ -307,6 +310,10 @@ pub enum MatrixEvent {
     MetricsReady { path: String, event_count: usize, metrics_text: String },
     /// Metrics export failed.
     MetricsFailed { error: String },
+    /// Message export (JSONL) complete.
+    MessagesExported { path: String, count: usize },
+    /// Message export failed.
+    MessagesExportFailed { error: String },
     /// Recent messages for the hover-preview AI summary.
     /// `is_unread` is true when the text contains only the unread window.
     RoomPreview { room_id: String, messages_text: String, is_unread: bool },
@@ -341,6 +348,9 @@ pub enum MatrixCommand {
         /// Used as a floor for quick_meta when the SDK store returns 0 pre-sync.
         known_unread: u32,
     },
+    /// Re-fetch a room's messages without changing any UI state.
+    /// Used after a sync gap to fill in events missed by the limited timeline.
+    RefreshRoom { room_id: String },
     SendMessage {
         room_id: String,
         body: String,
@@ -419,6 +429,8 @@ pub enum MatrixCommand {
     ImportRoomKeys { path: std::path::PathBuf, passphrase: String },
     /// Export room metrics (moderation events + activity) to CSV.
     ExportRoomMetrics { room_id: String, days: u32 },
+    /// Fetch up to `limit` recent messages for a room and write them to `path` as JSONL.
+    ExportMessages { room_id: String, path: std::path::PathBuf, limit: u32 },
     /// Fetch recent messages for the hover-preview AI summary and run Ollama inference.
     /// `unread_count` > 0 means only the last N unread messages should be summarised.
     FetchRoomPreview {
@@ -632,8 +644,14 @@ async fn cleanup_session(homeserver: &str) {
 pub fn spawn_matrix_thread(
     event_tx: Sender<MatrixEvent>,
     command_rx: Receiver<MatrixCommand>,
-) {
+) -> super::room_cache::RoomCache {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Create the cache before spawning so the GTK side gets a clone it can
+    // query synchronously on room selection — eliminating the async round-trip
+    // for warm-cache rooms.
+    let timeline_cache = super::room_cache::RoomCache::new();
+    let thread_cache = timeline_cache.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -643,11 +661,13 @@ pub fn spawn_matrix_thread(
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async move {
-            matrix_task(event_tx, command_rx, shutdown_rx, shutdown_tx).await;
+            matrix_task(event_tx, command_rx, shutdown_rx, shutdown_tx, thread_cache).await;
         });
 
         tracing::info!("Matrix thread shut down cleanly");
     });
+
+    timeline_cache
 }
 
 async fn matrix_task(
@@ -655,6 +675,7 @@ async fn matrix_task(
     command_rx: Receiver<MatrixCommand>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    timeline_cache: super::room_cache::RoomCache,
 ) {
     // Move legacy "matx" storage to "hikyaku" before touching the DB.
     migrate_legacy_storage();
@@ -718,9 +739,8 @@ async fn matrix_task(
     // event cache processes every event for all rooms, causing unnecessary
     // CPU and memory pressure for our use case.
 
-    // Unified timeline cache: in-memory HashMap + on-disk TimelineStore.
-    // Enables instant room switching (memory hit) and instant restarts (disk hit).
-    let timeline_cache = super::room_cache::RoomCache::new();
+    // timeline_cache is passed in from spawn_matrix_thread (created before the
+    // thread so the GTK side holds a clone for synchronous cache reads).
 
     // Run E2E encryption setup in the background — it makes several network
     // calls (cross-signing probe, key backup check) that previously blocked
@@ -733,11 +753,12 @@ async fn matrix_task(
         super::encryption::setup_encryption(&enc_client, &enc_tx, enc_creds).await;
     });
 
-    // Rooms that received new messages via sync since the last bg_refresh.
-    // Shared with start_sync handlers; forces needs_refresh=true regardless
-    // of the 30 s timer so stale cached timelines are never shown.
-    let dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // Rooms that received new messages while their memory cache was cold.
+    // Stores the actual pending MessageInfo objects so SelectRoom can apply
+    // them directly without a network round-trip.
+    // HashMap<room_id, Vec<pending_messages>>
+    let dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::matrix::MessageInfo>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Spawn sync in a separate task so we can keep processing commands.
     let sync_event_tx = event_tx.clone();
@@ -827,6 +848,7 @@ async fn matrix_task(
                                 messages: msgs,
                                 prev_batch_token: prev_batch,
                                 room_meta: meta,
+                                is_background: false,
                             }).await;
                         } else {
                             // Disk cache read: offload to blocking thread so the async
@@ -863,74 +885,90 @@ async fn matrix_task(
                                     messages: disk_msgs,
                                     prev_batch_token: disk_token,
                                     room_meta: quick_meta,
+                                    is_background: false,
                                 }).await;
                             } else {
                                 tracing::info!("Cache miss (memory + disk) for {}", room_id);
                             }
                         }
 
-                        // Skip background refresh when the in-memory cache is warm and
-                        // was kept up-to-date by append_memory during sync.
-                        //
-                        // Policy:
-                        //   is_dirty → append_memory failed for ≥1 message; must re-fetch
-                        //   no memory → cold cache; always fetch
-                        //   stale (>5 min) → periodic refresh; re-fetch to catch any gaps
-                        //
-                        // We deliberately omit a bare has_unread check: if append_memory
-                        // succeeded, the cache already contains the new message and there is
-                        // no reason to do an expensive full network round-trip.
-                        let is_dirty = dirty_rooms.lock().unwrap().contains(&room_id);
+                        // Drain any pending messages that arrived while memory was cold.
+                        // These are the actual MessageInfo objects stored by the sync
+                        // handler when append_memory() failed (cache was cold at that time).
+                        let pending_msgs: Vec<crate::matrix::MessageInfo> =
+                            dirty_rooms.lock().unwrap().remove(&room_id).unwrap_or_default();
                         let has_mem = timeline_cache.has_memory(&room_id);
-                        let server_fetched = timeline_cache.was_server_fetched(&room_id);
                         tracing::info!(
-                            "SelectRoom {}: dirty={} has_memory={} server_fetched={}",
-                            room_id, is_dirty, has_mem, server_fetched
+                            "SelectRoom {}: has_memory={} pending_msgs={}",
+                            room_id, has_mem, pending_msgs.len()
                         );
-                        // Refresh policy:
-                        //   no memory          → cold cache; always fetch
-                        //   dirty              → sync couldn't append; must re-fetch
-                        //   has_mem but disk-only (never server-fetched this session)
-                        //                      → disk snapshot may be hours/days old;
-                        //                        bg_refresh brings it current without
-                        //                        blocking the instant display above
-                        let needs_refresh = is_dirty || !has_mem || !server_fetched;
 
-                        if needs_refresh {
-                            dirty_rooms.lock().unwrap().remove(&room_id);
-                            // Tell the UI a refresh is starting so it can show a loading bar.
-                            let _ = event_tx.send(MatrixEvent::BgRefreshStarted {
-                                room_id: room_id.clone(),
-                            }).await;
-                            let bg_client = client.clone();
-                            let bg_tx = event_tx.clone();
-                            let bg_cache = timeline_cache.clone();
-                            let bg_room_id = room_id.clone();
-                            // Grab cached members if we already did a full fetch.
-                            let cached_members = timeline_cache.get_cached_members(&room_id);
-                            bg_refresh_task = Some(tokio::spawn(async move {
-                                // Pre-check: cancelled before doing any I/O.
-                                if task_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                                    return;
-                                }
-                                handle_select_room_bg(
-                                    &bg_client, &bg_tx, &bg_room_id,
-                                    bg_cache, cached_members, task_cancel,
-                                ).await;
-                                // Only clear the priority flag if we are still the latest refresh task.
-                                if BG_REFRESH_GENERATION.load(
-                                    std::sync::atomic::Ordering::Relaxed,
-                                ) == bg_gen {
-                                    ROOM_LOAD_IN_PROGRESS.store(
-                                        false, std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                            }));
-                        } else {
-                            // No refresh needed — clear the priority flag immediately.
-                            ROOM_LOAD_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
-                            tracing::debug!("Skipping bg refresh for {} (fresh cache)", room_id);
+                        // Apply any pending messages (arrived while cache was cold).
+                        if !pending_msgs.is_empty() {
+                            for msg in &pending_msgs {
+                                timeline_cache.append_memory(&room_id, msg.clone());
+                            }
+                            if let Some((msgs, token, mut meta)) = timeline_cache.get_memory(&room_id) {
+                                meta.unread_count = meta.unread_count.max(known_unread);
+                                let disk_cache = timeline_cache.clone();
+                                let disk_rid = room_id.clone();
+                                let disk_msgs = msgs.clone();
+                                let disk_tok = token.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    disk_cache.save_disk(&disk_rid, &disk_msgs, disk_tok.as_deref());
+                                });
+                                let _ = event_tx.send(MatrixEvent::RoomMessages {
+                                    room_id: room_id.clone(),
+                                    messages: msgs,
+                                    prev_batch_token: token,
+                                    room_meta: meta,
+                                    is_background: false,
+                                }).await;
+                            }
                         }
+
+                        // Skip the server fetch if the cache was populated within the
+                        // last 60 seconds — the data is fresh enough.  SyncGap events
+                        // call invalidate_room() which clears the freshness timestamp,
+                        // so gap rooms always get a full refetch regardless of age.
+                        let fresh = timeline_cache.is_fresh(
+                            &room_id, std::time::Duration::from_secs(60),
+                        );
+                        if fresh {
+                            tracing::debug!(
+                                "SelectRoom {room_id}: cache fresh, skipping server fetch"
+                            );
+                            ROOM_LOAD_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Cancel token still needs to be released so a future SelectRoom
+                            // can spawn a new task cleanly.
+                            bg_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                        let _ = event_tx.send(MatrixEvent::BgRefreshStarted {
+                            room_id: room_id.clone(),
+                        }).await;
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        let bg_cache = timeline_cache.clone();
+                        let bg_room_id = room_id.clone();
+                        let bg_known_unread = known_unread;
+                        bg_refresh_task = Some(tokio::spawn(async move {
+                            if task_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            handle_select_room_bg(
+                                &bg_client, &bg_tx, &bg_room_id,
+                                bg_cache, task_cancel,
+                                bg_known_unread,
+                            ).await;
+                            if BG_REFRESH_GENERATION.load(
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) == bg_gen {
+                                ROOM_LOAD_IN_PROGRESS.store(
+                                    false, std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }));
+                        } // end !fresh
 
                         // Cancel previous typing subscription and start new one.
                         if let Some(task) = typing_task.take() {
@@ -958,6 +996,25 @@ async fn matrix_task(
                                 }));
                             }
                         }
+                    }
+                    Ok(MatrixCommand::RefreshRoom { room_id }) => {
+                        // Force bg_refresh for the room regardless of cache state.
+                        // Used after a sync gap to fill in events missed by the
+                        // limited timeline.  Does NOT change any UI selection state.
+                        // Wipe both memory AND disk so handle_select_room_bg fetches
+                        // fresh from the server instead of replaying the stale JSON.
+                        timeline_cache.remove(&room_id);
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        let bg_cache = timeline_cache.clone();
+                        tokio::spawn(async move {
+                            handle_select_room_bg(
+                                &bg_client, &bg_tx, &room_id,
+                                bg_cache,
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                0,
+                            ).await;
+                        });
                     }
                     Ok(MatrixCommand::SendMessage { room_id, body, formatted_body, reply_to, quote_text, is_emote, mentioned_user_ids }) => {
                         handle_send_message(&client, &event_tx, &room_id, &body, formatted_body.as_deref(), reply_to.as_deref(), quote_text.as_ref(), is_emote, &mentioned_user_ids).await;
@@ -1019,7 +1076,7 @@ async fn matrix_task(
                                 timeline_cache.update_message_body_in_cache(
                                     &room_id, &event_id, &new_body, Some(&new_formatted),
                                 );
-                                dirty_rooms.lock().unwrap().insert(room_id.clone());
+                                // Cache already patched in-place; no dirty/refresh needed.
                                 let metadata = ReplacementMetadata::new(eid.to_owned(), None);
                                 let content = RoomMessageEventContent::text_plain(&new_body)
                                     .make_replacement(metadata, None);
@@ -1118,6 +1175,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::ExportRoomMetrics { room_id, days }) => {
                         handle_export_room_metrics(&client, &event_tx, &room_id, days).await;
+                    }
+                    Ok(MatrixCommand::ExportMessages { room_id, path, limit: _ }) => {
+                        handle_export_messages(&client, &event_tx, &room_id, &path, &timeline_cache).await;
                     }
                     Ok(MatrixCommand::FetchRoomPreview { room_id, unread_count, ollama_endpoint, ollama_model, extra_instructions }) => {
                         let bg_client = client.clone();
@@ -1499,7 +1559,16 @@ fn extract_message_content(
                 .map(|f| format!("<i>{}</i>", f.body));
             Some((format!("* {}", emote.body), formatted, None))
         }
-        _ => None,
+        MessageType::Location(loc) => {
+            Some((format!("📍 {}", loc.body), None, None))
+        }
+        MessageType::ServerNotice(notice) => {
+            Some((notice.body.clone(), None, None))
+        }
+        // Unknown / future message types: show body text so reply chains stay
+        // intact.  The `msgtype` discriminant is not available from the enum,
+        // so we fall back to a generic placeholder.
+        _ => Some(("[unsupported message type]".to_string(), None, None)),
     }
 }
 
@@ -1539,17 +1608,6 @@ use super::ROOM_LOAD_IN_PROGRESS;
 static AVATAR_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
-/// Serialises all SQLite-heavy background work.
-///
-/// Only ONE holder at a time may call `room.messages()`, bulk key download,
-/// or `collect_room_info`'s async parts.  When a bg_refresh task acquires
-/// this permit it immediately checks the cancel flag — if the user already
-/// moved to a different room the task exits without doing any I/O.
-///
-/// This replaces the old AtomicBool + 50 ms poll loop, which had gaps between
-/// yield points and allowed concurrent fetches to saturate the SQLite pool.
-static STORE_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
 
 /// Monotonically increasing generation for bg_refresh tasks.
 /// Incremented on every SelectRoom; the spawned task captures its generation
@@ -1599,8 +1657,6 @@ async fn resolve_display_name(
 /// Fetch the timestamp of the most recent message for rooms where we
 /// don't have one yet. Runs up to 20 requests in parallel.
 async fn backfill_timestamps(client: &Client, rooms: &mut [RoomInfo]) {
-    use futures_util::stream::{FuturesUnordered, StreamExt};
-
     let missing: Vec<usize> = rooms
         .iter()
         .enumerate()
@@ -1616,23 +1672,23 @@ async fn backfill_timestamps(client: &Client, rooms: &mut [RoomInfo]) {
         return;
     }
 
-    tracing::info!("Backfilling timestamps for {} rooms", missing.len());
+    tracing::info!("Backfilling timestamps for {} rooms (sequential, yields to user)", missing.len());
     let start = std::time::Instant::now();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
 
-    let mut futures = FuturesUnordered::new();
+    // Sequential with yield points — previously ran 20 concurrent room.messages()
+    // calls which saturated all CPU cores and caused GTK rendering stalls.
+    // Sequential is slower but never blocks user interaction.
+    let mut results: Vec<(usize, u64)> = Vec::with_capacity(missing.len());
     for &idx in &missing {
-        let room_id_str = rooms[idx].room_id.clone();
-        let client = client.clone();
-        let sem = sem.clone();
-        futures.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let room_id = match RoomId::parse(&room_id_str) {
+        // Yield before each network call so user interactions aren't starved.
+        yield_if_room_loading().await;
+        let room_id_str = &rooms[idx].room_id;
+            let room_id = match RoomId::parse(room_id_str) {
                 Ok(id) => id,
-                Err(_) => return (idx, 0u64),
+                Err(_) => { results.push((idx, 0u64)); continue; }
             };
             let Some(room) = client.get_room(&room_id) else {
-                return (idx, 0u64);
+                results.push((idx, 0u64)); continue;
             };
             // Filter server-side to only return message/encrypted events,
             // avoiding pagination through membership churn.
@@ -1657,17 +1713,14 @@ async fn backfill_timestamps(client: &Client, rooms: &mut [RoomInfo]) {
                 }
                 Err(_) => 0,
             };
-            (idx, ts)
-        }));
+        results.push((idx, ts));
     }
 
     let mut filled = 0u32;
-    while let Some(result) = futures.next().await {
-        if let Ok((idx, ts)) = result {
-            if ts > 0 {
-                rooms[idx].last_activity_ts = ts;
-                filled += 1;
-            }
+    for (idx, ts) in results {
+        if ts > 0 {
+            rooms[idx].last_activity_ts = ts;
+            filled += 1;
         }
     }
 
@@ -1689,7 +1742,6 @@ async fn collect_room_info(
     client: &Client,
     ts_cache: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>>,
 ) -> Vec<RoomInfo> {
-    use futures_util::future::join_all;
     use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
     use std::collections::HashMap;
 
@@ -1722,35 +1774,26 @@ async fn collect_room_info(
         })
         .collect();
 
-    // Space child events require an async store read.  Acquire STORE_SEMAPHORE
-    // so this join_all doesn't compete with a concurrent bg_refresh.
-    // The permit is released before the (synchronous) per-room loop below.
+    // Space child events — sequential to avoid exhausting matrix-sdk's internal
+    // SQLite connection pool.  Concurrent join_all across all spaces caused the
+    // pool to stall bg_refresh's room.messages() call for 3-4 s after ~60 s of
+    // inactivity when collect_room_info fired.
     let child_to_space: HashMap<String, String> = {
-        let t_space = std::time::Instant::now();
-        let _permit = STORE_SEMAPHORE.clone().acquire_owned().await
-            .expect("STORE_SEMAPHORE never closed");
-        tracing::info!("collect_room_info: space semaphore acquired ({:?} wait)", t_space.elapsed());
-        let space_futures = joined.iter()
-            .filter(|r| r.is_space())
-            .map(|room| async move {
-                let space_name = room.cached_display_name()
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| room.name().unwrap_or_else(|| room.room_id().to_string()));
-                let children = room
-                    .get_state_events_static::<SpaceChildEventContent>().await
-                    .unwrap_or_default();
-                (space_name, children)
-            });
-        let space_results = join_all(space_futures).await;
         let mut map: HashMap<String, String> = HashMap::new();
-        for (space_name, events) in space_results {
-            for raw_event in events {
+        for room in joined.iter().filter(|r| r.is_space()) {
+            let space_name = room.cached_display_name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| room.name().unwrap_or_else(|| room.room_id().to_string()));
+            let children = room
+                .get_state_events_static::<SpaceChildEventContent>().await
+                .unwrap_or_default();
+            for raw_event in children {
                 if let Ok(event) = raw_event.deserialize() {
                     map.insert(event.state_key().to_string(), space_name.clone());
                 }
             }
         }
-        tracing::info!("Space child mappings (parent-side): {} ({:?} with semaphore)", map.len(), t_space.elapsed());
+        tracing::info!("Space child mappings (parent-side): {}", map.len());
         map
     };
 
@@ -1976,7 +2019,7 @@ async fn start_sync(
     event_tx: &Sender<MatrixEvent>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     timeline_cache: super::room_cache::RoomCache,
-    dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::matrix::MessageInfo>>>>,
 ) {
     use matrix_sdk::ruma::events::room::message::{
         MessageType, OriginalSyncRoomMessageEvent,
@@ -1987,12 +2030,24 @@ async fn start_sync(
     // Persistent map of room_id → most recent message timestamp (seconds).
     // Loaded from disk so rooms appear in the right order immediately on
     // restart, without waiting for backfill.
-    let room_timestamps: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(load_timestamp_cache()));
-
     // Send the persisted room list immediately (instant, no DB queries) so
     // the sidebar is populated before the matrix-sdk store is queried.
     let disk_cached = load_room_list_cache();
+
+    // Seed timestamp map from both the dedicated timestamp cache AND the room
+    // list cache.  The room list cache has last_activity_ts for every room
+    // saved at the end of the previous session — seeding from it means
+    // backfill_timestamps finds zero missing rooms on all but the very first
+    // ever startup, eliminating the startup CPU spike entirely.
+    let room_timestamps: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> = {
+        let mut ts = load_timestamp_cache();
+        for room in &disk_cached {
+            if room.last_activity_ts > 0 {
+                ts.entry(room.room_id.clone()).or_insert(room.last_activity_ts);
+            }
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(ts))
+    };
     // Build a lookup of last-known unread/highlight counts from the disk cache.
     // Used below to guard against the SDK returning 0 pre-sync (before the
     // first sync has refreshed notification counts from the server).
@@ -2027,43 +2082,6 @@ async fn start_sync(
         // fires (is_first path below), the SDK has fresh counts and the disk
         // cache is updated again with the authoritative values.
         merge_disk_unread_counts(&mut cached_rooms, &disk_unread);
-        // Pre-fetch timelines for rooms with unread messages so first visits
-        // to active rooms are instant (cache hit instead of 1s network).
-        let unread_room_ids: Vec<String> = cached_rooms.iter()
-            .filter(|r| r.unread_count > 0 || r.highlight_count > 0)
-            .take(10)
-            .map(|r| r.room_id.clone())
-            .collect();
-        // Collect encrypted unread room IDs before cached_rooms is moved.
-        let encrypted_room_ids: Vec<String> = cached_rooms.iter()
-            .filter(|r| (r.unread_count > 0 || r.highlight_count > 0) && r.is_encrypted)
-            .take(10)
-            .map(|r| r.room_id.clone())
-            .collect();
-
-        // Also prefetch the 5 most recently active encrypted DMs regardless of
-        // unread count.  Encrypted DMs have no unread count when the user has
-        // already read them, but opening one still incurs a 4-6 s first-visit
-        // penalty without a cache entry.  Prefetch ensures the first click is
-        // served from cache.
-        let unread_set: std::collections::HashSet<&str> =
-            unread_room_ids.iter().map(|s| s.as_str()).collect();
-        let dm_prefetch_ids: Vec<String> = cached_rooms.iter()
-            .filter(|r| {
-                r.kind == crate::matrix::RoomKind::DirectMessage
-                    && r.is_encrypted
-                    && !unread_set.contains(r.room_id.as_str())
-            })
-            .take(5)
-            .map(|r| r.room_id.clone())
-            .collect();
-        let mut all_prefetch_ids = unread_room_ids.clone();
-        all_prefetch_ids.extend(dm_prefetch_ids.iter().cloned());
-
-        tracing::info!(
-            "Pre-fetching timelines: {} unread rooms + {} encrypted DMs ({} encrypted)",
-            unread_room_ids.len(), dm_prefetch_ids.len(), encrypted_room_ids.len()
-        );
         tracing::info!("Loaded {} rooms from local store", cached_rooms.len());
         save_room_list_cache(&cached_rooms);
 
@@ -2090,142 +2108,19 @@ async fn start_sync(
             })
             .await;
 
-        if !all_prefetch_ids.is_empty() {
-            tracing::info!("Pre-fetching timelines for {} rooms", all_prefetch_ids.len());
-            let prefetch_client = client.clone();
-            let prefetch_cache = timeline_cache.clone();
-            let prefetch_tx = event_tx.clone();
-            tokio::spawn(async move {
-                // Download room keys for encrypted rooms in parallel before fetching
-                // messages, so decryption succeeds on the first try.
-                // Each step yields if the user has opened a room in the meantime.
-                if !encrypted_room_ids.is_empty() {
-                    tracing::info!("Downloading room keys for {} encrypted rooms", encrypted_room_ids.len());
-                    let backups = prefetch_client.encryption().backups();
-                    let backups_ref = &backups;
-                    let prefetch_tx_ref = &prefetch_tx;
-                    let version_mismatch_reported = std::sync::atomic::AtomicBool::new(false);
-                    let vmr = &version_mismatch_reported;
-                    use futures_util::StreamExt;
-                    futures_util::stream::iter(encrypted_room_ids.iter())
-                        .for_each_concurrent(3, |rid| async move {
-                            yield_if_room_loading().await;
-                            if let Ok(room_id) = RoomId::parse(rid.as_str()) {
-                                match backups_ref.download_room_keys_for_room(&room_id).await {
-                                    Ok(()) => tracing::info!("Downloaded keys for {rid}"),
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("Unknown backup version")
-                                            && !vmr.swap(true, std::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            tracing::warn!("Backup version mismatch — local SQLite has a stale version");
-                                            let _ = prefetch_tx_ref.send(MatrixEvent::BackupVersionMismatch).await;
-                                        } else {
-                                            tracing::warn!("Failed to download keys for {rid}: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .await;
-                }
-                // Prefetch timelines in parallel (3-way) with priority yielding.
-                // Includes unread rooms + recently-active encrypted DMs.
-                use futures_util::StreamExt;
-                futures_util::stream::iter(all_prefetch_ids.iter())
-                    .for_each_concurrent(3, |rid| {
-                        let c = prefetch_client.clone();
-                        let cache = prefetch_cache.clone();
-                        async move {
-                            yield_if_room_loading().await;
-                            prefetch_room_timeline(&c, rid, &cache).await;
-                        }
-                    })
-                    .await;
-                tracing::info!("Pre-fetched {} room timelines", all_prefetch_ids.len());
-            });
-        }
+        // Startup prefetch intentionally removed.
+        // Disk cache (per-room JSON files) persists across sessions, so rooms
+        // visited before are served instantly from disk on next launch.
+        // Cold rooms (never visited) get cached on first open and are instant
+        // thereafter.  Prefetching all unread rooms at startup was causing CPU
+        // spikes (room.messages() + AES-GCM decryption per encrypted room).
+        // Keys are fetched on-demand in handle_select_room_bg when UTDs are
+        // detected in the visible window.
 
-        // Background bulk key download: if backup is connected, download keys
-        // for all encrypted rooms so they're ready before the user opens them.
-        // The prefetch above only covers unread rooms; this covers everything.
-        {
-            let bulk_client = client.clone();
-            tokio::spawn(async move {
-                let backups = bulk_client.encryption().backups();
-                if !backups.are_enabled().await {
-                    return;
-                }
-                let rooms = bulk_client.joined_rooms();
-                let mut encrypted = Vec::new();
-                for room in rooms {
-                    if room.is_encrypted().await.unwrap_or(false) {
-                        encrypted.push(room);
-                    }
-                }
-                tracing::info!("Startup bulk key download: {} encrypted rooms", encrypted.len());
-                use futures_util::StreamExt;
-                // Concurrency 1 (sequential): each download checks yield_if_room_loading
-                // so a user-triggered bg_refresh always pre-empts the bulk download.
-                futures_util::stream::iter(encrypted)
-                    .for_each_concurrent(1, |room| {
-                        let backups = backups.clone();
-                        async move {
-                            yield_if_room_loading().await;
-                            if let Err(e) = backups.download_room_keys_for_room(room.room_id()).await {
-                                let msg = e.to_string();
-                                if !msg.contains("Unknown backup version") {
-                                    tracing::warn!("Bulk key download failed for {}: {e}", room.room_id());
-                                }
-                            }
-                        }
-                    })
-                    .await;
-                tracing::info!("Startup bulk key download complete");
-            });
-        }
-
-        // Backfill timestamps in the background for rooms with ts=0.
-        // Only sends an updated room list if new timestamps were found.
-        let backfill_client = client.clone();
-        let backfill_tx = event_tx.clone();
-        let backfill_ts = room_timestamps.clone();
-        tokio::spawn(async move {
-            let mut rooms = collect_room_info(&backfill_client, Some(&backfill_ts)).await;
-            let before_count = rooms.iter().filter(|r| r.last_activity_ts == 0).count();
-            backfill_timestamps(&backfill_client, &mut rooms).await;
-            // Merge backfilled timestamps into the persistent cache.
-            {
-                let mut ts_map = backfill_ts.lock().unwrap();
-                for room in &mut rooms {
-                    if room.last_activity_ts > 0 {
-                        // Fresh data always wins — overwrite cache.
-                        ts_map.insert(room.room_id.clone(), room.last_activity_ts);
-                    } else if let Some(&cached) = ts_map.get(&room.room_id) {
-                        // No fresh data — fall back to cache.
-                        room.last_activity_ts = cached;
-                    }
-                }
-                let room_ids: Vec<String> = rooms.iter().map(|r| r.room_id.clone()).collect();
-                save_timestamp_cache(&ts_map, Some(&room_ids));
-            }
-            let after_count = rooms.iter().filter(|r| r.last_activity_ts == 0).count();
-            // Only re-send if backfill actually discovered new timestamps.
-            if after_count < before_count {
-                // Merge with disk cache to preserve unread badges — this task's
-                // collect_room_info may have SDK zeros (pre-sync).
-                let prev_disk: std::collections::HashMap<String, (u64, u64)> =
-                    load_room_list_cache()
-                        .into_iter()
-                        .map(|r| (r.room_id, (r.unread_count, r.highlight_count)))
-                        .collect();
-                merge_disk_unread_counts(&mut rooms, &prev_disk);
-                save_room_list_cache(&rooms);
-                let _ = backfill_tx
-                    .send(MatrixEvent::RoomListUpdated { rooms })
-                    .await;
-            }
-        });
+        // Timestamp backfill is deferred to the first sync (is_first=true path
+        // in start_sync), where the SDK has had a chance to process the first
+        // sync response and populate recency_stamp / latest_event for more rooms.
+        // Running it here would just duplicate the work done 1-2 seconds later.
     }
 
     // Interest watcher state: (watcher, terms_it_was_built_with, threshold).
@@ -2236,13 +2131,14 @@ async fn start_sync(
     let watcher_arc: std::sync::Arc<std::sync::Mutex<WatcherState>> =
         std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new(), 0.0)));
 
-    // Community health monitor state. Initialised lazily on the first
-    // eligible message when the plugin is enabled.
+    // Community health scoring: one dedicated OS thread reads from a bounded
+    // channel and runs fastembed inference sequentially — no spawn_blocking
+    // pileup, no CPU starvation of the GTK thread.
+    // Bounded to 32 slots: try_send drops messages when the scorer is behind.
+    // Scoring is non-critical so dropping is preferable to blocking the sync loop.
     #[cfg(feature = "community-health")]
-    type HealthState = Option<crate::plugins::community_health::HealthMonitor>;
-    #[cfg(feature = "community-health")]
-    let health_arc: std::sync::Arc<std::sync::Mutex<HealthState>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (health_score_tx, health_score_rx) =
+        std::sync::mpsc::sync_channel::<(String, String)>(32);
     #[cfg(feature = "ai")]
     {
         let settings = crate::config::settings();
@@ -2260,6 +2156,38 @@ async fn start_sync(
             });
         }
     }
+    // Spawn the dedicated health scorer thread (one thread for all scoring).
+    #[cfg(feature = "community-health")]
+    {
+        let settings = crate::config::settings();
+        if settings.plugins.community_health {
+            use crate::plugins::community_health::HealthMonitor;
+            let health_event_tx = event_tx.clone();
+            let rx = health_score_rx;
+            std::thread::Builder::new()
+                .name("health-scorer".to_string())
+                .spawn(move || {
+                    let Some(mut monitor) = HealthMonitor::new() else {
+                        tracing::warn!("HealthMonitor: model init failed, scoring disabled");
+                        return;
+                    };
+                    tracing::info!("HealthMonitor ready");
+                    while let Ok((rid, body)) = rx.recv() {
+                        if let Some(h) = monitor.record(&rid, &body) {
+                            let _ = health_event_tx.send_blocking(
+                                crate::matrix::MatrixEvent::HealthUpdate {
+                                    room_id: rid,
+                                    score: h.score,
+                                    trend: h.trend,
+                                    alert: h.alert,
+                                },
+                            );
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
 
     // Register handlers for new messages (both decrypted and encrypted).
     // The SDK auto-decrypts when keys are available and fires the
@@ -2271,6 +2199,8 @@ async fn start_sync(
     let msg_cache = timeline_cache.clone();
     #[cfg(feature = "ai")]
     let msg_watcher = watcher_arc.clone();
+    #[cfg(feature = "community-health")]
+    let msg_health_score_tx = health_score_tx.clone();
     client.add_event_handler(
         move |event: OriginalSyncRoomMessageEvent,
               room: matrix_sdk::room::Room| {
@@ -2280,6 +2210,8 @@ async fn start_sync(
             let client = msg_client.clone();
             #[cfg(feature = "ai")]
             let watcher = msg_watcher.clone();
+            #[cfg(feature = "community-health")]
+            let health_score_tx = msg_health_score_tx.clone();
             async move {
                 // If this is an edit (m.replace), fire MessageEdited and bail out.
                 // Do NOT treat it as a new message — the fallback body ("* ...") must
@@ -2298,7 +2230,7 @@ async fn start_sync(
                             &new_body,
                             new_formatted.as_deref(),
                         );
-                        dirty.lock().unwrap().insert(room_id_str.clone());
+                        // Cache already patched; no dirty/refresh needed.
                         let _ = tx.send(MatrixEvent::MessageEdited {
                             room_id: room_id_str,
                             event_id: event_id_str,
@@ -2440,12 +2372,11 @@ async fn start_sync(
                     is_system_event: false,
                 };
                 // Try to append directly to the memory cache.
-                // If the cache is warm, this keeps it fresh and we can skip
-                // bg_refresh on SelectRoom (no dirty flag needed).
-                // If the cache is cold, mark dirty so SelectRoom triggers a
-                // full bg_refresh.
+                // If warm: keeps cache fresh — SelectRoom skips bg_refresh.
+                // If cold: store the pending MessageInfo so SelectRoom can
+                // apply it after loading disk cache, avoiding a network fetch.
                 if !cache.append_memory(&room_id_str, msg.clone()) {
-                    dirty.lock().unwrap().insert(room_id_str.clone());
+                    dirty.lock().unwrap().entry(room_id_str.clone()).or_default().push(msg.clone());
                 }
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
@@ -2499,33 +2430,14 @@ async fn start_sync(
                     }
                 }
 
-                // Community health monitor — score the message and emit an
-                // update so the room row can show a health indicator.
+                // Community health monitor — forward to the dedicated scorer thread.
+                // try_send drops the message if the scorer is busy (bounded channel).
+                // This never blocks the sync loop and never spawns extra OS threads.
                 #[cfg(feature = "community-health")]
                 {
-                    use crate::plugins::community_health::HealthMonitor;
                     let cfg = crate::config::settings();
                     if cfg.plugins.community_health {
-                        let monitor = health_arc.clone();
-                        let body_check = body.clone();
-                        let rid = room_id_str.to_string();
-                        let health_tx = tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let mut guard = monitor.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = HealthMonitor::new();
-                            }
-                            if let Some(ref mut m) = *guard {
-                                if let Some(h) = m.record(&rid, &body_check) {
-                                    let _ = health_tx.send_blocking(MatrixEvent::HealthUpdate {
-                                        room_id: rid,
-                                        score: h.score,
-                                        trend: h.trend,
-                                        alert: h.alert,
-                                    });
-                                }
-                            }
-                        });
+                        let _ = health_score_tx.try_send((room_id_str.to_string(), body.clone()));
                     }
                 }
             }
@@ -2570,7 +2482,7 @@ async fn start_sync(
                     is_system_event: false,
                 };
                 if !cache.append_memory(&rid_str, msg.clone()) {
-                    dirty.lock().unwrap().insert(rid_str.clone());
+                    dirty.lock().unwrap().entry(rid_str.clone()).or_default().push(msg.clone());
                 }
                 let _ = tx
                     .send(MatrixEvent::NewMessage {
@@ -2886,11 +2798,22 @@ async fn start_sync(
                     // Notify UI about sync gaps so it can re-fetch affected rooms.
                     if !gap_rooms.is_empty() {
                         tracing::info!("Sync gap detected for {} rooms", gap_rooms.len());
-                        // Only wipe the in-memory cache, not disk. Disk cache still
-                        // serves an instant first display on the next SelectRoom.
-                        // has_memory=false forces needs_refresh=true so bg_refresh
-                        // always runs — no 4-second blank wait for cached rooms.
+                        // Flush each room's in-memory cache to disk BEFORE wiping it,
+                        // so that the disk copy stays current (or gets promoted if it
+                        // was stale).  Without this, a room that had good decrypted
+                        // messages in memory from append_memory/bg_refresh would
+                        // regress to whatever old snapshot was on disk.
                         for rid in &gap_rooms {
+                            if let Some((msgs, token, _meta)) = gap_cache.get_memory(rid) {
+                                if !msgs.is_empty() {
+                                    let flush_cache = gap_cache.clone();
+                                    let flush_rid = rid.clone();
+                                    let flush_token = token.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        flush_cache.save_disk(&flush_rid, &msgs, flush_token.as_deref());
+                                    });
+                                }
+                            }
                             gap_cache.remove_memory(rid);
                         }
                         for rid in gap_rooms {
@@ -2898,15 +2821,15 @@ async fn start_sync(
                         }
                     }
                     // Refresh room list on initial sync and periodically after.
-                    // Throttled to once every 60 seconds — collect_room_info is
-                    // expensive (~1-2s for 295 rooms) and we don't need frequent
-                    // full refreshes since NewMessage events update badges live.
+                    // Throttled to once every 3 minutes — unread badges update
+                    // live via NewMessage events, so we only need periodic full
+                    // refreshes for room ordering and space assignments.
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     let prev = last_update.load(std::sync::atomic::Ordering::Relaxed);
-                    let should_update = is_first || (now_secs - prev >= 60);
+                    let should_update = is_first || (now_secs - prev >= 180);
 
                     if should_update {
                         // Stamp update time NOW so the next sync (30 s away) doesn't
@@ -2917,10 +2840,8 @@ async fn start_sync(
                         // callback returns immediately — the task first yields until
                         // any user-triggered room load finishes.
                         //
-                        // Why: collect_room_info fires join_all(295 room × 5 SQLite
-                        // futures) — ~1475 concurrent reads.  If this races with
-                        // handle_select_room_bg's room.messages() call the shared
-                        // SQLite connection pool stalls the user for 1-2 s.  This
+                        // Why: collect_room_info iterates spaces sequentially to
+                        // avoid exhausting matrix-sdk's internal SQLite pool.  This
                         // is the "click after 60 s idle = slow" pattern.
                         let bg_tx = tx.clone();
                         let bg_client = client.clone();
@@ -2930,16 +2851,10 @@ async fn start_sync(
                             let t0 = std::time::Instant::now();
                             let mut rooms = collect_room_info(&bg_client, Some(&bg_ts)).await;
                             tracing::info!("collect_room_info: done in {:?} ({} rooms)", t0.elapsed(), rooms.len());
-                            if is_first {
-                                backfill_timestamps(&bg_client, &mut rooms).await;
-                            }
-                            // Always merge with the disk cache before saving.
-                            // The SDK's unread_notification_counts() is unreliable —
-                            // push counts may be 0 for rooms where notification rules
-                            // don't fire, or before the first sync completes.
-                            // Rooms the user has opened are zeroed in the disk cache
-                            // by zero_room_unread_in_disk_cache (called on SelectRoom),
-                            // so merging here never resurrects a badge the user cleared.
+
+                            // Merge disk unread counts and patch timestamps from the
+                            // in-memory cache *before* the first RoomListUpdated so the
+                            // sidebar gets correct data immediately.
                             {
                                 let prev_disk: std::collections::HashMap<String, (u64, u64)> =
                                     load_room_list_cache()
@@ -2967,8 +2882,34 @@ async fn start_sync(
                                     rooms.iter().map(|r| r.room_id.clone()).collect();
                                 save_timestamp_cache(&ts_map, Some(&room_ids));
                             }
+
+                            // Send the sidebar update immediately — don't block on backfill.
                             save_room_list_cache(&rooms);
-                            let _ = bg_tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
+                            let _ = bg_tx.send(MatrixEvent::RoomListUpdated { rooms: rooms.clone() }).await;
+
+                            // Backfill timestamps for rooms that still have ts=0 (first
+                            // ever launch or rooms with no cached ts). This is slow (network
+                            // requests) and runs AFTER the sidebar is already showing data.
+                            if is_first {
+                                backfill_timestamps(&bg_client, &mut rooms).await;
+                                // Only send a second update if backfill actually filled something.
+                                let filled = rooms.iter().filter(|r| r.last_activity_ts > 0).count();
+                                if filled > 0 {
+                                    {
+                                        let mut ts_map = bg_ts.lock().unwrap();
+                                        for room in &rooms {
+                                            if room.last_activity_ts > 0 {
+                                                ts_map.insert(room.room_id.clone(), room.last_activity_ts);
+                                            }
+                                        }
+                                        let room_ids: Vec<String> =
+                                            rooms.iter().map(|r| r.room_id.clone()).collect();
+                                        save_timestamp_cache(&ts_map, Some(&room_ids));
+                                    }
+                                    save_room_list_cache(&rooms);
+                                    let _ = bg_tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
+                                }
+                            }
                         });
                     }
 
@@ -3346,55 +3287,6 @@ async fn extract_messages(
 /// This set contains only room ID strings, NOT encryption keys.
 /// Pre-fetch a room's timeline into the cache without sending to the UI.
 /// Used during startup to warm the cache for unread rooms.
-async fn prefetch_room_timeline(
-    client: &Client,
-    room_id: &str,
-    timeline_cache: &super::room_cache::RoomCache,
-) {
-    use matrix_sdk::ruma::UInt;
-
-    let Ok(room_id) = RoomId::parse(room_id) else { return };
-    let Some(room) = client.get_room(&room_id) else { return };
-
-    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
-    let mut msg_filter = RoomEventFilter::default();
-    msg_filter.types = Some(vec![
-        "m.room.message".to_string(),
-        "m.room.encrypted".to_string(),
-        "m.reaction".to_string(),
-        "m.room.member".to_string(),
-    ]);
-    let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(25u32);
-    options.filter = msg_filter;
-
-    let (msgs, token) = match room.messages(options).await {
-        Ok(response) => {
-            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
-            let token = response.end.map(|t| t.to_string());
-            (msgs, token)
-        }
-        Err(_) => return,
-    };
-
-    if msgs.is_empty() { return; }
-
-    let topic = room.topic().unwrap_or_default();
-    let is_encrypted = room.is_encrypted().await.unwrap_or(false);
-
-    let meta = RoomMeta {
-        topic,
-        is_encrypted,
-        member_count: room.joined_members_count(),
-        is_favourite: room.is_favourite(),
-        member_avatars: vec![],
-        ..Default::default()
-    };
-
-    let rid_str = room_id.to_string();
-    timeline_cache.insert_memory_only(&rid_str, msgs, token, meta);
-    timeline_cache.mark_fresh(&rid_str);
-}
 
 /// Background room select — fetches messages and metadata, updates cache + UI.
 /// Runs in a spawned task so it doesn't block the command loop.
@@ -3403,11 +3295,12 @@ async fn handle_select_room_bg(
     event_tx: &Sender<MatrixEvent>,
     room_id: &str,
     timeline_cache: super::room_cache::RoomCache,
-    // Pre-fetched members from cache. None = do a full server fetch this visit.
-    cached_members: Option<(Vec<(String, String)>, Vec<(String, String)>)>,
-    // Cooperative cancel flag.  Checked at key await points so a stale task
-    // exits early without competing with the current task for SQLite.
+    // Cooperative cancel flag.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Unread count from the UI badge before clear_unread() zeroed it.
+    // Passed as floor to compute_enter_unread() for the pre-sync window
+    // where sdk_unread is still 0 but the user clearly has unread messages.
+    known_unread: u32,
 ) {
     use matrix_sdk::ruma::UInt;
 
@@ -3432,13 +3325,6 @@ async fn handle_select_room_bg(
 
     // Spawn the fetch + post-join work as a detachable task.
     //
-    // The STORE_SEMAPHORE is acquired INSIDE the inner task so the 20-second
-    // outer timeout covers both the semaphore wait AND the fetch.  Previously
-    // the semaphore was acquired here (before spawn), which meant a long-held
-    // semaphore (e.g. held by collect_room_info for a space) would block
-    // handle_select_room_bg indefinitely and leave the "Updating messages"
-    // banner stuck forever.
-    //
     // If room.messages() takes > 20 s (slow/overloaded homeserver) we send an
     // empty RoomMessages to stop the spinner, then DROP this JoinHandle.
     // Dropping a JoinHandle in Tokio detaches the task — it keeps running.
@@ -3461,14 +3347,8 @@ async fn handle_select_room_bg(
         let start      = std::time::Instant::now();
         let t_inner    = start;
 
-        // Acquire the global store semaphore — serialises concurrent bg_refresh
-        // tasks so they never compete for the SQLite connection pool.
-        let _store_permit = STORE_SEMAPHORE.clone().acquire_owned().await
-            .expect("STORE_SEMAPHORE never closed");
-        tracing::info!("bg_refresh {room_id}: semaphore acquired ({:?} wait)", t_inner.elapsed());
-
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("bg_refresh {room_id}: cancelled after semaphore");
+            tracing::info!("bg_refresh {room_id}: cancelled before fetch");
             return;
         }
 
@@ -3479,13 +3359,18 @@ async fn handle_select_room_bg(
 
         let make_msg_options = || {
             let mut f = RoomEventFilter::default();
+            // Reactions are intentionally excluded here: they count against the
+            // limit but produce no visible messages.  In an active room with many
+            // reactions, including them would halve (or worse) the number of
+            // visible messages shown on first load.  Reactions that arrive while
+            // the room is open come in via the live sync path (ReactionAdded event)
+            // and are applied in-place, so nothing is lost for currently-open rooms.
             f.types = Some(vec![
                 "m.room.message".to_string(),
                 "m.room.encrypted".to_string(),
-                "m.reaction".to_string(),
             ]);
             let mut o = matrix_sdk::room::MessagesOptions::backward();
-            o.limit = UInt::from(25u32);
+            o.limit = UInt::from(100u32);
             o.filter = f;
             o
         };
@@ -3661,27 +3546,55 @@ async fn handle_select_room_bg(
         }
     };
 
-        let member_room = room.clone();
-        let member_future = async move {
-            if let Some((m, a)) = cached_members {
-                return (m, a);
+        // Fetch room members for nick completion and room info panel.
+        // Only fetch if not already cached this session.  Skip rooms with more
+        // than 200 members (large public rooms) to avoid slow server requests.
+        // The member count from the SDK summary is reliable after the first sync.
+        let estimated_member_count = room.joined_members_count();
+        let mut members_were_cached = false;
+        let (members, member_avatars) = if let Some(cached) =
+            timeline_cache.get_cached_members(&room_id.to_string())
+        {
+            members_were_cached = true;
+            cached
+        } else if estimated_member_count <= 200 || estimated_member_count == 0 {
+            use matrix_sdk::RoomMemberships;
+            match room.members(RoomMemberships::JOIN).await {
+                Ok(member_list) => {
+                    let members: Vec<(String, String)> = member_list
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.user_id().to_string(),
+                                m.display_name().unwrap_or_else(|| m.user_id().localpart()).to_string(),
+                            )
+                        })
+                        .collect();
+                    let member_avatars: Vec<(String, String)> = member_list
+                        .iter()
+                        .filter_map(|m| {
+                            m.avatar_url().map(|url| (m.user_id().to_string(), url.to_string()))
+                        })
+                        .collect();
+                    timeline_cache.cache_members(
+                        &room_id.to_string(),
+                        members.clone(),
+                        member_avatars.clone(),
+                    );
+                    (members, member_avatars)
+                }
+                Err(e) => {
+                    tracing::warn!("bg_refresh {room_id}: room.members() failed: {e}");
+                    (vec![], vec![])
+                }
             }
-            // Full server fetch — used only once per session per room.
-            let raw = member_room
-            .members(matrix_sdk::RoomMemberships::ACTIVE)
-            .await
-            .unwrap_or_default();
-        let mut members = Vec::with_capacity(raw.len());
-        let mut member_avatars = Vec::with_capacity(raw.len());
-        for m in raw {
-            let uid = m.user_id().to_string();
-            let name = m.display_name().map(|n| n.to_string()).unwrap_or_else(|| uid.clone());
-            let avatar = m.avatar_url().map(|u| u.to_string()).unwrap_or_default();
-            members.push((uid.clone(), name));
-            member_avatars.push((uid, avatar));
-        }
-        (members, member_avatars)
-    };
+        } else {
+            // Large room — skip full fetch, return empty (nick completion disabled).
+            tracing::debug!("bg_refresh {room_id}: skipping member fetch (large room, count={})", estimated_member_count);
+            (vec![], vec![])
+        };
+        let members_fetched_flag = !members.is_empty();
+        tracing::info!("bg_refresh {room_id}: members fetched={members_fetched_flag} (count={}, cached={members_were_cached})", members.len());
 
         let enc_room = room.clone();
         let enc_future = async move { enc_room.is_encrypted().await.unwrap_or(false) };
@@ -3698,25 +3611,21 @@ async fn handle_select_room_bg(
             .map(|ev| ev.content.event_id.to_string())
     };
 
-        // Run everything in parallel — messages, tombstone, pinned, members,
-        // encryption check, and fully_read marker all race together.
+        // Run messages, tombstone, pinned, encryption, and fully_read in parallel.
         let (
             (all_messages, prev_batch_token),
             (is_tombstoned, replacement_room, replacement_room_name),
             pinned_messages,
-            (members, member_avatars),
             is_encrypted,
             fully_read_event_id,
         ) = tokio::join!(
             msg_future,
             tombstone_future,
             pinned_future,
-            member_future,
             enc_future,
             fully_read_future,
         );
         tracing::info!("bg_refresh {room_id}: tokio::join! done in {:?}", t_inner.elapsed());
-
         // Backfill reply_to_sender from the existing memory cache for replies
         // that point to events outside the current 25-message batch.  Modern
         // clients often omit the ">" fallback quote, leaving sender unknown.
@@ -3740,9 +3649,15 @@ async fn handle_select_room_bg(
             }
         }
 
-        let members_fetched = true;
+        let members_fetched = members_fetched_flag;
         let topic = room.topic().unwrap_or_default();
-        let member_count = room.joined_members_count();
+        // Prefer the fetched member list length — it's accurate even before the
+        // first sync populates the SDK's joined_member_count summary field.
+        let member_count = if !members.is_empty() {
+            members.len() as u64
+        } else {
+            room.joined_members_count()
+        };
         // Derive unread_count from the fetched messages + fully_read marker.
         // The SDK's unread_notification_counts() is 0 until after the first sync
         // has processed notification counts — using it directly produces no divider
@@ -3754,7 +3669,7 @@ async fn handle_select_room_bg(
             &all_messages,
             fully_read_event_id.as_deref(),
             sdk_unread,
-            0, // known_unread not available here; count-based path handles it
+            known_unread,
         );
         let room_meta = RoomMeta {
             topic,
@@ -3773,22 +3688,58 @@ async fn handle_select_room_bg(
         };
 
         let rid_str = room_id.to_string();
-        let prev_top = timeline_cache.get_memory(&rid_str)
-            .and_then(|(msgs, _, _)| msgs.last().map(|m| m.event_id.clone()));
+        let prev_count = timeline_cache.get_memory(&rid_str)
+            .map(|(msgs, _, _)| msgs.len())
+            .unwrap_or(0);
 
         if !all_messages.is_empty() {
+            // Always merge server result with in-memory cache by event_id union.
+            // Never prefer one side by size — the server fetch goes backward
+            // (older history) while live sync delivers forward (new messages).
+            // Taking the larger side by count would discard the other side's
+            // unique events (e.g. user's recent comments not yet in the server's
+            // backward window, or older history not yet in the live-sync window).
+            let merged_messages = {
+                let existing = timeline_cache.get_memory(&rid_str)
+                    .map(|(msgs, _, _)| msgs)
+                    .unwrap_or_default();
+                if existing.is_empty() {
+                    all_messages.clone()
+                } else {
+                    // Union by event_id: existing messages win on duplicates so
+                    // any local edits/state are preserved.  Sort chronologically.
+                    let mut by_id: std::collections::HashMap<String, crate::matrix::MessageInfo> =
+                        std::collections::HashMap::new();
+                    for m in existing.into_iter().chain(all_messages.clone()) {
+                        if m.event_id.is_empty() {
+                            // No event_id (local echo etc.) — skip dedup.
+                            continue;
+                        }
+                        by_id.entry(m.event_id.clone()).or_insert(m);
+                    }
+                    let mut merged: Vec<crate::matrix::MessageInfo> =
+                        by_id.into_values().collect();
+                    merged.sort_by_key(|m| m.timestamp);
+                    tracing::info!(
+                        "bg_refresh {room_id}: merged server({}) ∪ memory → {} total",
+                        all_messages.len(),
+                        merged.len(),
+                    );
+                    merged
+                }
+            };
             timeline_cache.insert_memory_only(
                 &rid_str,
-                all_messages.clone(),
+                merged_messages.clone(),
                 prev_batch_token.clone(),
                 room_meta.clone(),
             );
             timeline_cache.mark_fresh(&rid_str);
             let disk_cache = timeline_cache.clone();
-            let disk_msgs = all_messages.clone();
             let disk_token = prev_batch_token.clone();
+            let disk_rid = rid_str.clone();
             tokio::task::spawn_blocking(move || {
-                disk_cache.save_disk(&rid_str, &disk_msgs, disk_token.as_deref());
+                disk_cache.save_disk(&disk_rid, &merged_messages, disk_token.as_deref());
             });
         }
 
@@ -3796,31 +3747,28 @@ async fn handle_select_room_bg(
             return;
         }
 
-        let fresh_top = all_messages.last().map(|m| m.event_id.as_str());
-        if fresh_top.is_some() && fresh_top == prev_top.as_deref() {
-            // Messages unchanged — skip the full re-render to avoid a needless
-            // splice.  BUT: still send when unread_count > 0 so the "New
-            // messages" divider and tinting are applied.  This path is hit when
-            // append_memory kept the cache fresh (12 new messages added via
-            // NewMessage sync events) — the UI only got quick_meta with
-            // unread_count=0 from the cache hit, so it needs this meta update
-            // to place the divider.
-            if room_meta.unread_count == 0 && room_meta.fully_read_event_id.is_none() {
-                tracing::debug!("bg_refresh for {} unchanged, skipping re-render", room_id);
-                return;
-            }
-            tracing::debug!(
-                "bg_refresh for {} messages unchanged but unread_count={} fully_read={:?}, sending meta",
-                room_id, room_meta.unread_count, room_meta.fully_read_event_id
-            );
-        }
+        // Always send RoomMessages.  An earlier Tokio-side "skip re-render"
+        // optimisation compared fresh_top == prev_top, but this caused stale
+        // data to persist when the disk cache was built from an incomplete
+        // sync (sync-gap rooms whose timeline is always limited, e.g.
+        // #gnome-hackers).  The GTK-side set_messages already has its own
+        // skip logic (event_index comparison) that is accurate and cheap.
+        tracing::debug!(
+            "bg_refresh for {}: prev_count={} fresh_count={} unread={} fully_read={:?}",
+            room_id, prev_count,
+            timeline_cache.get_memory(&rid_str).map(|(m,_,_)| m.len()).unwrap_or(0),
+            room_meta.unread_count, room_meta.fully_read_event_id
+        );
 
         let _ = event_tx
             .send(MatrixEvent::RoomMessages {
                 room_id: room_id.to_string(),
-                messages: all_messages,
+                messages: timeline_cache.get_memory(&room_id.to_string())
+                    .map(|(msgs, _, _)| msgs)
+                    .unwrap_or(all_messages),
                 prev_batch_token,
                 room_meta,
+                is_background: true,
             })
             .await;
     }); // end tokio::spawn(inner)
@@ -3844,6 +3792,7 @@ async fn handle_select_room_bg(
                         messages: vec![],
                         prev_batch_token: None,
                         room_meta: RoomMeta::default(),
+                        is_background: true,
                     })
                     .await;
             }
@@ -3871,14 +3820,14 @@ async fn handle_fetch_older(
 
     use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
     let mut msg_filter = RoomEventFilter::default();
+    // Reactions excluded for the same reason as the initial fetch: they count
+    // against the limit but produce no visible messages.
     msg_filter.types = Some(vec![
         "m.room.message".to_string(),
         "m.room.encrypted".to_string(),
-        "m.reaction".to_string(),
-        "m.room.member".to_string(),
     ]);
     let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(25u32);
+    options.limit = UInt::from(50u32);
     options.from = Some(from_token.to_string());
     options.filter = msg_filter;
 
@@ -4565,19 +4514,42 @@ async fn handle_create_dm(
         }
     }
 
-    // No existing DM — create one.
-    tracing::info!("Creating new DM room with {user_id}");
+    // Verify the user exists on their homeserver before creating a room.
+    // A Matrix homeserver will happily create a room and invite a non-existent
+    // user — the invite just silently hangs. Fetching the profile first gives
+    // a clear error message instead.
+    {
+        use matrix_sdk::ruma::api::client::profile::get_profile::v3::Request as ProfileRequest;
+        let profile_req = ProfileRequest::new(target_uid.to_owned());
+        if let Err(e) = client.send(profile_req).await {
+            tracing::warn!("User {user_id} not found: {e}");
+            let _ = event_tx.send(MatrixEvent::DmFailed {
+                error: format!("User {user_id} not found — check the ID and try again"),
+            }).await;
+            return;
+        }
+    }
+
+    // No existing DM — create one with encryption enabled.
+    tracing::info!("Creating new encrypted DM room with {user_id}");
     use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
+    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+    use matrix_sdk::ruma::events::InitialStateEvent;
+
+    let enc_event = InitialStateEvent::new(RoomEncryptionEventContent::with_recommended_defaults())
+        .to_raw_any();
+
     let mut request = CreateRoomRequest::new();
     request.is_direct = true;
     request.invite = vec![target_uid.to_owned()];
     request.preset = Some(matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset::TrustedPrivateChat);
+    request.initial_state = vec![enc_event];
 
     match client.create_room(request).await {
         Ok(response) => {
             let room_id = response.room_id().to_string();
             let name = user_id.to_string();
-            tracing::info!("Created DM room {room_id} with {user_id}");
+            tracing::info!("Created encrypted DM room {room_id} with {user_id}");
             let _ = event_tx.send(MatrixEvent::DmReady {
                 user_id: user_id.to_string(),
                 room_id,
@@ -4647,6 +4619,69 @@ async fn handle_mark_read(client: &Client, room_id: &str, cached_event_id: Optio
         }
         Err(e) => tracing::warn!("handle_mark_read: failed for {room_id}: {e}"),
     }
+}
+
+/// Export messages for `room_id` from the SQLite cache to `path` as JSONL.
+/// Each line: {"sender":"…","sender_id":"@…","body":"…"}
+/// Safe: reads only from the local cache, never calls room.messages().
+async fn handle_export_messages(
+    _client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    path: &std::path::Path,
+    timeline_cache: &super::room_cache::RoomCache,
+) {
+    use std::io::Write as _;
+
+    // Read from disk cache on a blocking thread.
+    let cache = timeline_cache.clone();
+    let rid = room_id.to_string();
+    let disk_data = tokio::task::spawn_blocking(move || {
+        cache.load_disk(&rid)
+    }).await.ok().flatten();
+
+    // Fall back to in-memory cache if disk has nothing.
+    let msgs = match disk_data {
+        Some((msgs, _token)) => msgs,
+        None => {
+            match timeline_cache.get_memory(room_id) {
+                Some((msgs, _, _)) => msgs,
+                None => {
+                    let _ = event_tx.send(MatrixEvent::MessagesExportFailed {
+                        error: "No cached messages for this room — open the room first to load them.".into(),
+                    }).await;
+                    return;
+                }
+            }
+        }
+    };
+
+    let mut file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = event_tx.send(MatrixEvent::MessagesExportFailed {
+                error: format!("Cannot write to {}: {e}", path.display()),
+            }).await;
+            return;
+        }
+    };
+
+    let mut count = 0usize;
+    for msg in &msgs {
+        if msg.body.is_empty() || msg.is_system_event { continue; }
+        let line = serde_json::json!({
+            "sender":    msg.sender,
+            "sender_id": msg.sender_id,
+            "body":      msg.body,
+        });
+        if writeln!(file, "{line}").is_err() { break; }
+        count += 1;
+    }
+
+    let _ = event_tx.send(MatrixEvent::MessagesExported {
+        path: path.display().to_string(),
+        count,
+    }).await;
 }
 
 async fn handle_export_room_metrics(

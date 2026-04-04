@@ -97,6 +97,7 @@ mod imp {
                         Ok(c) => {
                             let _ = c.execute_batch(
                                 "PRAGMA journal_mode=WAL;
+                                 PRAGMA synchronous=NORMAL;
                                  CREATE TABLE IF NOT EXISTS local_unread (
                                      room_id    TEXT PRIMARY KEY,
                                      unread     INTEGER NOT NULL DEFAULT 0,

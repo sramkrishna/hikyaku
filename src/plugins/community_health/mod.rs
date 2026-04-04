@@ -23,23 +23,29 @@ const POSITIVE_ANCHORS: &[&str] = &[
     "thank you", "great work", "I really appreciate it", "well explained",
     "welcome", "helpful", "good point", "nice job", "I agree", "well said",
     "excellent contribution", "friendly discussion", "supportive community",
+    // Clearly positive technical-discourse phrases (not neutral filler).
+    "good question", "happy to help", "I appreciate the feedback",
+    "that is a great idea", "well done", "thanks for the clarification",
 ];
 
 /// Anchor phrases that define the negative / toxic emotional pole.
+/// Kept to clear interpersonal toxicity — NOT mere technical disagreement.
 const NEGATIVE_ANCHORS: &[&str] = &[
-    "hostile", "rude", "toxic behaviour", "you are completely wrong",
-    "you always do this", "stop it", "this is ridiculous", "personal attack",
-    "drama", "terrible", "insulting", "offensive behaviour", "harassment",
+    "hostile", "rude", "toxic behaviour",
+    "you always do this", "personal attack",
+    "drama", "insulting", "offensive behaviour", "harassment",
+    "you are stupid", "shut up", "I hate this community",
+    "you people are the problem", "this is pathetic",
 ];
 
 /// Overall health classification for a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertLevel {
-    /// Average score above 0.50 — normal, healthy room.
+    /// Average score above 0.48 — normal, healthy room.
     None,
-    /// Average score 0.35–0.50 — worth monitoring.
+    /// Average score 0.33–0.48 — worth monitoring.
     Watch,
-    /// Average score below 0.35 — sustained tension, action may be needed.
+    /// Average score below 0.33 — sustained tension, action may be needed.
     Warning,
 }
 
@@ -88,9 +94,9 @@ impl RoomWindow {
             0
         };
 
-        let alert = if avg < 0.35 {
+        let alert = if avg < 0.33 {
             AlertLevel::Warning
-        } else if avg < 0.50 {
+        } else if avg < 0.48 {
             AlertLevel::Watch
         } else {
             AlertLevel::None
@@ -253,14 +259,14 @@ mod tests {
     #[test]
     fn alert_watch() {
         let mut w = RoomWindow::new();
-        for _ in 0..10 { w.push(0.42); }
+        for _ in 0..10 { w.push(0.40); }
         assert_eq!(w.health().unwrap().alert, AlertLevel::Watch);
     }
 
     #[test]
     fn alert_none() {
         let mut w = RoomWindow::new();
-        for _ in 0..10 { w.push(0.75); }
+        for _ in 0..10 { w.push(0.55); }
         assert_eq!(w.health().unwrap().alert, AlertLevel::None);
     }
 

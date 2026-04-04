@@ -56,11 +56,27 @@ template $MxMessageRow : Gtk.Box {
       }
     }
 
-    // Body content — text labels and code block views are added here dynamically.
+    // Primary body label for plain-text messages — updated in-place to avoid
+    // widget construction on every bind. For HTML/code-block messages, this is
+    // hidden and body_box is used instead.
+    Gtk.Label body_label {
+      halign: start;
+      wrap: true;
+      wrap-mode: word_char;
+      xalign: 0;
+      selectable: true;
+      hexpand: true;
+      visible: false;
+      styles ["mx-message-body"]
+    }
+
+    // Body content — used only for HTML/code-block messages and special rows
+    // (system events, dividers). Hidden when body_label is active.
     Gtk.Box body_box {
       orientation: vertical;
       spacing: 4;
       hexpand: true;
+      visible: false;
     }
 
     // Media attachment placeholder — clickable.

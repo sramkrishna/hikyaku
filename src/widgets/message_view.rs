@@ -4,6 +4,13 @@
 // The ListView is inside a ScrolledWindow that auto-scrolls to the bottom
 // when new messages arrive.
 
+// Diagnostic counters reset before each splice, read after, to measure how
+// many bind calls happen per splice and their total time.
+pub(crate) static BIND_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub(crate) static BIND_TOTAL_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 mod imp {
     use adw::prelude::*;
     use gtk::glib;
@@ -20,15 +27,31 @@ mod imp {
     #[derive(CompositeTemplate)]
     #[template(file = "src/widgets/message_view.blp")]
     pub struct MessageView {
-        pub list_store: gio::ListStore,
+        // ── Per-room widget cache ────────────────────────────────────────────
+        /// Shared factory for all per-room ListViews (set once in constructed).
+        pub factory: std::cell::OnceCell<gtk::SignalListItemFactory>,
+        /// Stack holding per-room ScrolledWindow+ListView widgets (one per visited room).
+        pub room_stack: gtk::Stack,
+        /// Blueprint placeholder that room_stack is inserted into.
+        #[template_child]
+        pub room_list_placeholder: TemplateChild<gtk::Box>,
+        /// room_id → (scrolled_window, list_view, list_store)
+        pub room_view_cache: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::ListView, gio::ListStore)>>,
+        /// Currently visible room id (empty string = no room selected).
+        pub current_room_id: RefCell<String>,
+        /// Current room's list_store — updated by switch_room() for O(1) access.
+        pub cur_list_store: RefCell<gio::ListStore>,
+        /// Saved event_index per room — restored on return visit so bg_refresh
+        /// can detect "nothing changed" without a full splice.
+        pub saved_event_indices: RefCell<HashMap<String, HashMap<String, crate::models::MessageObject>>>,
+        /// Saved messages_loaded flag per room — restored so return visits
+        /// don't trigger first-load auto-scroll.
+        pub saved_messages_loaded: RefCell<HashMap<String, bool>>,
+        // ── Template children ────────────────────────────────────────────────
         #[template_child]
         pub view_stack: TemplateChild<gtk::Stack>,
         #[template_child]
         pub loading_spinner: TemplateChild<gtk::Spinner>,
-        #[template_child]
-        pub scrolled_window: TemplateChild<gtk::ScrolledWindow>,
-        #[template_child]
-        pub list_view: TemplateChild<gtk::ListView>,
         #[template_child]
         pub attach_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -156,16 +179,26 @@ mod imp {
         pub history_cursor: Cell<usize>,
         /// Draft saved when the user first presses Up to navigate history.
         pub history_draft: RefCell<String>,
+        /// Pending timer to show the "loading" view after a delay.
+        /// Cancelled when RoomMessages arrives so warm-cache rooms never flash.
+        pub loading_timer: RefCell<Option<glib::SourceId>>,
     }
 
     impl Default for MessageView {
         fn default() -> Self {
             Self {
-                list_store: gio::ListStore::new::<MessageObject>(),
+                factory: std::cell::OnceCell::new(),
+                room_stack: gtk::Stack::builder()
+                    .transition_type(gtk::StackTransitionType::None)
+                    .build(),
+                room_list_placeholder: Default::default(),
+                room_view_cache: RefCell::new(HashMap::new()),
+                current_room_id: RefCell::new(String::new()),
+                cur_list_store: RefCell::new(gio::ListStore::new::<MessageObject>()),
+                saved_event_indices: RefCell::new(HashMap::new()),
+                saved_messages_loaded: RefCell::new(HashMap::new()),
                 view_stack: Default::default(),
                 loading_spinner: Default::default(),
-                scrolled_window: Default::default(),
-                list_view: Default::default(),
                 attach_button: Default::default(),
                 input_view: Default::default(),
                 input_placeholder: Default::default(),
@@ -234,7 +267,81 @@ mod imp {
                 send_history: RefCell::new(Vec::new()),
                 history_cursor: Cell::new(0),
                 history_draft: RefCell::new(String::new()),
+                loading_timer: RefCell::new(None),
             }
+        }
+    }
+
+    impl MessageView {
+        /// Current room's list_store — O(1), returns a cloned GObject handle.
+        pub fn list_store(&self) -> gio::ListStore {
+            self.cur_list_store.borrow().clone()
+        }
+
+        /// Current room's list_view — O(1) clone from cache.
+        pub fn list_view(&self) -> gtk::ListView {
+            let id = self.current_room_id.borrow().clone();
+            self.room_view_cache.borrow()
+                .get(&id)
+                .map(|(_, lv, _)| lv.clone())
+                .expect("list_view() called with no current room")
+        }
+
+        /// Current room's scrolled_window — O(1) clone from cache.
+        pub fn scrolled_window(&self) -> gtk::ScrolledWindow {
+            let id = self.current_room_id.borrow().clone();
+            self.room_view_cache.borrow()
+                .get(&id)
+                .map(|(sw, _, _)| sw.clone())
+                .expect("scrolled_window() called with no current room")
+        }
+
+        /// Get or create the per-room (scrolled_window, list_view, list_store) triple.
+        /// On first call for a given room_id, creates a new ListView with the shared
+        /// factory and adds a ScrolledWindow to room_stack.  Subsequent calls return
+        /// the cached triple.
+        ///
+        /// `obj` is the outer MessageView — used to connect the scroll-to-top handler
+        /// on first visit (handler must not be reconnected on return visits).
+        pub fn ensure_room_view(
+            &self,
+            room_id: &str,
+            obj: &super::MessageView,
+        ) -> (gtk::ScrolledWindow, gtk::ListView, gio::ListStore) {
+            if let Some(entry) = self.room_view_cache.borrow().get(room_id) {
+                return entry.clone();
+            }
+            let list_store = gio::ListStore::new::<crate::models::MessageObject>();
+            let no_sel = gtk::NoSelection::new(Some(list_store.clone()));
+            let list_view = gtk::ListView::builder().build();
+            list_view.set_model(Some(&no_sel));
+            list_view.set_factory(self.factory.get());
+            let scrolled_window = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&list_view)
+                .css_classes(["mx-tinted-bg"])
+                .build();
+            // Connect scroll-to-top handler once per room.
+            let view_weak = obj.downgrade();
+            scrolled_window.vadjustment().connect_value_notify(move |adj| {
+                if adj.value() < 50.0 {
+                    let Some(view) = view_weak.upgrade() else { return };
+                    let imp = view.imp();
+                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
+                        imp.fetching_older.set(true);
+                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                            cb();
+                        }
+                    }
+                }
+            });
+            self.room_stack.add_named(&scrolled_window, Some(room_id));
+            self.room_view_cache.borrow_mut().insert(
+                room_id.to_string(),
+                (scrolled_window.clone(), list_view.clone(), list_store.clone()),
+            );
+            (scrolled_window, list_view, list_store)
         }
     }
 
@@ -414,11 +521,17 @@ mod imp {
                 let ctx = view.as_ref()
                     .map(|v| v.row_context())
                     .unwrap_or_default();
+                let _tb = std::time::Instant::now();
                 row.bind_message_object(&msg_obj, &ctx);
                 let is_bm = view.as_ref()
                     .map(|v| v.imp().bookmarked_ids.borrow().contains(&msg_obj.event_id()))
                     .unwrap_or(false);
                 row.set_bookmarked(is_bm);
+                crate::widgets::message_view::BIND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::widgets::message_view::BIND_TOTAL_US.fetch_add(
+                    _tb.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             });
 
             // Disconnect flash handler when a row is recycled for a different item.
@@ -431,9 +544,14 @@ mod imp {
                 }
             });
 
-            let no_selection = gtk::NoSelection::new(Some(self.list_store.clone()));
-            self.list_view.set_model(Some(&no_selection));
-            self.list_view.set_factory(Some(&factory));
+            // Store the factory so ensure_room_view() can attach it to each
+            // per-room ListView.  Do NOT attach it to any global list_view —
+            // we use a per-room ListView+ListStore (GtkStack) approach instead.
+            self.factory.set(factory).expect("factory already initialised");
+            // Add the room_stack to the blueprint placeholder.  Per-room
+            // ScrolledWindow+ListView widgets are added inside room_stack
+            // by ensure_room_view() on each room's first visit.
+            self.room_list_placeholder.append(&self.room_stack);
 
             // Helper: get full text from the TextView buffer.
             fn buf_text(buf: &gtk::TextBuffer) -> String {
@@ -483,22 +601,8 @@ mod imp {
                 }
             });
 
-            // Detect scroll-to-top for pagination.
-            let view_for_scroll = obj.clone();
-            self.scrolled_window.vadjustment().connect_value_notify(move |adj| {
-                // Trigger when scrolled near the top (within 50px).
-                if adj.value() < 50.0 {
-                    let imp = view_for_scroll.imp();
-                    if !imp.fetching_older.get() {
-                        if imp.prev_batch_token.borrow().is_some() {
-                            imp.fetching_older.set(true);
-                            if let Some(ref cb) = *imp.on_scroll_top.borrow() {
-                                cb();
-                            }
-                        }
-                    }
-                }
-            });
+            // Scroll-to-top for pagination is connected per-room inside
+            // ensure_room_view() so each room's ScrolledWindow gets the handler.
 
             // Enter = send, Shift+Enter = newline.
             let send_key_ctrl = gtk::EventControllerKey::new();
@@ -1259,7 +1363,7 @@ impl MessageView {
         }
         // Update the visible row if it's currently rendered.
         let eid = event_id.to_string();
-        let mut child = imp.list_view.first_child();
+        let mut child = imp.list_view().first_child();
         while let Some(ref widget) = child {
             if let Some(row) = Self::find_message_row(widget) {
                 if *row.imp().event_id.borrow() == eid {
@@ -1322,7 +1426,7 @@ impl MessageView {
         // the full list_store). Identify the right row by its stored event_id
         // rather than by absolute position, which is correct across virtual scroll.
         let eid = event_id.to_string();
-        let mut child = imp.list_view.first_child();
+        let mut child = imp.list_view().first_child();
         while let Some(ref widget) = child {
             if let Some(row) = Self::find_message_row(widget) {
                 if *row.imp().event_id.borrow() == eid {
@@ -1437,8 +1541,8 @@ impl MessageView {
             None => return false,
         };
         // list_store.find() uses GObject identity — encapsulated library call.
-        let Some(i) = imp.list_store.find(&msg) else { return false };
-        imp.list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
+        let Some(i) = imp.list_store().find(&msg) else { return false };
+        imp.list_view().scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
         // Trigger flash via GObject property — the notify::is-flashing handler
         // in bind_message_object applies the CSS class reactively, no widget walk.
         msg.set_is_flashing(true);
@@ -1463,8 +1567,8 @@ impl MessageView {
             Some(m) => m,
             None => return,
         };
-        if let Some(i) = imp.list_store.find(&msg) {
-            imp.list_store.remove(i);
+        if let Some(i) = imp.list_store().find(&msg) {
+            imp.list_store().remove(i);
         }
     }
 
@@ -1494,16 +1598,15 @@ impl MessageView {
 
         if !first_load {
             // bg_refresh: skip the expensive full-list splice when nothing changed.
-            // Check the NEWEST message (messages.last() — messages are oldest-first after
-            // extract_messages reversal).  Checking .first() (the oldest) was wrong:
-            // when a new message arrives, the oldest of the 50-window shifts out but
-            // is still in event_index → false negative → update silently skipped.
-            let has_new = messages.last()
-                .map(|m| !m.event_id.is_empty() && !imp.event_index.borrow().contains_key(&m.event_id))
-                .unwrap_or(false);
-            let has_utd = imp.event_index.borrow().values()
-                .any(|obj| obj.body().starts_with('\u{1f512}'));
-            // Detect edits: same event_id in index but body or formatted_body changed.
+            // Check ALL incoming messages — not just the newest — because sync-gap
+            // messages arrive in the middle of the window (older than the already-known
+            // newest event), so a last()-only check produces a false negative and the
+            // user sees missing messages.
+            let has_new = messages.iter().any(|m| {
+                !m.event_id.is_empty() && !imp.event_index.borrow().contains_key(&m.event_id)
+            });
+            // Detect edits (including UTD→decrypted transitions): same event_id
+            // in index but body or formatted_body changed.
             let has_edit = messages.iter().any(|m| {
                 if m.event_id.is_empty() { return false; }
                 imp.event_index.borrow()
@@ -1519,7 +1622,7 @@ impl MessageView {
             let has_redaction = imp.event_index.borrow().keys()
                 .filter(|k| k.as_str() != "__unread_divider__")
                 .any(|k| !incoming_ids.contains(k.as_str()));
-            if !has_new && !has_utd && !has_edit && !has_redaction {
+            if !has_new && !has_edit && !has_redaction {
                 // No new messages to splice — but still insert the divider if needed.
                 // This path is hit when the disk cache already contains the unread
                 // messages (bg_refresh fetches the same window), so the splice skips
@@ -1548,9 +1651,27 @@ impl MessageView {
             }
         }
 
+        let _t1 = std::time::Instant::now();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        imp.list_store.splice(0, n, &objs);
+        let _t2 = std::time::Instant::now();
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
+        use std::sync::atomic::Ordering;
+        crate::widgets::message_view::BIND_COUNT.store(0, Ordering::Relaxed);
+        crate::widgets::message_view::BIND_TOTAL_US.store(0, Ordering::Relaxed);
+        // For first_load the room's list_store is empty (n=0).  Detaching the
+        // model before the splice prevents GTK from processing items-changed for
+        // each item — it reads the final N items in one shot when the model is
+        // re-attached below.  set_model(None) on an empty list is O(0) (instant),
+        // unlike set_model(None) on a non-empty list which is O(N_content).
+        if first_load {
+            imp.list_view().set_model(gtk::SelectionModel::NONE);
+        }
+        imp.list_store().splice(0, n, &objs);
+        let _t3 = std::time::Instant::now();
+        let bc = crate::widgets::message_view::BIND_COUNT.load(Ordering::Relaxed);
+        let bt = crate::widgets::message_view::BIND_TOTAL_US.load(Ordering::Relaxed);
+        tracing::info!("set_messages: info_to_obj(n={})={:?} splice(prev={n},first_load={first_load})={:?} binds={bc} bind_total={}µs",
+            objs.len(), _t2-_t1, _t3-_t2, bt);
         // Rebuild event_index from scratch for the new room.
         let mut idx = imp.event_index.borrow_mut();
         idx.clear();
@@ -1563,6 +1684,19 @@ impl MessageView {
         drop(idx);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+
+        // When the loaded batch is small (can fit on-screen), the scroll
+        // threshold (adj.value < 50) never fires because the list is fully
+        // visible and the user has no surface to scroll.  Auto-fetch older
+        // messages immediately so the view fills with history.
+        if imp.list_store().n_items() < 20 && imp.prev_batch_token.borrow().is_some() {
+            if !imp.fetching_older.get() {
+                if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                    imp.fetching_older.set(true);
+                    cb();
+                }
+            }
+        }
 
         // Insert (or re-insert) the "New messages" divider whenever it's absent from
         // the list and the server reports unread messages.  The splice above always
@@ -1604,6 +1738,14 @@ impl MessageView {
             false
         };
 
+        // Re-attach the per-room model after the first-load splice.
+        // GTK reads all N items in one shot and binds only the ~15 visible rows,
+        // rather than processing items-changed for each of the N items during the
+        // splice above.  For bg_refresh (not first_load) the model stayed attached.
+        if first_load {
+            let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
+            imp.list_view().set_model(Some(&no_sel));
+        }
         imp.view_stack.set_visible_child_name("messages");
 
         // Only auto-scroll on the first load.  Subsequent bg_refresh calls
@@ -1625,7 +1767,7 @@ impl MessageView {
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         let imp = self.imp();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
-        imp.list_store.splice(0, 0, &objs);
+        imp.list_store().splice(0, 0, &objs);
         // Add new objects to the event_index.
         let mut idx = imp.event_index.borrow_mut();
         for obj in &objs {
@@ -1637,6 +1779,38 @@ impl MessageView {
         drop(idx);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+    }
+
+    /// Serialize all messages currently in the list store to JSON Lines and
+    /// write them to `path`.  Each line is:
+    ///   {"sender":"Display Name","sender_id":"@user:server","body":"..."}
+    /// System events (joins, leaves) are skipped.
+    /// Returns the number of messages written.
+    pub fn export_messages_jsonl(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        use gio::prelude::ListModelExt as _;
+
+        let imp = self.imp();
+        let n = imp.list_store().n_items();
+        let mut file = std::fs::File::create(path)?;
+        let mut count = 0usize;
+
+        for i in 0..n {
+            let Some(obj) = imp.list_store().item(i) else { continue };
+            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
+            if msg.is_system_event() { continue; }
+            let body = msg.body();
+            if body.is_empty() { continue; }
+            // Minimal JSON — escape only what serde_json would escape.
+            let line = serde_json::json!({
+                "sender":    msg.sender(),
+                "sender_id": msg.sender_id(),
+                "body":      body,
+            });
+            writeln!(file, "{line}")?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Walk a widget tree to find a MessageRow child.
@@ -1691,20 +1865,59 @@ impl MessageView {
         self.imp().prev_batch_token.borrow().clone()
     }
 
-    /// Clear messages and room meta (used when switching rooms before new data arrives).
-    pub fn clear(&self) {
+    /// Prepare for a room switch to `room_id`.
+    ///
+    /// For rooms visited before this is O(1): the per-room ListView stays live
+    /// in room_stack and we just call set_visible_child_name.  The user sees
+    /// previous messages immediately; bg_refresh splices only if content changed.
+    ///
+    /// For first-time rooms a new ListView+ListStore is created (still O(1)).
+    /// view_stack shows the loading spinner until set_messages arrives.
+    pub fn clear(&self, room_id: &str) {
         let imp = self.imp();
-        imp.view_stack.set_visible_child_name("loading");
+        // Cancel any previous deferred-loading timer.
+        if let Some(id) = imp.loading_timer.borrow_mut().take() {
+            id.remove();
+        }
         self.set_refreshing(false);
-        imp.list_store.remove_all();
-        imp.event_index.borrow_mut().clear();
+
+        // ── Save outgoing room state ─────────────────────────────────────────
+        let old_room_id = imp.current_room_id.borrow().clone();
+        if !old_room_id.is_empty() {
+            let idx = imp.event_index.borrow().clone();
+            imp.saved_event_indices.borrow_mut().insert(old_room_id.clone(), idx);
+            imp.saved_messages_loaded.borrow_mut()
+                .insert(old_room_id, imp.messages_loaded.get());
+        }
+
+        // ── Set up incoming room view ────────────────────────────────────────
+        let is_return_visit = imp.room_view_cache.borrow().contains_key(room_id);
+        let (_, _, list_store) = imp.ensure_room_view(room_id, self);
+        *imp.cur_list_store.borrow_mut() = list_store;
+        *imp.current_room_id.borrow_mut() = room_id.to_string();
+
+        // Restore per-room state for return visits so set_messages can skip an
+        // unnecessary splice when the server returns the same data we already
+        // show.  The server fetch always runs (see client.rs SelectRoom), so
+        // any gap messages detected by has_new will still trigger a splice.
+        if let Some(saved_idx) = imp.saved_event_indices.borrow_mut().remove(room_id) {
+            *imp.event_index.borrow_mut() = saved_idx;
+        } else {
+            imp.event_index.borrow_mut().clear();
+        }
+        let was_loaded = imp.saved_messages_loaded.borrow_mut()
+            .remove(room_id).unwrap_or(false);
+        imp.messages_loaded.set(was_loaded);
+
+        // ── Reset non-persisted per-room state ───────────────────────────────
         imp.bookmarked_ids.borrow_mut().clear();
         imp.new_message_objs.borrow_mut().clear();
         imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
-        imp.messages_loaded.set(false);
-        // Clear info banner so stale pinned messages don't flash.
+        imp.fully_read_event_id.replace(None);
+
+        // Clear info banners.
         imp.unread_banner.set_revealed(false);
         imp.info_banner.set_visible(false);
         imp.info_separator.set_visible(false);
@@ -1712,20 +1925,29 @@ impl MessageView {
         imp.tombstone_banner.set_visible(false);
         imp.pinned_box.set_visible(false);
         self.remove_css_class("tombstone-view");
-        // Clear reply state and pending mention tracking.
+
+        // Clear reply/typing state.
         imp.reply_to_event.replace(None);
         imp.reply_quote.replace(None);
         imp.pending_mentions.borrow_mut().clear();
-        // Reset typing state so new room gets a clean slate.
         imp.last_typing_sent.set(false);
-        if let Some(id) = imp.typing_debounce.borrow_mut().take() {
-            id.remove();
-        }
-        if let Some(id) = imp.spell_debounce.borrow_mut().take() {
-            id.remove();
-        }
+        if let Some(id) = imp.typing_debounce.borrow_mut().take() { id.remove(); }
+        if let Some(id) = imp.spell_debounce.borrow_mut().take() { id.remove(); }
         imp.reply_preview.set_visible(false);
         imp.typing_label.set_visible(false);
+
+        // ── Switch to the new room view (O(1)) ───────────────────────────────
+        imp.room_stack.set_visible_child_name(room_id);
+        if is_return_visit && was_loaded {
+            // Show existing messages instantly; server fetch (always running)
+            // will splice in any new/gap messages via the has_new check.
+            imp.view_stack.set_visible_child_name("messages");
+        } else {
+            imp.view_stack.set_visible_child_name("loading");
+        }
+        tracing::info!(
+            "clear: room={room_id} return={is_return_visit} was_loaded={was_loaded}"
+        );
     }
 
     /// Connect a callback for when the user scrolls to the top (load older messages).
@@ -1860,8 +2082,8 @@ impl MessageView {
         }
         // O(1) lookup — at most one divider exists at a time.
         if let Some(divider) = imp.event_index.borrow_mut().remove("__unread_divider__") {
-            if let Some(i) = imp.list_store.find(&divider) {
-                imp.list_store.remove(i);
+            if let Some(i) = imp.list_store().find(&divider) {
+                imp.list_store().remove(i);
             }
         }
         imp.unread_banner.set_revealed(false);
@@ -1891,14 +2113,14 @@ impl MessageView {
     /// current window.  Auto-dismisses the banner after 10 seconds.
     fn insert_divider_by_count(&self, unread_count: u32) {
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         let pos = n.saturating_sub(unread_count);
         // Mark all messages after the divider position as new and track them
         // so remove_dividers can clear them in O(unread) not O(total).
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in pos..n {
-            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i)
+            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i)
                 .and_downcast::<MessageObject>()
             {
                 obj.set_is_new_message(true);
@@ -1907,7 +2129,7 @@ impl MessageView {
         }
         drop(new_objs);
         let divider = Self::make_divider_obj();
-        imp.list_store.insert(pos, &divider);
+        imp.list_store().insert(pos, &divider);
         imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
         // Actual new count = messages from pos to end (before insert, n - pos).
         let actual_new = n - pos;
@@ -1924,11 +2146,11 @@ impl MessageView {
         let Some(marker_obj) = imp.event_index.borrow().get(event_id).cloned() else {
             return false; // Event not in the current window (case C).
         };
-        let Some(marker_pos) = imp.list_store.find(&marker_obj) else {
+        let Some(marker_pos) = imp.list_store().find(&marker_obj) else {
             return false;
         };
         let insert_pos = marker_pos + 1;
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         if insert_pos >= n {
             return false; // Event is the last item — unread messages not yet loaded (case B).
         }
@@ -1936,7 +2158,7 @@ impl MessageView {
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in insert_pos..n {
-            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i)
+            if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i)
                 .and_downcast::<MessageObject>()
             {
                 obj.set_is_new_message(true);
@@ -1946,7 +2168,7 @@ impl MessageView {
         drop(new_objs);
         let new_count = n - insert_pos;
         let divider = Self::make_divider_obj();
-        imp.list_store.insert(insert_pos, &divider);
+        imp.list_store().insert(insert_pos, &divider);
         imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
         self.show_unread_banner(new_count);
         true
@@ -1959,7 +2181,7 @@ impl MessageView {
         self.remove_dividers();
         let divider = Self::make_divider_obj();
         self.imp().event_index.borrow_mut().insert("__unread_divider__".to_string(), divider.clone());
-        self.imp().list_store.append(&divider);
+        self.imp().list_store().append(&divider);
         // Count starts at 1; window.rs calls set_unseen_count() as more messages arrive.
         self.show_unread_banner(1);
         self.scroll_to_bottom();
@@ -1986,7 +2208,7 @@ impl MessageView {
             obj.set_is_new_message(true);
             self.imp().new_message_objs.borrow_mut().push(obj.clone());
         }
-        self.imp().list_store.append(&obj);
+        self.imp().list_store().append(&obj);
         self.scroll_to_bottom();
     }
 
@@ -1995,12 +2217,12 @@ impl MessageView {
     /// Returns true if an echo was found and patched, false otherwise.
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let imp = self.imp();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
+        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         // Local echo search — echos have empty event_id and are near the end.
         // This is a backwards scan over items to process (finding the echo),
         // not a lookup of a known key — acceptable per the no-loops policy.
         for i in (0..n).rev() {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store, i) else { continue };
+            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i) else { continue };
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id().is_empty() && msg.body() == echo_body {
                 msg.set_event_id(event_id.to_string());
@@ -2008,7 +2230,7 @@ impl MessageView {
                 imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
                 // Rebind the visible row so MessageRow's Rc cells get updated.
                 let eid_str = event_id.to_string();
-                let mut child = imp.list_view.first_child();
+                let mut child = imp.list_view().first_child();
                 while let Some(ref widget) = child {
                     if let Some(row) = Self::find_message_row(widget) {
                         // Echo row had empty event_id — match by checking if row
@@ -2037,7 +2259,7 @@ impl MessageView {
 
     fn scroll_to_bottom(&self) {
         let imp = self.imp();
-        if gio::prelude::ListModelExt::n_items(&imp.list_store) == 0 { return; }
+        if gio::prelude::ListModelExt::n_items(&imp.list_store()) == 0 { return; }
         // Do NOT call list_view.scroll_to() — with GTK_LIST_SCROLL_NONE it has
         // undefined behaviour when the item is already partially visible and can
         // scroll the last row to the *top* of the viewport, overriding us.
@@ -2047,7 +2269,7 @@ impl MessageView {
         // after the layout has updated vadj.upper for the new row.  We fire a
         // second idle inside the first to catch any second layout pass (e.g.
         // variable-height rows that get remeasured after realisation).
-        let sw = imp.scrolled_window.clone();
+        let sw = imp.scrolled_window().clone();
         glib::idle_add_local_once(move || {
             let vadj = sw.vadjustment();
             vadj.set_value(vadj.upper() - vadj.page_size());
@@ -2692,5 +2914,71 @@ mod tests {
         let result = divider_decision(&ids, None, preserved, false);
         assert_eq!(result, Some((8, 2)),
             "even after timer fires, divider must still tint the original 2 messages");
+    }
+
+    // ── Per-room state save/restore (regression for room-switch performance) ──
+
+    #[test]
+    fn per_room_state_save_restore_prevents_spurious_splice() {
+        // Simulate the logic in clear() + set_messages() for a return visit.
+        // When returning to a room, the saved event_index means set_messages()
+        // detects "nothing changed" and skips the O(N) splice.
+
+        use std::collections::HashMap;
+
+        let mut saved_indices: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        // First visit to room_a: load 3 messages.
+        let room_a = "!roomA:example.org";
+        let idx_a: HashMap<String, String> = [
+            ("$ev1".to_string(), "body1".to_string()),
+            ("$ev2".to_string(), "body2".to_string()),
+            ("$ev3".to_string(), "body3".to_string()),
+        ].into_iter().collect();
+
+        // Switch away — save room_a's event_index.
+        saved_indices.insert(room_a.to_string(), idx_a.clone());
+
+        // Visit room_b.
+        let room_b = "!roomB:example.org";
+        let _idx_b: HashMap<String, String> = HashMap::new(); // empty for this test
+
+        // Switch back to room_a — restore its event_index.
+        let restored = saved_indices.remove(room_a).unwrap_or_default();
+        assert_eq!(restored.len(), 3, "event_index should be restored for room_a");
+
+        // Simulate the has_new check: last incoming message is $ev3, which IS in index.
+        let last_incoming_id = "$ev3";
+        let has_new = !restored.contains_key(last_incoming_id);
+        assert!(!has_new, "bg_refresh should detect no new messages on return visit");
+
+        // Verify room_b (first visit) starts with empty index.
+        let _ = room_b; // used above
+        let fresh_idx: HashMap<String, String> = saved_indices
+            .remove(room_b).unwrap_or_default();
+        assert!(fresh_idx.is_empty(), "first visit to room_b has empty event_index");
+    }
+
+    #[test]
+    fn per_room_messages_loaded_prevents_auto_scroll_on_return() {
+        // Simulate clear() save/restore of messages_loaded.
+        // Return visits must NOT auto-scroll (was_loaded=true → first_load=false
+        // in set_messages, which skips the auto-scroll block).
+
+        let mut saved_loaded: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let room_a = "!roomA:example.org";
+
+        // First visit: messages_loaded starts false → set to true after set_messages.
+        let messages_loaded_first = true; // after set_messages ran
+        saved_loaded.insert(room_a.to_string(), messages_loaded_first);
+
+        // Switch to another room, then back to room_a.
+        let was_loaded = saved_loaded.remove(room_a).unwrap_or(false);
+        assert!(was_loaded, "messages_loaded should be restored for return visit");
+
+        // In set_messages, first_load = !imp.messages_loaded.get().
+        // Since messages_loaded was restored to true, first_load = false → no auto-scroll.
+        let first_load = !was_loaded;
+        assert!(!first_load, "return visit must not trigger first-load auto-scroll");
     }
 }

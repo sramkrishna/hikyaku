@@ -90,6 +90,8 @@ mod imp {
         #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub body_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub body_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub reply_box: TemplateChild<gtk::Box>,
@@ -514,6 +516,24 @@ mod imp {
             self.reply_box.add_controller(reply_gesture);
             // Make reply box look clickable.
             self.reply_box.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
+
+            // body_label matrix.to link handler — connected once at construction
+            // so the label itself doesn't need to be re-created on every bind.
+            self.body_label.connect_activate_link(|_lbl, uri| {
+                if let Some(matrix_id) = super::parse_matrix_uri(uri) {
+                    if let Some(app) = gio::Application::default() {
+                        if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                            if let Some(window) = gtk_app.active_window() {
+                                if let Some(win) = window.downcast_ref::<crate::widgets::MxWindow>() {
+                                    win.handle_matrix_link(&matrix_id);
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                    }
+                }
+                glib::Propagation::Proceed
+            });
 
             // Media button click — download and show preview.
             let media_url = self.media_url.clone();
@@ -945,7 +965,9 @@ impl MessageRow {
         if msg.is_system_event() {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
+            imp.body_label.set_visible(false);
             clear_body_box(&imp.body_box);
+            imp.body_box.set_visible(true);
             let lbl = gtk::Label::builder()
                 .label(&body)
                 .halign(gtk::Align::Center)
@@ -970,7 +992,9 @@ impl MessageRow {
         if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
+            imp.body_label.set_visible(false);
             clear_body_box(&imp.body_box);
+            imp.body_box.set_visible(true);
             let lbl = gtk::Label::builder()
                 .label(&body)
                 .halign(gtk::Align::Center)
@@ -1235,16 +1259,18 @@ impl MessageRow {
         if has_highlight { self.add_css_class("mention-row"); }
         else { self.remove_css_class("mention-row"); }
 
-        // Skip expensive body widget recreation if body content is unchanged.
+        // Skip body update if content is unchanged since last bind.
         // Reactions are handled separately; only body + formatted_body matter here.
         let body_key = format!("{body}\0{formatted_body}");
         if *imp.last_body_key.borrow() != body_key {
             imp.last_body_key.replace(body_key);
-            clear_body_box(&imp.body_box);
 
             if !formatted_body.is_empty() {
-                // HTML path — split into text + code segments.
-                // Links are already <a> tags — do NOT linkify again.
+                // HTML path — may contain code blocks, so we need body_box with
+                // dynamically-created child widgets.  body_label is hidden.
+                imp.body_label.set_visible(false);
+                clear_body_box(&imp.body_box);
+                imp.body_box.set_visible(true);
                 let segments = crate::markdown::html_to_segments(formatted_body);
                 for seg in segments {
                     match seg {
@@ -1257,10 +1283,11 @@ impl MessageRow {
                     }
                 }
             } else {
-                // Plain-text path — escape, highlight names, linkify URLs.
+                // Plain-text path — update the pre-allocated body_label in-place.
+                // This avoids constructing a new GtkLabel (with its internal
+                // GtkTextView for selectability) on every room switch.
                 let mut escaped = glib::markup_escape_text(body).to_string();
                 if has_highlight {
-                    // Use pre-lowercased names; build lower of escaped once per loop.
                     for name_lower in &highlight_lower {
                         let escaped_lower = escaped.to_lowercase();
                         let mut result = String::new();
@@ -1277,7 +1304,10 @@ impl MessageRow {
                         escaped = result;
                     }
                 }
-                imp.body_box.append(&make_text_label(&linkify_urls(&escaped)));
+                imp.body_box.set_visible(false);
+                clear_body_box(&imp.body_box);
+                imp.body_label.set_markup(&linkify_urls(&escaped));
+                imp.body_label.set_visible(true);
             }
         }
 

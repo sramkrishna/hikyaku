@@ -21,6 +21,9 @@ mod imp {
     pub struct MxWindow {
         pub event_rx: OnceCell<Receiver<MatrixEvent>>,
         pub command_tx: OnceCell<Sender<MatrixCommand>>,
+        /// Shared timeline cache — written by the Matrix thread, read here for
+        /// instant synchronous cache hits on room selection.
+        pub timeline_cache: OnceCell<crate::matrix::room_cache::RoomCache>,
         pub onboarding_page: OnboardingPage,
         pub login_page: LoginPage,
         pub room_list_view: RoomListView,
@@ -55,6 +58,8 @@ mod imp {
         pub bookmark_button: OnceCell<gtk::Button>,
         /// Export metrics button.
         pub export_button: OnceCell<gtk::Button>,
+        /// Export messages button — dumps visible room messages to a JSONL file.
+        pub export_messages_button: OnceCell<gtk::Button>,
         /// Current user ID for deduplicating local echo.
         pub user_id: RefCell<String>,
         /// Media cache: mxc_url → local file path.
@@ -128,6 +133,7 @@ mod imp {
             Self {
                 event_rx: OnceCell::new(),
                 command_tx: OnceCell::new(),
+                timeline_cache: OnceCell::new(),
                 onboarding_page: OnboardingPage::new(),
                 login_page: LoginPage::new(),
                 room_list_view: RoomListView::new(),
@@ -159,6 +165,7 @@ mod imp {
                 info_button: OnceCell::new(),
                 bookmark_button: OnceCell::new(),
                 export_button: OnceCell::new(),
+                export_messages_button: OnceCell::new(),
                 user_id: RefCell::new(String::new()),
                 media_cache: RefCell::new(std::collections::HashMap::new()),
                 avatar_cache: RefCell::new(std::collections::HashMap::new()),
@@ -589,6 +596,7 @@ impl MxWindow {
         app: &crate::application::MxApplication,
         event_rx: Receiver<MatrixEvent>,
         command_tx: Sender<MatrixCommand>,
+        timeline_cache: crate::matrix::room_cache::RoomCache,
     ) -> Self {
         let window: Self = glib::Object::builder()
             .property("application", app)
@@ -597,6 +605,7 @@ impl MxWindow {
         let imp = window.imp();
         let _ = imp.event_rx.set(event_rx.clone());
         let _ = imp.command_tx.set(command_tx.clone());
+        let _ = imp.timeline_cache.set(timeline_cache);
 
         // Load persisted local unread counts, then connect broker → room list.
         imp.local_unread.load();
@@ -626,6 +635,8 @@ impl MxWindow {
         let msg_view = imp.message_view.clone();
         let room_list = imp.room_list_view.clone();
         imp.room_list_view.connect_room_selected(move |room_id, room_name| {
+            let _t0 = std::time::Instant::now();
+            let _t_phase1 = std::time::Instant::now();
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
                 window.imp().notification_manager.set_current_room(Some(&room_id));
@@ -641,6 +652,9 @@ impl MxWindow {
                     btn.set_visible(true);
                 }
                 if let Some(btn) = window.imp().export_button.get() {
+                    btn.set_visible(true);
+                }
+                if let Some(btn) = window.imp().export_messages_button.get() {
                     btn.set_visible(true);
                 }
                 // Hide details sidebar when switching rooms.
@@ -665,6 +679,8 @@ impl MxWindow {
                 w.imp().local_unread.mark_read(&room_id);
             }
 
+            tracing::info!("room_selected phase1 (widget updates+unread) took {:?}", _t_phase1.elapsed());
+            let _t_phase2 = std::time::Instant::now();
             // Delay sending read receipt by 15 seconds.
             // This ensures the user actually stays in the room before telling the server.
             if let Some(window) = window_weak.upgrade() {
@@ -721,8 +737,64 @@ impl MxWindow {
                 );
                 imp.read_timer.replace(Some((source, fired_flag, room_id.clone())));
             }
-            // Clear old messages while we fetch the new room's messages.
-            msg_view.clear();
+            tracing::info!("room_selected phase2 (read timer setup) took {:?}", _t_phase2.elapsed());
+            let _t_phase3 = std::time::Instant::now();
+            // Instant path: read the cache synchronously on the GTK thread —
+            // no async round-trip, no loading flash for warm-cache rooms.
+            let cache_hit = window_weak.upgrade()
+                .and_then(|w| w.imp().timeline_cache.get().cloned())
+                .and_then(|cache| cache.get_memory(&room_id));
+
+            if let Some((msgs, prev_batch, mut meta)) = cache_hit {
+                meta.unread_count = meta.unread_count.max(known_unread);
+                if let Some(window) = window_weak.upgrade() {
+                    let wimp = window.imp();
+                    wimp.current_room_meta.replace(Some(meta.clone()));
+                    let is_dm = {
+                        let reg = wimp.room_list_view.imp().room_registry.borrow();
+                        reg.get(&room_id)
+                            .map(|o| o.kind() == crate::matrix::RoomKind::DirectMessage)
+                            .unwrap_or(false)
+                    };
+                    msg_view.set_is_dm_room(is_dm);
+                    msg_view.set_no_media(wimp.room_list_view.resolve_no_media(&room_id));
+                    // Switch to the new room's per-room ListView (O(1)).
+                    // For return visits existing messages show immediately;
+                    // for first visits the spinner shows until set_messages arrives.
+                    msg_view.clear(&room_id);
+                    msg_view.set_room_meta(&meta);
+                    if let Some(btn) = wimp.bookmark_button.get() {
+                        btn.set_icon_name(if meta.is_favourite {
+                            "starred-symbolic"
+                        } else {
+                            "non-starred-symbolic"
+                        });
+                        btn.set_tooltip_text(Some(if meta.is_favourite {
+                            "Remove bookmark"
+                        } else {
+                            "Bookmark this room"
+                        }));
+                    }
+                    // Defer set_messages to the next idle so the room header and
+                    // loading spinner render before the GTK thread is frozen by
+                    // the splice.  The handler returns quickly and the user sees
+                    // the new room's header immediately.
+                    let mv = msg_view.clone();
+                    let rid_bm = room_id.clone();
+                    glib::idle_add_local_once(move || {
+                        mv.set_messages(&msgs, prev_batch);
+                        mv.load_bookmarks(&rid_bm);
+                    });
+                }
+            } else {
+                // Cold cache — show loading state and wait for Tokio.
+                msg_view.clear(&room_id);
+            }
+
+            // Always send SelectRoom so Tokio can dirty-check, run bg_refresh,
+            // and deliver an authoritative RoomMessages event.  set_messages
+            // handles idempotent updates (no-splice when nothing changed).
+            tracing::info!("room_selected GTK handler took {:?} for {room_id}", _t0.elapsed());
             let tx = cmd_tx.clone();
             let rid = room_id.clone();
             glib::spawn_future_local(async move {
@@ -1398,19 +1470,25 @@ impl MxWindow {
                             message_view.set_refreshing(true);
                         }
                     }
-                    MatrixEvent::RoomMessages { room_id, messages, prev_batch_token, room_meta } => {
+                    MatrixEvent::RoomMessages { room_id, messages, prev_batch_token, room_meta, is_background } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             // Fresh data arrived — hide the loading bar (if shown for stale cache).
                             message_view.set_refreshing(false);
                             window.imp().current_room_meta.replace(Some(room_meta.clone()));
                             // MOTD: clear changed icon and record the current topic as seen.
+                            // Offloaded to idle so the synchronous disk I/O (load+write)
+                            // doesn't block the GTK main loop during room switches.
                             #[cfg(feature = "motd")]
                             {
                                 room_list_view.set_topic_changed(&room_id, false);
                                 if !room_meta.topic.is_empty() {
-                                    let mut cache = crate::plugins::motd::load();
-                                    crate::plugins::motd::mark_seen(&room_id, &room_meta.topic, &mut cache);
+                                    let motd_rid = room_id.clone();
+                                    let motd_topic = room_meta.topic.clone();
+                                    glib::idle_add_local_once(move || {
+                                        let mut cache = crate::plugins::motd::load();
+                                        crate::plugins::motd::mark_seen(&motd_rid, &motd_topic, &mut cache);
+                                    });
                                 }
                             }
                             // Check if this room is a DM by looking at the registry.
@@ -1434,19 +1512,9 @@ impl MxWindow {
                                     "Bookmark this room"
                                 }));
                             }
-                            message_view.set_messages(&messages, prev_batch_token);
-                            message_view.load_bookmarks(&room_id);
-
-                            // Flash a bookmarked message if one is pending.
-                            if let Some(eid) = window.imp().pending_flash_event_id.take() {
-                                let mv = message_view.clone();
-                                glib::idle_add_local_once(move || {
-                                    mv.scroll_to_event(&eid);
-                                });
-                            }
-
                             // Queue avatar fetches only for senders of the displayed
                             // messages — not all room members (which can be thousands).
+                            // Done before set_messages so messages isn't moved yet.
                             let avatar_lookup: std::collections::HashMap<&str, &str> =
                                 room_meta.member_avatars.iter()
                                     .map(|(uid, mxc)| (uid.as_str(), mxc.as_str()))
@@ -1465,6 +1533,29 @@ impl MxWindow {
                                     })
                                     .collect()
                             };
+
+                            // For bg_refresh results, defer the splice to an idle
+                            // callback so the GTK frame (and selection highlight) can
+                            // render before the potentially-expensive items_changed fires.
+                            if is_background {
+                                let mv = message_view.clone();
+                                glib::idle_add_local_once(move || {
+                                    mv.set_messages(&messages, prev_batch_token);
+                                });
+                            } else {
+                                message_view.set_messages(&messages, prev_batch_token);
+                            }
+                            let mv_bm2 = message_view.clone();
+                            let rid_bm2 = room_id.clone();
+                            glib::idle_add_local_once(move || mv_bm2.load_bookmarks(&rid_bm2));
+
+                            // Flash a bookmarked message if one is pending.
+                            if let Some(eid) = window.imp().pending_flash_event_id.take() {
+                                let mv = message_view.clone();
+                                glib::idle_add_local_once(move || {
+                                    mv.scroll_to_event(&eid);
+                                });
+                            }
                             for (uid, mxc) in to_fetch {
                                 let tx = command_tx.clone();
                                 glib::spawn_future_local(async move {
@@ -1505,16 +1596,21 @@ impl MxWindow {
                             "UI NewMessage room={room_id} is_dm={is_dm} is_self={is_self} is_current={is_current_room}"
                         );
 
+                        // System events (join/leave/kick/ban) are shown inline
+                        // but never count as unread messages or trigger the divider.
+                        let is_system = message.is_system_event;
+
                         if is_current_room && !is_self {
                             // Insert a "New messages" divider before the first
                             // unseen message when the window is unfocused.
                             let unfocused = !window_focused;
-                            if unfocused && window.imp().unseen_while_unfocused.get() == 0 {
+                            if !is_system && unfocused && window.imp().unseen_while_unfocused.get() == 0 {
                                 message_view.insert_divider();
                             }
-                            // Tint the row blue when the window is not focused.
-                            message_view.append_message(&message, unfocused);
-                            if unfocused {
+                            // Tint the row blue when the window is not focused and
+                            // it's a real message (system events shown without tint).
+                            message_view.append_message(&message, unfocused && !is_system);
+                            if !is_system && unfocused {
                                 let count = window.imp().unseen_while_unfocused.get() + 1;
                                 window.imp().unseen_while_unfocused.set(count);
                                 // Keep the banner title in sync with the live count.
@@ -1533,7 +1629,8 @@ impl MxWindow {
 
                         // Update unread badge on rooms we're NOT viewing.
                         // Route through the local broker so counts persist across restarts.
-                        if !is_current_room && !is_self {
+                        // System events (join/leave) are not counted as unread.
+                        if !is_system && !is_current_room && !is_self {
                             window.imp().local_unread.increment(&room_id, is_mention);
                         }
 
@@ -1720,6 +1817,12 @@ impl MxWindow {
                     MatrixEvent::MetricsFailed { error } => {
                         toast_error(&toast_overlay, "Metrics export failed", &error);
                     }
+                    MatrixEvent::MessagesExported { path, count } => {
+                        toast(&toast_overlay, &format!("Exported {count} messages → {path}"));
+                    }
+                    MatrixEvent::MessagesExportFailed { error } => {
+                        toast_error(&toast_overlay, "Message export failed", &error);
+                    }
                     // RoomPreview is no longer sent — Ollama now runs on the tokio thread
                     // and sends OllamaChunk events directly.
                     MatrixEvent::RoomPreview { .. } => {}
@@ -1868,7 +1971,7 @@ impl MxWindow {
                         if let Some(page) = window.imp().content_page.get() {
                             page.set_title(&room_name);
                         }
-                        message_view.clear();
+                        message_view.clear(&room_id);
                         let tx = window.imp().command_tx.get().unwrap().clone();
                         let rid = room_id.clone();
                         glib::spawn_future_local(async move {
@@ -1879,14 +1982,23 @@ impl MxWindow {
                         toast_error(&toast_overlay, "Failed to open DM", &error);
                     }
                     MatrixEvent::SyncGap { room_id } => {
-                        // The memory cache was wiped by the sync thread so the next
-                        // SelectRoom (when the user navigates away and back) will
-                        // trigger a full bg_refresh.  While the user is currently
-                        // viewing the room, NewMessage events are already delivering
-                        // each message live — no need to trigger a full re-fetch that
-                        // would flash the "Updating messages" banner every 30 s on
-                        // busy rooms (KDE, GNOME, etc. whose timeline is always limited).
-                        tracing::debug!("SyncGap for {room_id} (cache wiped; live NewMessage events cover gap)");
+                        // The memory cache was wiped by the sync thread.
+                        // If the user is currently viewing this room, trigger a
+                        // silent bg_refresh so gap events (messages the limited
+                        // sync response skipped) are fetched from the server.
+                        // The "Updating messages" banner is suppressed when
+                        // messages_loaded=true, so this is invisible to the user.
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            tracing::info!("SyncGap for current room {room_id} — triggering silent refresh");
+                            let tx = command_tx.clone();
+                            let rid = room_id.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::RefreshRoom { room_id: rid }).await;
+                            });
+                        } else {
+                            tracing::debug!("SyncGap for {room_id} (cache wiped; will refetch on next SelectRoom)");
+                        }
                     }
                     MatrixEvent::TypingUsers { room_id, names } => {
                         let current = window.imp().current_room_id.borrow().clone();
@@ -2103,10 +2215,20 @@ impl MxWindow {
         export_button.add_css_class("flat");
         content_header.pack_end(&export_button);
 
+        // Export messages button — dumps visible messages to JSONL for health_test etc.
+        let export_messages_button = gtk::Button::builder()
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Export messages to file")
+            .visible(false)
+            .build();
+        export_messages_button.add_css_class("flat");
+        content_header.pack_end(&export_messages_button);
+
         // Store button references so room selection can show/hide them.
         let _ = imp.info_button.set(info_button.clone());
         let _ = imp.bookmark_button.set(bookmark_button.clone());
         let _ = imp.export_button.set(export_button.clone());
+        let _ = imp.export_messages_button.set(export_messages_button.clone());
 
         // Wire bookmark toggle.
         let window_weak_bm = self.downgrade();
@@ -2190,6 +2312,33 @@ impl MxWindow {
             let Some(room_id) = imp.current_room_id.borrow().clone() else { return };
             let tx = imp.command_tx.get().unwrap().clone();
             show_export_metrics_dialog(&window, room_id, tx);
+        });
+
+        // Wire up export messages button — dumps the currently displayed messages to JSONL.
+        // Reads from the list_store (what's on screen) so it always matches what the user sees,
+        // regardless of what the disk cache holds.
+        let window_weak_msg_export = self.downgrade();
+        let toast_msg_export = imp.toast_overlay.clone();
+        export_messages_button.connect_clicked(move |_| {
+            let Some(window) = window_weak_msg_export.upgrade() else { return };
+            let imp = window.imp();
+            let Some(room_id) = imp.current_room_id.borrow().clone() else { return };
+            let safe_name: String = room_id.trim_start_matches('!')
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            let filename = format!("hikyaku-{safe_name}.jsonl");
+            let path = dirs::download_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(&filename);
+            match imp.message_view.export_messages_jsonl(&path) {
+                Ok(0) => toast(&toast_msg_export,
+                    "No messages to export — scroll up to load history first"),
+                Ok(n) => toast(&toast_msg_export,
+                    &format!("Exported {n} messages → {}", path.display())),
+                Err(e) => toast_error(&toast_msg_export, "Export failed", &e.to_string()),
+            }
         });
 
         // Details sidebar (right side, hidden by default).

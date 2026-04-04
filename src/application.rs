@@ -62,7 +62,7 @@ mod imp {
             // Spawn the background tokio thread that runs matrix-sdk.
             // Shutdown is initiated by sending MatrixCommand::Shutdown — all
             // commands before it are guaranteed to run first (no race condition).
-            matrix::spawn_matrix_thread(event_tx, command_rx);
+            let timeline_cache = matrix::spawn_matrix_thread(event_tx, command_rx);
 
             // Store event channel (command_tx lives only in the window).
             let _ = self.event_rx.set(event_rx.clone());
@@ -107,7 +107,7 @@ mod imp {
             }
 
             // Create and present the main window.
-            let window = MxWindow::new(&app, event_rx, command_tx);
+            let window = MxWindow::new(&app, event_rx, command_tx, timeline_cache);
             window.set_title(Some(config::APP_NAME));
             window.set_default_size(1000, 700);
 
