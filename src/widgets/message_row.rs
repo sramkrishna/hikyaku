@@ -705,27 +705,7 @@ fn extract_image_url(body: &str) -> Option<String> {
 
 /// Convert URLs in already-escaped markup text into clickable <a> links.
 fn linkify_urls(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("http") {
-        // Check it's https:// or http://
-        let candidate = &rest[start..];
-        if !candidate.starts_with("https://") && !candidate.starts_with("http://") {
-            result.push_str(&rest[..start + 4]);
-            rest = &rest[start + 4..];
-            continue;
-        }
-        result.push_str(&rest[..start]);
-        // Find end of URL — stop at whitespace, >, or end of string.
-        let url_end = candidate
-            .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
-            .unwrap_or(candidate.len());
-        let url = &candidate[..url_end];
-        result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
-        rest = &candidate[url_end..];
-    }
-    result.push_str(rest);
-    result
+    crate::markdown::linkify_urls(text)
 }
 
 /// Remove all children from the body_box before repopulating it.
@@ -1266,21 +1246,29 @@ impl MessageRow {
             imp.last_body_key.replace(body_key);
 
             if !formatted_body.is_empty() {
-                // HTML path — may contain code blocks, so we need body_box with
-                // dynamically-created child widgets.  body_label is hidden.
-                imp.body_label.set_visible(false);
-                clear_body_box(&imp.body_box);
-                imp.body_box.set_visible(true);
-                let segments = crate::markdown::html_to_segments(formatted_body);
-                for seg in segments {
-                    match seg {
-                        crate::markdown::Segment::Text(markup) => {
-                            imp.body_box.append(&make_text_label(&markup));
-                        }
-                        crate::markdown::Segment::Code { content, lang } => {
-                            imp.body_box.append(&make_code_view(&content, &lang));
+                if formatted_body.contains("<pre") {
+                    // Contains code blocks — use body_box for syntax-highlighted views.
+                    imp.body_label.set_visible(false);
+                    clear_body_box(&imp.body_box);
+                    imp.body_box.set_visible(true);
+                    for seg in crate::markdown::html_to_segments(formatted_body) {
+                        match seg {
+                            crate::markdown::Segment::Text(markup) => {
+                                imp.body_box.append(&make_text_label(&markup));
+                            }
+                            crate::markdown::Segment::Code { content, lang } => {
+                                imp.body_box.append(&make_code_view(&content, &lang));
+                            }
                         }
                     }
+                } else {
+                    // Simple HTML (bold, italic, links, etc.) — convert to Pango markup
+                    // and use the pre-allocated body_label. Avoids all widget construction
+                    // per bind, which is the main source of scroll lag.
+                    imp.body_box.set_visible(false);
+                    clear_body_box(&imp.body_box);
+                    imp.body_label.set_markup(&crate::markdown::html_to_pango(formatted_body));
+                    imp.body_label.set_visible(true);
                 }
             } else {
                 // Plain-text path — update the pre-allocated body_label in-place.

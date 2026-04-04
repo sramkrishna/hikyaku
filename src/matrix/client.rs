@@ -3546,56 +3546,6 @@ async fn handle_select_room_bg(
         }
     };
 
-        // Fetch room members for nick completion and room info panel.
-        // Only fetch if not already cached this session.  Skip rooms with more
-        // than 200 members (large public rooms) to avoid slow server requests.
-        // The member count from the SDK summary is reliable after the first sync.
-        let estimated_member_count = room.joined_members_count();
-        let mut members_were_cached = false;
-        let (members, member_avatars) = if let Some(cached) =
-            timeline_cache.get_cached_members(&room_id.to_string())
-        {
-            members_were_cached = true;
-            cached
-        } else if estimated_member_count <= 200 || estimated_member_count == 0 {
-            use matrix_sdk::RoomMemberships;
-            match room.members(RoomMemberships::JOIN).await {
-                Ok(member_list) => {
-                    let members: Vec<(String, String)> = member_list
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.user_id().to_string(),
-                                m.display_name().unwrap_or_else(|| m.user_id().localpart()).to_string(),
-                            )
-                        })
-                        .collect();
-                    let member_avatars: Vec<(String, String)> = member_list
-                        .iter()
-                        .filter_map(|m| {
-                            m.avatar_url().map(|url| (m.user_id().to_string(), url.to_string()))
-                        })
-                        .collect();
-                    timeline_cache.cache_members(
-                        &room_id.to_string(),
-                        members.clone(),
-                        member_avatars.clone(),
-                    );
-                    (members, member_avatars)
-                }
-                Err(e) => {
-                    tracing::warn!("bg_refresh {room_id}: room.members() failed: {e}");
-                    (vec![], vec![])
-                }
-            }
-        } else {
-            // Large room — skip full fetch, return empty (nick completion disabled).
-            tracing::debug!("bg_refresh {room_id}: skipping member fetch (large room, count={})", estimated_member_count);
-            (vec![], vec![])
-        };
-        let members_fetched_flag = !members.is_empty();
-        tracing::info!("bg_refresh {room_id}: members fetched={members_fetched_flag} (count={}, cached={members_were_cached})", members.len());
-
         let enc_room = room.clone();
         let enc_future = async move { enc_room.is_encrypted().await.unwrap_or(false) };
 
@@ -3609,22 +3559,67 @@ async fn handle_select_room_bg(
             .flatten()
             .and_then(|raw| raw.deserialize().ok())
             .map(|ev| ev.content.event_id.to_string())
-    };
+        };
 
-        // Run messages, tombstone, pinned, encryption, and fully_read in parallel.
+        // Member fetch runs in parallel with messages, tombstone, etc.
+        // No size cap — for large rooms this may take a second or two, but it runs
+        // concurrently so it doesn't add to total latency beyond the message fetch.
+        // Result is cached per-session so subsequent room visits are instant.
+        let member_room = room.clone();
+        let member_cache = timeline_cache.clone();
+        let member_room_id_str = room_id.to_string();
+        let member_future = async move {
+            if let Some(cached) = member_cache.get_cached_members(&member_room_id_str) {
+                return (cached, true); // (members+avatars, was_cached)
+            }
+            use matrix_sdk::RoomMemberships;
+            match member_room.members(RoomMemberships::JOIN).await {
+                Ok(member_list) => {
+                    let members: Vec<(String, String)> = member_list
+                        .iter()
+                        .map(|m| (
+                            m.user_id().to_string(),
+                            m.display_name().unwrap_or_else(|| m.user_id().localpart()).to_string(),
+                        ))
+                        .collect();
+                    let member_avatars: Vec<(String, String)> = member_list
+                        .iter()
+                        .filter_map(|m| {
+                            m.avatar_url().map(|url| (m.user_id().to_string(), url.to_string()))
+                        })
+                        .collect();
+                    member_cache.cache_members(
+                        &member_room_id_str,
+                        members.clone(),
+                        member_avatars.clone(),
+                    );
+                    ((members, member_avatars), false)
+                }
+                Err(e) => {
+                    tracing::warn!("bg_refresh {member_room_id_str}: room.members() failed: {e}");
+                    ((vec![], vec![]), false)
+                }
+            }
+        };
+
+        // Run messages, tombstone, pinned, encryption, fully_read, and members in parallel.
         let (
             (all_messages, prev_batch_token),
             (is_tombstoned, replacement_room, replacement_room_name),
             pinned_messages,
             is_encrypted,
             fully_read_event_id,
+            ((members, member_avatars), members_were_cached),
         ) = tokio::join!(
             msg_future,
             tombstone_future,
             pinned_future,
             enc_future,
             fully_read_future,
+            member_future,
         );
+        let members_fetched_flag = !members.is_empty();
+        tracing::info!("bg_refresh {room_id}: members fetched={members_fetched_flag} (count={}, cached={members_were_cached})", members.len());
         tracing::info!("bg_refresh {room_id}: tokio::join! done in {:?}", t_inner.elapsed());
         // Backfill reply_to_sender from the existing memory cache for replies
         // that point to events outside the current 25-message batch.  Modern
@@ -3649,6 +3644,22 @@ async fn handle_select_room_bg(
             }
         }
 
+        // For large rooms (count > 200) the full member fetch was skipped.
+        // Fall back to the unique senders from the loaded timeline so nick
+        // completion and the room info panel still work for recent participants.
+        let members = if members.is_empty() && !all_messages.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let mut timeline_members: Vec<(String, String)> = all_messages.iter()
+                .rev()  // most-recent senders first
+                .filter(|m| !m.sender_id.is_empty() && seen.insert(m.sender_id.clone()))
+                .map(|m| (m.sender_id.clone(), m.sender.clone()))
+                .collect();
+            timeline_members.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            tracing::debug!("bg_refresh {room_id}: derived {} members from timeline", timeline_members.len());
+            timeline_members
+        } else {
+            members
+        };
         let members_fetched = members_fetched_flag;
         let topic = room.topic().unwrap_or_default();
         // Prefer the fetched member list length — it's accurate even before the

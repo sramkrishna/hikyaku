@@ -1678,12 +1678,15 @@ impl MxWindow {
                     }
                     MatrixEvent::ReactionUpdate { room_id, event_id, reactions } => {
                         let current = window.imp().current_room_id.borrow().clone();
+                        tracing::debug!("ReactionUpdate: room={room_id} current={current:?} target={event_id}");
                         if current.as_deref() == Some(&room_id) {
                             for (emoji, _count, senders) in &reactions {
                                 for sender in senders {
                                     message_view.add_reaction(&event_id, emoji, sender);
                                 }
                             }
+                        } else {
+                            tracing::debug!("ReactionUpdate skipped: not in that room");
                         }
                     }
                     MatrixEvent::ReactionNotification { room_id, room_name, reactor, emoji } => {
@@ -3656,8 +3659,14 @@ impl MxWindow {
         // Members list.
         if !meta.members.is_empty() {
             container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            // For large rooms we only show timeline participants, not all members.
+            let header_text = if meta.members_fetched {
+                format!("Members ({})", meta.members.len())
+            } else {
+                format!("Recent participants ({})", meta.members.len())
+            };
             let members_header = gtk::Label::builder()
-                .label(&format!("Members ({})", meta.members.len()))
+                .label(&header_text)
                 .css_classes(["heading", "caption"])
                 .halign(gtk::Align::Start)
                 .build();

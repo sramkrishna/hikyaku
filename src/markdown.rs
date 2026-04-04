@@ -223,7 +223,7 @@ pub fn html_to_segments(html: &str) -> Vec<Segment> {
             if in_pre {
                 pre_content.push_str(&decoded);
             } else {
-                text_buf.push_str(&escape_text(&decoded));
+                text_buf.push_str(&linkify_urls(&escape_text(&decoded)));
             }
         }
     }
@@ -325,6 +325,33 @@ pub(crate) fn escape_text(s: &str) -> String {
      .replace('>', "&gt;")
 }
 
+/// Convert bare http/https URLs in already-escaped Pango markup text into
+/// `<a href="…">…</a>` links.  Input must already be XML-escaped (& → &amp;
+/// etc.) so that URL characters are intact but no literal `<`/`>` remain.
+pub(crate) fn linkify_urls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(start) = rest.find("http") {
+        let candidate = &rest[start..];
+        if !candidate.starts_with("https://") && !candidate.starts_with("http://") {
+            result.push_str(&rest[..start + 4]);
+            rest = &rest[start + 4..];
+            continue;
+        }
+        result.push_str(&rest[..start]);
+        // Stop at whitespace or literal < / > (there are none after escape_text,
+        // but guard against double-calls or future callers).
+        let url_end = candidate
+            .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
+            .unwrap_or(candidate.len());
+        let url = &candidate[..url_end];
+        result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
+        rest = &candidate[url_end..];
+    }
+    result.push_str(rest);
+    result
+}
+
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;")
      .replace('<', "&lt;")
@@ -364,5 +391,34 @@ mod tests {
     fn test_link() {
         let segs = html_to_segments("<a href=\"https://example.com\">click</a>");
         assert!(matches!(&segs[0], Segment::Text(t) if t.contains("href=\"https://example.com\"")));
+    }
+
+    #[test]
+    fn test_bare_url_in_html_text_is_linkified() {
+        // A bare URL in the text content of HTML (no <a> tag) should be linkified.
+        let segs = html_to_segments("Check out https://example.com for details");
+        assert!(matches!(&segs[0], Segment::Text(t) if t.contains("href=\"https://example.com\"")),
+            "bare URL should be wrapped in <a href>");
+    }
+
+    #[test]
+    fn test_bare_url_in_paragraph_is_linkified() {
+        // pulldown_cmark wraps plain text in <p>; the stripped result is bare text.
+        let segs = html_to_segments("why no link? - https://github.com/foo/bar#section");
+        assert!(matches!(&segs[0], Segment::Text(t) if t.contains("href=\"https://github.com/foo/bar#section\"")),
+            "URL with fragment should be linkified");
+    }
+
+    #[test]
+    fn test_linkify_urls_basic() {
+        let out = linkify_urls("see https://example.com here");
+        assert!(out.contains("<a href=\"https://example.com\">https://example.com</a>"));
+    }
+
+    #[test]
+    fn test_linkify_urls_no_false_positive() {
+        // "http" that is not a proper URL prefix should not be linkified.
+        let out = linkify_urls("not a link: httpx://foo");
+        assert!(!out.contains("<a"), "httpx:// should not be linkified");
     }
 }

@@ -1419,7 +1419,11 @@ impl MessageView {
         // O(1) lookup via event_index — no list_store scan.
         let msg = match imp.event_index.borrow().get(event_id).cloned() {
             Some(m) => m,
-            None => return,
+            None => {
+                tracing::debug!("update_message_in_place: {event_id} not in event_index (room={})",
+                    imp.current_room_id.borrow());
+                return;
+            }
         };
         mutate(&msg);
         // Walk only the currently-visible rows (typically ~10-20 widgets, not
