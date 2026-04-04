@@ -2542,10 +2542,20 @@ impl MxWindow {
         imp.room_list_view.connect_bookmarks_activated(move || {
             let Some(window) = window_weak.upgrade() else { return };
             let imp = window.imp();
-            imp.bookmarks_overview.reload_messages();
-            imp.bookmarks_overview.clear_search();
-            // Rebuild favourite room cards with current registry objects.
-            {
+            // Open the sheet first so libadwaita can start the slide-up animation
+            // immediately. Heavy work (file I/O + widget construction) is deferred
+            // to an idle callback so it doesn't block the first animation frame.
+            if let Some(sheet) = imp.bookmarks_sheet.get() {
+                imp.bookmarks_overview.set_height_request(window.height());
+                sheet.set_open(true);
+            }
+            let window_weak2 = window.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(window) = window_weak2.upgrade() else { return };
+                let imp = window.imp();
+                imp.bookmarks_overview.reload_messages();
+                imp.bookmarks_overview.clear_search();
+                // Rebuild favourite room cards with current registry objects.
                 let registry = imp.room_list_view.imp().room_registry.borrow();
                 let cached = imp.room_list_view.imp().cached_rooms.borrow();
                 let mut favs: Vec<crate::models::RoomObject> = cached.iter()
@@ -2554,11 +2564,7 @@ impl MxWindow {
                     .collect();
                 favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
                 imp.bookmarks_overview.set_favourite_rooms(&favs);
-            }
-            if let Some(sheet) = imp.bookmarks_sheet.get() {
-                imp.bookmarks_overview.set_height_request(window.height());
-                sheet.set_open(true);
-            }
+            });
         });
 
         // Bookmarks overlay closed → slide down, switch sidebar to messages.

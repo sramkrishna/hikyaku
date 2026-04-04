@@ -92,6 +92,10 @@ mod imp {
         #[template_child]
         pub body_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub system_event_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub divider_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub body_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub reply_box: TemplateChild<gtk::Box>,
@@ -942,20 +946,15 @@ impl MessageRow {
         let show_media = !ctx.no_media;
 
         // System event row — join/leave/invite/kick/ban inline text.
+        // Use pre-allocated system_event_label to avoid widget construction on scroll.
         if msg.is_system_event() {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
             imp.body_label.set_visible(false);
-            clear_body_box(&imp.body_box);
-            imp.body_box.set_visible(true);
-            let lbl = gtk::Label::builder()
-                .label(&body)
-                .halign(gtk::Align::Center)
-                .selectable(false)
-                .hexpand(true)
-                .css_classes(["dim-label", "caption", "message-system-event"])
-                .build();
-            imp.body_box.append(&lbl);
+            imp.body_box.set_visible(false);
+            imp.divider_label.set_visible(false);
+            imp.system_event_label.set_text(&body);
+            imp.system_event_label.set_visible(true);
             imp.reply_box.set_visible(false);
             imp.thread_icon.set_visible(false);
             imp.reactions_box.set_visible(false);
@@ -967,22 +966,17 @@ impl MessageRow {
         }
         // Reset system event styling.
         self.remove_css_class("message-system-event");
+        imp.system_event_label.set_visible(false);
 
         // Divider row — "New messages" separator, not a real message.
+        // Use pre-allocated divider_label to avoid widget construction on scroll.
         if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
             imp.body_label.set_visible(false);
-            clear_body_box(&imp.body_box);
-            imp.body_box.set_visible(true);
-            let lbl = gtk::Label::builder()
-                .label(&body)
-                .halign(gtk::Align::Center)
-                .selectable(false)
-                .hexpand(true)
-                .css_classes(["dim-label", "caption"])
-                .build();
-            imp.body_box.append(&lbl);
+            imp.body_box.set_visible(false);
+            imp.divider_label.set_text(&body);
+            imp.divider_label.set_visible(true);
             imp.reply_box.set_visible(false);
             imp.thread_icon.set_visible(false);
             imp.reactions_box.set_visible(false);
@@ -992,6 +986,7 @@ impl MessageRow {
             return;
         }
         // Reset divider styling if this row was previously a divider.
+        imp.divider_label.set_visible(false);
         self.remove_css_class("message-divider");
         imp.sender_label.set_visible(true);
         imp.timestamp_label.set_visible(true);

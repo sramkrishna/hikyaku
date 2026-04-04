@@ -3366,15 +3366,15 @@ async fn handle_select_room_bg(
 
         let make_msg_options = || {
             let mut f = RoomEventFilter::default();
-            // Reactions are intentionally excluded here: they count against the
-            // limit but produce no visible messages.  In an active room with many
-            // reactions, including them would halve (or worse) the number of
-            // visible messages shown on first load.  Reactions that arrive while
-            // the room is open come in via the live sync path (ReactionAdded event)
-            // and are applied in-place, so nothing is lost for currently-open rooms.
+            // Include m.reaction so the reaction_map is populated and reactions
+            // are stored in the disk cache.  Without this, historical reactions
+            // (added before the current session) are never shown.  In practice
+            // reactions are sparse — even in active rooms they rarely exceed
+            // 10-15% of events, so the effective message count stays ~85+/100.
             f.types = Some(vec![
                 "m.room.message".to_string(),
                 "m.room.encrypted".to_string(),
+                "m.reaction".to_string(),
             ]);
             let mut o = matrix_sdk::room::MessagesOptions::backward();
             o.limit = UInt::from(100u32);
@@ -3724,16 +3724,28 @@ async fn handle_select_room_bg(
                 if existing.is_empty() {
                     all_messages.clone()
                 } else {
-                    // Union by event_id: existing messages win on duplicates so
-                    // any local edits/state are preserved.  Sort chronologically.
+                    // Union by event_id: memory wins for body/sender so local
+                    // edits are preserved, but reactions come from the server
+                    // (authoritative source).  Sort chronologically.
                     let mut by_id: std::collections::HashMap<String, crate::matrix::MessageInfo> =
                         std::collections::HashMap::new();
-                    for m in existing.into_iter().chain(all_messages.clone()) {
-                        if m.event_id.is_empty() {
-                            // No event_id (local echo etc.) — skip dedup.
-                            continue;
-                        }
-                        by_id.entry(m.event_id.clone()).or_insert(m);
+                    // Insert memory messages first.
+                    for m in existing.into_iter() {
+                        if m.event_id.is_empty() { continue; }
+                        by_id.insert(m.event_id.clone(), m);
+                    }
+                    // Overlay server messages: memory wins for text, server wins
+                    // for reactions (which the disk cache never stored until now).
+                    for m in all_messages.clone() {
+                        if m.event_id.is_empty() { continue; }
+                        by_id.entry(m.event_id.clone())
+                            .and_modify(|existing| {
+                                // Take server reactions if present; keep memory body.
+                                if !m.reactions.is_empty() {
+                                    existing.reactions = m.reactions.clone();
+                                }
+                            })
+                            .or_insert(m);
                     }
                     let mut merged: Vec<crate::matrix::MessageInfo> =
                         by_id.into_values().collect();

@@ -70,8 +70,27 @@ template $MxMessageRow : Gtk.Box {
       styles ["mx-message-body"]
     }
 
-    // Body content — used only for HTML/code-block messages and special rows
-    // (system events, dividers). Hidden when body_label is active.
+    // Pre-allocated label for system events (join/leave/invite/kick/ban).
+    // Updated in-place in bind to avoid widget construction on scroll.
+    Gtk.Label system_event_label {
+      halign: center;
+      hexpand: true;
+      selectable: false;
+      visible: false;
+      styles ["dim-label", "caption", "message-system-event"]
+    }
+
+    // Pre-allocated label for the "New messages" divider row.
+    Gtk.Label divider_label {
+      halign: center;
+      hexpand: true;
+      selectable: false;
+      visible: false;
+      styles ["dim-label", "caption"]
+    }
+
+    // Body content — used only for HTML/code-block messages.
+    // Hidden when body_label, system_event_label, or divider_label is active.
     Gtk.Box body_box {
       orientation: vertical;
       spacing: 4;

@@ -1601,58 +1601,107 @@ impl MessageView {
         }
 
         if !first_load {
-            // bg_refresh: skip the expensive full-list splice when nothing changed.
-            // Check ALL incoming messages — not just the newest — because sync-gap
-            // messages arrive in the middle of the window (older than the already-known
-            // newest event), so a last()-only check produces a false negative and the
-            // user sees missing messages.
-            let has_new = messages.iter().any(|m| {
-                !m.event_id.is_empty() && !imp.event_index.borrow().contains_key(&m.event_id)
-            });
-            // Detect edits (including UTD→decrypted transitions): same event_id
-            // in index but body or formatted_body changed.
-            let has_edit = messages.iter().any(|m| {
-                if m.event_id.is_empty() { return false; }
-                imp.event_index.borrow()
-                    .get(&m.event_id)
-                    .map(|obj| obj.body() != m.body
-                        || obj.formatted_body() != m.formatted_body.as_deref().unwrap_or(""))
-                    .unwrap_or(false)
-            });
-            // Detect redactions: event_id in index but absent from the fresh batch.
-            let incoming_ids: std::collections::HashSet<&str> =
-                messages.iter().filter(|m| !m.event_id.is_empty())
-                    .map(|m| m.event_id.as_str()).collect();
-            let has_redaction = imp.event_index.borrow().keys()
-                .filter(|k| k.as_str() != "__unread_divider__")
-                .any(|k| !incoming_ids.contains(k.as_str()));
-            if !has_new && !has_edit && !has_redaction {
-                // No new messages to splice — but still insert the divider if needed.
-                // This path is hit when the disk cache already contains the unread
-                // messages (bg_refresh fetches the same window), so the splice skips
-                // but set_room_meta has already set room_unread_count > 0.
-                // No-splice bg_refresh: only insert divider if this is effectively
-                // still the first view (disk cache path sets first_load=true, then
-                // bg_refresh hits this branch with first_load=false but the divider
-                // hasn't been placed yet because the disk-load set_messages was the
-                // first_load call). Guard: don't re-insert once divider is present.
-                let unread = imp.room_unread_count.get();
-                let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
-                if !divider_in_list && unread > 0 {
-                    let fully_read = imp.fully_read_event_id.borrow().clone();
-                    tracing::info!(
-                        "Divider check (no-splice): unread={unread}, fully_read={fully_read:?}"
-                    );
-                    let placed = fully_read
-                        .as_deref()
-                        .map(|eid| self.insert_divider_after_event(eid))
-                        .unwrap_or(false);
-                    if !placed {
-                        self.insert_divider_by_count(unread);
+            // bg_refresh: always do incremental updates — never a full-replace splice.
+            //
+            // Full splice (splice(0, N, &objs)) on an occupied list_store takes 300ms–3s
+            // regardless of bind cost.  Instead:
+            //   • New messages  → append to end (server always returns latest-first).
+            //   • Edits/UTD     → update GObject properties in-place via update_message_body.
+            //   • Redactions    → NOT detected here; handled by MatrixEvent::MessageRedacted.
+            //     (The server fetch window may return fewer events than the disk cache holds —
+            //      treating that difference as redactions was the original false-positive source.)
+
+            // Collect new messages (not yet in the displayed list).
+            let new_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
+                .filter(|m| !m.event_id.is_empty()
+                    && !imp.event_index.borrow().contains_key(&m.event_id))
+                .collect();
+
+            // Collect changed messages (body, formatted_body, or reactions differ).
+            let edited_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
+                .filter(|m| {
+                    if m.event_id.is_empty() { return false; }
+                    let incoming_reactions = serde_json::to_string(&m.reactions).unwrap_or_default();
+                    imp.event_index.borrow()
+                        .get(&m.event_id)
+                        .map(|obj| obj.body() != m.body
+                            || obj.formatted_body() != m.formatted_body.as_deref().unwrap_or("")
+                            || obj.reactions_json() != incoming_reactions)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            // Apply changes in-place — O(visible_rows) per message, no splice needed.
+            for m in &edited_msgs {
+                let incoming_reactions = serde_json::to_string(&m.reactions).unwrap_or_default();
+                self.update_message_in_place(&m.event_id, |obj| {
+                    obj.set_body(m.body.clone());
+                    obj.set_formatted_body(m.formatted_body.as_deref().unwrap_or("").to_string());
+                    obj.set_reactions_json(incoming_reactions.clone());
+                });
+            }
+
+            // Insert new messages at the correct timestamp position.
+            // new_msgs is already sorted oldest→newest (inherited from the sorted `messages`
+            // parameter).  For each one, binary-search the list_store to find where its
+            // timestamp belongs so that gap-fill messages (older than the newest in the
+            // list) land in the right place rather than at the end.
+            // Common case: all new messages are newer → every insert is an O(1) append.
+            if !new_msgs.is_empty() {
+                let list_store = imp.list_store();
+                let mut any_at_end = false;
+                {
+                    let mut idx = imp.event_index.borrow_mut();
+                    for m in &new_msgs {
+                        let obj = Self::info_to_obj(m);
+                        let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
+                        let n = list_store.n_items();
+                        if pos >= n {
+                            list_store.append(&obj);
+                            any_at_end = true;
+                        } else {
+                            list_store.splice(pos, 0, &[obj.clone().upcast::<glib::Object>()]);
+                        }
+                        if !obj.event_id().is_empty() {
+                            idx.insert(obj.event_id(), obj);
+                        }
                     }
                 }
-                return;
+                // Only scroll to bottom if at least one message was added at the end
+                // (i.e. new arrivals, not gap-fill).  Avoid disrupting the user's
+                // reading position when old gap messages are inserted in the middle.
+                if any_at_end {
+                    let view_weak = self.downgrade();
+                    glib::idle_add_local_once(move || {
+                        let Some(view) = view_weak.upgrade() else { return };
+                        view.scroll_to_bottom();
+                    });
+                }
             }
+
+            tracing::info!(
+                "set_messages: incremental new={} edits={} room={}",
+                new_msgs.len(), edited_msgs.len(),
+                imp.current_room_id.borrow()
+            );
+
+            // Insert divider if needed (same logic as the no-change path).
+            let unread = imp.room_unread_count.get();
+            let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
+            if !divider_in_list && unread > 0 {
+                let fully_read = imp.fully_read_event_id.borrow().clone();
+                tracing::info!(
+                    "Divider check (incremental): unread={unread}, fully_read={fully_read:?}"
+                );
+                let placed = fully_read
+                    .as_deref()
+                    .map(|eid| self.insert_divider_after_event(eid))
+                    .unwrap_or(false);
+                if !placed {
+                    self.insert_divider_by_count(unread);
+                }
+            }
+            return; // Never fall through to the full-replace splice below.
         }
 
         let _t1 = std::time::Instant::now();
@@ -1818,6 +1867,31 @@ impl MessageView {
     }
 
     /// Walk a widget tree to find a MessageRow child.
+    /// Binary-search the list_store (sorted oldest→newest by timestamp) for the
+    /// first position whose item's timestamp is strictly greater than `ts`.
+    /// Inserting at this position keeps the list sorted.
+    /// Returns list_store.n_items() when `ts` is ≥ everything (append case).
+    fn sorted_insert_pos(list_store: &gio::ListStore, ts: u64) -> u32 {
+        use gio::prelude::ListModelExt;
+        let n = list_store.n_items();
+        if n == 0 { return 0; }
+        let mut lo = 0u32;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let item_ts = list_store.item(mid)
+                .and_downcast::<crate::models::MessageObject>()
+                .map(|o| o.timestamp())
+                .unwrap_or(0);
+            if item_ts <= ts {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     fn find_message_row(widget: &gtk::Widget) -> Option<crate::widgets::message_row::MessageRow> {
         use crate::widgets::message_row::MessageRow;
         if let Some(row) = widget.downcast_ref::<MessageRow>() {
