@@ -1534,13 +1534,23 @@ impl MxWindow {
                                     .collect()
                             };
 
-                            // For bg_refresh results, defer the splice to an idle
-                            // callback so the GTK frame (and selection highlight) can
-                            // render before the potentially-expensive items_changed fires.
+                            // For bg_refresh results, defer the splice to an idle so
+                            // the GTK frame (and selection highlight) renders first.
+                            // Re-check the current room inside the idle: a stale idle
+                            // that fires after the user has switched rooms would otherwise
+                            // splice the wrong data into the new room's list_store.
                             if is_background {
                                 let mv = message_view.clone();
+                                let weak_win = window.downgrade();
+                                let guard_rid = room_id.clone();
                                 glib::idle_add_local_once(move || {
-                                    mv.set_messages(&messages, prev_batch_token);
+                                    let still_here = weak_win.upgrade()
+                                        .map(|w| w.imp().current_room_id.borrow()
+                                            .as_deref() == Some(&guard_rid))
+                                        .unwrap_or(false);
+                                    if still_here {
+                                        mv.set_messages(&messages, prev_batch_token);
+                                    }
                                 });
                             } else {
                                 message_view.set_messages(&messages, prev_batch_token);
