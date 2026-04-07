@@ -174,7 +174,7 @@ mod imp {
                 on_join_rooms: Rc::new(RefCell::new(None)),
 
                 on_ai_setup: Rc::new(RefCell::new(None)),
-                ai_selected_model: Rc::new(RefCell::new("llama3.2".to_string())),
+                ai_selected_model: Rc::new(RefCell::new("qwen2.5:3b".to_string())),
 
                 on_finish: Rc::new(RefCell::new(None)),
 
@@ -958,13 +958,12 @@ mod imp {
             vbox.append(&ai_group);
 
             // Model picker — only visible when switch is on.
-            // llama3.2 is the best balance for this use case; more accurate than
-            // smaller models and fast enough on modest hardware.
             const MODELS: &[(&str, &str)] = &[
-                ("llama3.2", "Best balance of accuracy and size — recommended"),
-                ("mistral",  "Larger 7B model, higher accuracy, needs more RAM"),
-                ("phi4-mini","Smallest model, lowest RAM usage"),
-                ("gemma3",   "Google's open model"),
+                ("qwen2.5:3b", "Best balance of accuracy and size — recommended"),
+                ("llama3.2",   "Meta's 3B model, good general-purpose chat"),
+                ("mistral",    "Larger 7B model, higher accuracy, needs more RAM"),
+                ("phi4-mini",  "Smallest model, lowest RAM usage"),
+                ("gemma3",     "Google's open model"),
             ];
 
             let model_list = gtk::StringList::new(&[]);

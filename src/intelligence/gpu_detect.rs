@@ -32,9 +32,9 @@ pub fn detect_gpu() -> Option<GpuInfo> {
 pub fn suggested_model(gpu: Option<&GpuInfo>) -> &'static str {
     let vram = gpu.and_then(|g| g.vram_mib);
     match vram {
-        Some(v) if v >= 8192 => "mistral",     // 8 GB+: mistral 7B fits well
-        Some(v) if v >= 4096 => "llama3.2",    // 4–8 GB: llama3.2 3B is the sweet spot
-        _ => "llama3.2",                        // CPU/iGPU: llama3.2 3B is the best quality/size tradeoff
+        Some(v) if v >= 8192 => "mistral",       // 8 GB+: mistral 7B fits well
+        Some(v) if v >= 4096 => "qwen2.5:3b",  // 4–8 GB: qwen2.5 3B is the sweet spot
+        _ => "qwen2.5:3b",                      // CPU/iGPU: qwen2.5 3B best quality/size tradeoff
     }
 }
 
