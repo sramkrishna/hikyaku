@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>me.ramkrishna.hikyaku</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Hikyaku</name>
+  <summary>Matrix chat client with activity awareness</summary>
+
+  <description>
+    <p>
+      Hikyaku is a Matrix chat client for GNOME built around activity awareness.
+      It helps you stay on top of conversations by surfacing the rooms and direct
+      messages that matter most, and lets an on-device AI assistant answer
+      questions about Matrix and summarize room conversations — all without your
+      data leaving your device.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>End-to-end encrypted messaging with key backup and recovery</li>
+      <li>Direct messages and group rooms with space organisation</li>
+      <li>On-device AI assistant powered by Ollama (optional)</li>
+      <li>Message bookmarks and room pinning</li>
+      <li>Spell-check and rich text rendering</li>
+      <li>@mention notifications and unread badges</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">me.ramkrishna.hikyaku.desktop</launchable>
+
+  <url type="homepage">https://github.com/ramkrishna/hikyaku</url>
+  <url type="bugtracker">https://github.com/ramkrishna/hikyaku/issues</url>
+
+  <developer id="me.ramkrishna">
+    <name>Sriram Ramkrishna</name>
+  </developer>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#3584e4</color>
+    <color type="primary" scheme_preference="dark">#1c71d8</color>
+  </branding>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Main chat view with room list</caption>
+      <image>https://raw.githubusercontent.com/ramkrishna/hikyaku/main/docs/screenshots/main.png</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.1.0" date="2026-04-07">
+      <description>
+        <p>Initial release of Hikyaku.</p>
+      </description>
+    </release>
+  </releases>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </recommends>
+</component>

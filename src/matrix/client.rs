@@ -2226,13 +2226,18 @@ async fn start_sync(
     let mut cached_rooms = collect_room_info(&client, Some(&room_timestamps)).await;
     if !cached_rooms.is_empty() {
         // Apply cached timestamps so rooms sort correctly from the start.
-        // Fresh data from collect_room_info wins; cache is fallback only.
+        // Merge timestamps: take the MAX of what collect_room_info found
+        // (from latest_event()) and what the disk cache recorded (from the
+        // previous session's backfill/sync).  This prevents a dormant room
+        // whose latest_event() returns a months-old event from overwriting a
+        // newer value that was captured by the sync-response extractor.
         {
             let mut ts_map = room_timestamps.lock().unwrap();
             for room in &mut cached_rooms {
-                if room.last_activity_ts > 0 {
+                let cached = ts_map.get(&room.room_id).copied().unwrap_or(0);
+                if room.last_activity_ts > cached {
                     ts_map.insert(room.room_id.clone(), room.last_activity_ts);
-                } else if let Some(&cached) = ts_map.get(&room.room_id) {
+                } else if cached > 0 {
                     room.last_activity_ts = cached;
                 }
             }
@@ -3023,9 +3028,10 @@ async fn start_sync(
                                 let mut ts_map = bg_ts.lock().unwrap();
                                 let mut patched = 0u32;
                                 for room in &mut rooms {
-                                    if room.last_activity_ts > 0 {
+                                    let cached = ts_map.get(&room.room_id).copied().unwrap_or(0);
+                                    if room.last_activity_ts > cached {
                                         ts_map.insert(room.room_id.clone(), room.last_activity_ts);
-                                    } else if let Some(&cached) = ts_map.get(&room.room_id) {
+                                    } else if cached > 0 {
                                         room.last_activity_ts = cached;
                                         patched += 1;
                                     }
@@ -5466,6 +5472,30 @@ async fn warmup_ollama_model(endpoint: &str, model: &str) {
     // Ensure Ollama is running before attempting warmup.
     if !ensure_ollama_running_tokio(endpoint).await {
         tracing::warn!("Warmup: Ollama not reachable at {endpoint}");
+        return;
+    }
+
+    // Check that the model is actually downloaded before trying to load it.
+    // Ollama returns 404 on /api/chat when the model doesn't exist locally —
+    // this is expected if the user enabled AI but hasn't pulled the model yet.
+    let tags_url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+    let model_available = match ollama_client().get(&tags_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<serde_json::Value>().await
+                .ok()
+                .and_then(|v| v.get("models")?.as_array().cloned())
+                .map(|models| models.iter().any(|m| {
+                    m.get("name").and_then(|n| n.as_str())
+                        .map(|n| n == model || n.starts_with(&format!("{model}:")))
+                        .unwrap_or(false)
+                }))
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+
+    if !model_available {
+        tracing::debug!("Warmup: model '{model}' not yet downloaded, skipping");
         return;
     }
 

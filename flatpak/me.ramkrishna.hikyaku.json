@@ -82,6 +82,7 @@
         "cargo build --release --locked --no-default-features --features rolodex,pinning,motd,ai-flatpak",
         "install -Dm755 target/release/hikyaku /app/bin/hikyaku",
         "install -Dm644 data/me.ramkrishna.hikyaku.desktop /app/share/applications/me.ramkrishna.hikyaku.desktop",
+        "install -Dm644 data/me.ramkrishna.hikyaku.metainfo.xml /app/share/metainfo/me.ramkrishna.hikyaku.metainfo.xml",
         "install -Dm644 data/me.ramkrishna.hikyaku.gschema.xml /app/share/glib-2.0/schemas/me.ramkrishna.hikyaku.gschema.xml",
         "install -Dm644 data/icons/hicolor/scalable/apps/me.ramkrishna.hikyaku.svg /app/share/icons/hicolor/scalable/apps/me.ramkrishna.hikyaku.svg",
         "install -Dm644 data/icons/hicolor/scalable/actions/mention-symbolic.svg /app/share/icons/hicolor/scalable/actions/mention-symbolic.svg",

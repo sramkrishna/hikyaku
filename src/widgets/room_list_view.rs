@@ -1277,6 +1277,11 @@ impl RoomListView {
         // user is waiting for DMs to appear, so we render them first.
         let dm_ids: Vec<String> = dms.iter().map(|r| r.room_id.clone()).collect();
         if *imp.last_dm_order.borrow() != dm_ids {
+            // Log the top DMs for diagnosing sort regressions.
+            let dm_preview: Vec<(&str, u64)> = dms.iter().take(5)
+                .map(|r| (r.name.as_str(), r.last_activity_ts))
+                .collect();
+            tracing::debug!("rebuild_stores: DM order (top 5): {:?}", dm_preview);
             let objects: Vec<RoomObject> = dms.iter().map(|r| lookup(r)).collect();
             let _td = std::time::Instant::now();
             Self::patch_store(&imp.dm_store, &objects);
