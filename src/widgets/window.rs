@@ -97,6 +97,10 @@ mod imp {
         /// The ticker checks this before scheduling a new idle so that at most
         /// one update is in-flight per timeslice — prevents stacking.
         pub rooms_idle_pending: Cell<bool>,
+        /// True until the first RoomListUpdated after SyncStarted arrives.
+        /// NewMessage notifications are suppressed during this window to prevent
+        /// spam from historical catchup messages on first login.
+        pub initial_sync_done: Cell<bool>,
         /// Full-window bookmarks overview (Ptyxis-style card grid).
         pub bookmarks_overview: BookmarksOverview,
         /// Bottom sheet that slides the bookmarks overview over the main view.
@@ -198,6 +202,7 @@ mod imp {
                 hover_pulse_timer: RefCell::new(None),
                 pending_rooms: RefCell::new(None),
                 rooms_idle_pending: Cell::new(false),
+                initial_sync_done: Cell::new(false),
                 bookmarks_overview: BookmarksOverview::new(),
                 bookmarks_sheet: OnceCell::new(),
                 pending_flash_event_id: RefCell::new(None),
@@ -710,8 +715,34 @@ impl MxWindow {
         // Verification callbacks.
         {
             let cmd_tx = command_tx.clone();
+            let window_ref = window.clone();
             imp.login_page.connect_verify_with_device(move || {
+                let w = window_ref.clone();
+                // Guard: if a verification dialog is already open, do nothing.
+                // Without this, a second tap would cancel the in-progress request.
+                if w.imp().verify_dialog.borrow().is_some() {
+                    return;
+                }
                 let tx = cmd_tx.clone();
+                let dialog = crate::widgets::verification_dialog::show_waiting_dialog(
+                    &w, tx.clone(),
+                );
+                let window_weak = w.downgrade();
+                let tx2 = tx.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if let Some(win) = window_weak.upgrade() {
+                        win.imp().verify_dialog.replace(None);
+                        if response == "cancel" {
+                            let tx = tx2.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::CancelVerification {
+                                    flow_id: String::new(),
+                                }).await;
+                            });
+                        }
+                    }
+                });
+                w.imp().verify_dialog.replace(Some(dialog));
                 glib::spawn_future_local(async move {
                     let _ = tx.send(MatrixCommand::RequestSelfVerification).await;
                 });
@@ -1565,6 +1596,8 @@ impl MxWindow {
                     }
                     MatrixEvent::SyncStarted => {
                         tracing::info!("Initial sync started…");
+                        // Reset catchup guard — suppress notifications until first room list arrives.
+                        window.imp().initial_sync_done.set(false);
                         // Preload the Ollama model in the background so the
                         // first Ctrl+click doesn't pay the full load penalty.
                         let ollama_cfg = crate::config::settings().ollama;
@@ -1583,6 +1616,8 @@ impl MxWindow {
                         toast_error(&toast_overlay, "Sync error", &error);
                     }
                     MatrixEvent::RoomListUpdated { rooms } => {
+                        // First room list after sync = catchup complete.
+                        window.imp().initial_sync_done.set(true);
                         // Store the latest snapshot; the 50 ms ticker drains it.
                         // Multiple events arriving within one timeslice are
                         // coalesced — only the newest snapshot is kept.
@@ -1770,7 +1805,10 @@ impl MxWindow {
 
                         // Delegate all in-app banner + desktop notification logic
                         // to the NotificationManager, which checks UX state internally.
-                        if !is_self && (is_mention || is_dm) {
+                        // Skip notifications until the first room list arrives — those
+                        // are historical catchup messages the user has already seen.
+                        let sync_done = window.imp().initial_sync_done.get();
+                        if !is_self && sync_done && (is_mention || is_dm) {
                             window.imp().notification_manager.push(
                                 &room_id,
                                 &room_name,
@@ -1864,7 +1902,7 @@ impl MxWindow {
                         }
                         window.imp().verify_banner.set_revealed(false);
                         let toast = adw::Toast::builder()
-                            .title("Device verified! Recover your key backup to decrypt older messages.")
+                            .title("Device verified! To decrypt your full message history, use Recover Keys.")
                             .button_label("Recover Keys")
                             .action_name("win.recover-keys")
                             .timeout(30)
@@ -2267,6 +2305,9 @@ impl MxWindow {
 
     fn show_login(&self) {
         let imp = self.imp();
+        // Register window actions early so toast buttons (e.g. "Recover Keys")
+        // are live even before the main view is shown during the wizard flow.
+        self.setup_actions();
         imp.toolbar.set_content(Some(&imp.login_page));
     }
 
@@ -3137,6 +3178,7 @@ impl MxWindow {
 
         let join_action = ActionEntryBuilder::new("join-room")
             .activate(|window: &Self, _, _| {
+                if window.imp().content_page.get().is_none() { return; }
                 let tab = window.imp().room_list_view.visible_tab();
                 match tab.as_deref() {
                     Some("messages") => {
@@ -3179,6 +3221,7 @@ impl MxWindow {
 
         let prev_room_action = ActionEntryBuilder::new("prev-room")
             .activate(|window: &Self, _, _| {
+                if window.imp().content_page.get().is_none() { return; }
                 let imp = window.imp();
                 let current = imp.current_room_id.borrow().clone().unwrap_or_default();
                 imp.room_list_view.navigate_room(&current, -1);
@@ -3187,6 +3230,7 @@ impl MxWindow {
 
         let next_room_action = ActionEntryBuilder::new("next-room")
             .activate(|window: &Self, _, _| {
+                if window.imp().content_page.get().is_none() { return; }
                 let imp = window.imp();
                 let current = imp.current_room_id.borrow().clone().unwrap_or_default();
                 imp.room_list_view.navigate_room(&current, 1);

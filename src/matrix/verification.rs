@@ -9,7 +9,7 @@
 
 use async_channel::Sender;
 use matrix_sdk::encryption::verification::{
-    SasState, SasVerification, VerificationRequest,
+    SasState, SasVerification, Verification, VerificationRequest,
     VerificationRequestState,
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
@@ -348,7 +348,8 @@ async fn watch_request_state(
         match new_state {
             VerificationRequestState::Ready { .. } => {
                 tracing::info!("Verification {flow_id} ready, starting SAS");
-                // Start SAS from our side.
+                // Start SAS from our side. May return None if the other device
+                // already started it — in that case Transitioned fires instead.
                 match request.start_sas().await {
                     Ok(Some(sas)) => {
                         tracing::info!("SAS started for {flow_id}");
@@ -360,11 +361,28 @@ async fn watch_request_state(
                         return;
                     }
                     Ok(None) => {
-                        tracing::warn!("SAS not available for {flow_id}");
+                        // The other device started SAS first; we'll receive it
+                        // via the Transitioned state below.
+                        tracing::info!("SAS not started by us (other side started it); waiting for Transitioned");
                     }
                     Err(e) => {
                         tracing::error!("Failed to start SAS for {flow_id}: {e}");
                     }
+                }
+            }
+            VerificationRequestState::Transitioned { verification } => {
+                // The request transitioned to a concrete verification method —
+                // either because we called start_sas() or the other device did.
+                tracing::info!("Verification {flow_id} transitioned to concrete method");
+                if let Verification::SasV1(sas) = verification {
+                    if let Err(e) = sas.accept().await {
+                        tracing::error!("Failed to accept transitioned SAS: {e}");
+                        return;
+                    }
+                    watch_sas_state(sas, event_tx, state, flow_id).await;
+                    return;
+                } else {
+                    tracing::warn!("Verification {flow_id} transitioned to non-SAS method; ignoring");
                 }
             }
             VerificationRequestState::Done => {
