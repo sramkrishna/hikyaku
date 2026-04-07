@@ -43,13 +43,28 @@ pub(super) async fn setup_encryption(
     match enc.bootstrap_cross_signing_if_needed(None).await {
         Ok(()) => tracing::info!("Cross-signing ready (identity already existed)"),
         Err(e) => {
-            if let Some(uiaa) = e.as_uiaa_response() {
+            // Extract the UIAA session.  Conduit omits the required `params`
+            // field from its UIAA 401, so ruma falls back to ClientApi instead
+            // of Uiaa.  Try the proper path first, then fall back to raw JSON.
+            use matrix_sdk::ruma::api::client::error::ErrorBody;
+            let session = e.as_uiaa_response()
+                .and_then(|u| u.session.clone())
+                .or_else(|| {
+                    e.as_client_api_error()
+                        .filter(|ce| ce.status_code.as_u16() == 401)
+                        .and_then(|ce| match &ce.body {
+                            ErrorBody::Json(v) => v.get("session")?.as_str().map(str::to_owned),
+                            _ => None,
+                        })
+                });
+
+            if session.is_some() {
                 if let Some((username, password)) = login_creds {
                     let mut pw = Password::new(
                         UserIdentifier::UserIdOrLocalpart(username),
                         password,
                     );
-                    pw.session = uiaa.session.clone();
+                    pw.session = session;
                     match enc.bootstrap_cross_signing_if_needed(Some(AuthData::Password(pw))).await {
                         Ok(()) => {
                             tracing::info!("Cross-signing bootstrapped (new account, UIAA satisfied)");
@@ -100,6 +115,16 @@ pub(super) async fn setup_encryption(
         // self-signed.  No verification prompt needed — show a success hint instead.
         tracing::info!("Encryption bootstrapped — sending CrossSigningBootstrapped");
         let _ = event_tx.send(MatrixEvent::CrossSigningBootstrapped).await;
+
+        // Generate a recovery key for the new account and emit it so the UI
+        // can show the "Save Your Recovery Key" page.
+        match client.encryption().recovery().enable().await {
+            Ok(key) => {
+                tracing::info!("Recovery key generated for new account");
+                let _ = event_tx.send(MatrixEvent::RecoveryKeyGenerated { key }).await;
+            }
+            Err(e) => tracing::warn!("Recovery key generation failed: {e}"),
+        }
     } else if !is_verified {
         tracing::info!("Device not cross-verified — prompting user");
         let _ = event_tx.send(MatrixEvent::DeviceUnverified).await;

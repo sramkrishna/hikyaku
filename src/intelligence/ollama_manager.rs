@@ -160,3 +160,74 @@ pub fn stop() {
         tracing::info!("Managed Ollama stopped");
     }
 }
+
+/// Download the Ollama Linux binary to the managed path.
+/// `progress` is called with values in [0.0, 1.0].
+/// Used in Flatpak where the system Ollama is not available.
+pub async fn download_ollama_binary<F>(mut progress: F) -> Result<PathBuf, String>
+where
+    F: FnMut(f64) + 'static,
+{
+    let url = "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64";
+    let dest = managed_binary_path();
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directories: {e}"))?;
+    }
+
+    let session = soup::Session::new();
+    session.set_timeout(0); // no timeout for large download
+    let msg = soup::Message::new("GET", url)
+        .map_err(|e| format!("Bad URL: {e}"))?;
+
+    // Get the response input stream.
+    let stream = session
+        .send_future(&msg, glib::Priority::DEFAULT)
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    // Read content-length for progress (may be absent or -1).
+    let content_len = msg
+        .response_headers()
+        .map(|h| h.content_length())
+        .filter(|&n| n > 0)
+        .map(|n| n as u64)
+        .unwrap_or(0);
+
+    let mut bytes_read: u64 = 0;
+    let chunk_size: usize = 65536;
+    let mut data: Vec<u8> = Vec::new();
+
+    loop {
+        let buf = stream
+            .read_bytes_future(chunk_size, glib::Priority::DEFAULT)
+            .await
+            .map_err(|e| format!("Read error: {e}"))?;
+        if buf.is_empty() { break; }
+        bytes_read += buf.len() as u64;
+        data.extend_from_slice(&buf);
+        if content_len > 0 {
+            progress((bytes_read as f64) / (content_len as f64));
+        } else {
+            progress(-1.0); // indeterminate
+        }
+    }
+
+    std::fs::write(&dest, &data)
+        .map_err(|e| format!("Write failed: {e}"))?;
+
+    // Make the binary executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dest)
+            .map_err(|e| format!("stat failed: {e}"))?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dest, perms)
+            .map_err(|e| format!("chmod failed: {e}"))?;
+    }
+
+    tracing::info!("Ollama binary downloaded to {}", dest.display());
+    Ok(dest)
+}

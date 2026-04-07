@@ -31,7 +31,9 @@
     "append-path": "/usr/lib/sdk/rust-stable/bin",
     "env": {
       "CARGO_HOME": "/run/build/hikyaku/cargo",
-      "CARGO_NET_OFFLINE": "true"
+      "CARGO_NET_OFFLINE": "true",
+      "ORT_STRATEGY": "system",
+      "ORT_LIB_LOCATION": "/app/lib"
     }
   },
   "modules": [

@@ -634,6 +634,113 @@ impl MxWindow {
             });
         });
 
+        // Wire up register button.
+        let cmd_tx = command_tx.clone();
+        imp.login_page.connect_register_requested(move |hs, user, pass, display, email| {
+            let tx = cmd_tx.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::Register {
+                    homeserver: hs,
+                    username: user,
+                    password: pass,
+                    display_name: display,
+                    email,
+                }).await;
+            });
+        });
+
+        // Wire up recovery key save (best-effort — no save_recovery_key in session.rs yet).
+        imp.login_page.connect_save_recovery_key(|_key| {
+            // TODO: save recovery key to GNOME Keyring via session::save_recovery_key
+            tracing::info!("Recovery key save requested (not yet implemented)");
+        });
+
+        // Recovery key confirmed → fetch public rooms for the local-spaces wizard page.
+        {
+            let cmd_tx = command_tx.clone();
+            imp.login_page.connect_recovery_key_confirmed(move || {
+                let tx = cmd_tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::BrowsePublicRooms {
+                        search_term: None,
+                        spaces_only: true,
+                        server: None,
+                    }).await;
+                });
+            });
+        }
+
+        // Join rooms confirmed or skipped → send join commands (navigation continues to resources).
+        {
+            let cmd_tx = command_tx.clone();
+            imp.login_page.connect_join_rooms(move |room_aliases| {
+                let tx = cmd_tx.clone();
+                glib::spawn_future_local(async move {
+                    for alias in room_aliases {
+                        let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: alias }).await;
+                    }
+                });
+            });
+        }
+
+        // AI setup page → save settings; trigger model download after wizard if enabled.
+        imp.login_page.connect_ai_setup(|enabled, model| {
+            let gs = crate::config::gsettings();
+            let _ = gs.set_boolean("ollama-enabled", enabled);
+            let _ = gs.set_string("ollama-model", &model);
+            tracing::info!("Wizard AI setup: enabled={enabled}, model={model}");
+        });
+
+        // Get-started "Start Chatting" → enter the app, then start model download if needed.
+        {
+            let window_ref = window.clone();
+            imp.login_page.connect_finish(move || {
+                window_ref.show_main_view();
+                let cfg = crate::config::settings();
+                if cfg.ollama.enabled && !cfg.ollama.setup_done {
+                    let w = window_ref.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(800),
+                        move || show_ai_setup_dialog(&w),
+                    );
+                }
+            });
+        }
+
+        // Verification callbacks.
+        {
+            let cmd_tx = command_tx.clone();
+            imp.login_page.connect_verify_with_device(move || {
+                let tx = cmd_tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::RequestSelfVerification).await;
+                });
+            });
+        }
+        {
+            let cmd_tx = command_tx.clone();
+            let window_ref = window.clone();
+            let toast_ref = imp.toast_overlay.clone();
+            imp.login_page.connect_recover_with_key(move |key| {
+                toast(&toast_ref, "Recovering keys… this may take a minute.");
+                let tx = cmd_tx.clone();
+                let w = window_ref.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::RecoverKeys { recovery_key: key }).await;
+                    // After recovery, go to the main view (same as skip).
+                    w.show_main_view();
+                });
+            });
+        }
+        {
+            let window_ref = window.clone();
+            let toast_ref = imp.toast_overlay.clone();
+            imp.login_page.connect_skip_verification(move || {
+                toast(&toast_ref, "Encrypted messages will not be readable until you verify this device");
+                window_ref.show_main_view();
+            });
+        }
+
         // Wire up room selection → send SelectRoom command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
@@ -1407,17 +1514,14 @@ impl MxWindow {
                             window.show_login();
                         }
                     }
-                    MatrixEvent::LoginSuccess { display_name, user_id } => {
+                    MatrixEvent::LoginSuccess { display_name, user_id, from_registration, is_fresh_login } => {
                         // Clear first-start flag now that login succeeded.
                         let _ = crate::config::gsettings().set_boolean("first-start", false);
-                        let msg = format!("Logged in as {display_name}");
-                        toast(&toast_overlay, &msg);
                         login_page.stop_spinner();
-                        tracing::info!("{msg}");
+                        login_page.stop_register_spinner();
+                        tracing::info!("Logged in as {display_name} (from_registration={from_registration}, fresh={is_fresh_login})");
                         window.imp().user_id.replace(user_id.clone());
                         message_view.set_user_id(&user_id);
-                        // Highlight the user's display name, localpart, and
-                        // full user ID so mentions in any form get highlighted.
                         let localpart = user_id
                             .strip_prefix('@')
                             .and_then(|s| s.split(':').next())
@@ -1428,14 +1532,29 @@ impl MxWindow {
                             names.push(&localpart);
                         }
                         message_view.set_highlight_names(&names);
-                        window.show_main_view();
-                        // Show first-run AI setup if not yet done.
-                        if !crate::config::settings().ollama.setup_done {
-                            let w = window.clone();
-                            glib::timeout_add_local_once(
-                                std::time::Duration::from_millis(800),
-                                move || show_ai_setup_dialog(&w),
-                            );
+
+                        if from_registration {
+                            // Stay on the login page — the recovery key and
+                            // room suggestions wizard pages will follow via
+                            // RecoveryKeyGenerated and connect_join_rooms.
+                        } else if is_fresh_login {
+                            // Fresh interactive login — show verify-device page
+                            // so the user knows about encrypted rooms.
+                            login_page.show_verify_device();
+                        } else {
+                            // Restored session — go straight to the app.
+                            let msg = format!("Logged in as {display_name}");
+                            toast(&toast_overlay, &msg);
+                            window.show_main_view();
+                            // Show first-run AI setup only if AI is enabled and setup not yet done.
+                            let cfg = crate::config::settings();
+                            if cfg.ollama.enabled && !cfg.ollama.setup_done {
+                                let w = window.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(800),
+                                    move || show_ai_setup_dialog(&w),
+                                );
+                            }
                         }
                     }
                     MatrixEvent::LoginFailed { error } => {
@@ -1774,6 +1893,18 @@ impl MxWindow {
                     }
                     MatrixEvent::DeviceUnverified => {
                         window.imp().verify_banner.set_revealed(true);
+                        window.imp().login_page.show_verify_device();
+                    }
+                    MatrixEvent::RegistrationFailed { error } => {
+                        window.imp().login_page.stop_register_spinner();
+                        window.imp().login_page.show_register_error(&error);
+                    }
+                    MatrixEvent::RegistrationSuccess { .. } => {
+                        // LoginSuccess is sent by do_register via do_login; this variant
+                        // is reserved for future use.
+                    }
+                    MatrixEvent::RecoveryKeyGenerated { key } => {
+                        window.imp().login_page.show_recovery_key(&key);
                     }
                     MatrixEvent::RecoveryStarted => {
                         toast(&toast_overlay, "Recovering keys… this may take up to a minute.");
@@ -1801,11 +1932,16 @@ impl MxWindow {
                         toast_error(&toast_overlay, "Key recovery failed", &error);
                     }
                     MatrixEvent::BackupVersionMismatch => {
-                        toast_error(
-                            &toast_overlay,
-                            "Key backup not connected",
-                            "Use Recover Keys in the menu to reconnect your key backup and decrypt messages.",
-                        );
+                        // Suppress during onboarding — content_page is only
+                        // set after show_main_view(), so None means we're
+                        // still in the wizard/login flow.
+                        if window.imp().content_page.get().is_some() {
+                            toast_error(
+                                &toast_overlay,
+                                "Key backup not connected",
+                                "Use Recover Keys in the menu to reconnect your key backup and decrypt messages.",
+                            );
+                        }
                     }
                     MatrixEvent::StaleBackupDeleted => {
                         toast(&toast_overlay, "Stale backup cleared — click Recover Keys once more to connect.");
@@ -1966,7 +2102,29 @@ impl MxWindow {
                         }
                     }
                     MatrixEvent::PublicRoomDirectory { title, rooms } => {
-                        window.show_or_update_directory(&title, &rooms);
+                        // During onboarding the login page is the active content;
+                        // route results to the local-spaces wizard page instead of
+                        // the room browser.
+                        let login_page_widget: gtk::Widget = window.imp().login_page.clone().upcast();
+                        let toolbar_content = window.imp().toolbar.content();
+                        let in_onboarding = toolbar_content
+                            .as_ref()
+                            .map(|w| w == &login_page_widget)
+                            .unwrap_or(false);
+                        tracing::info!(
+                            "PublicRoomDirectory: {} rooms, in_onboarding={in_onboarding}, \
+                             toolbar_content={:?}",
+                            rooms.len(),
+                            toolbar_content.as_ref().map(|w| w.widget_name().to_string()),
+                        );
+                        if in_onboarding {
+                            let items: Vec<(String, String, String)> = rooms.iter()
+                                .map(|r| (r.room_id.clone(), r.name.clone(), r.topic.clone()))
+                                .collect();
+                            window.imp().login_page.show_local_spaces(items);
+                        } else {
+                            window.show_or_update_directory(&title, &rooms);
+                        }
                     }
                     MatrixEvent::SpaceDirectory { space_id: _, rooms } => {
                         window.show_space_directory("Space Rooms", &rooms);
@@ -3843,30 +4001,6 @@ impl MxWindow {
         let dialog = adw::PreferencesDialog::new();
         let cfg = config::settings().clone();
 
-        // --- Sync group ---
-        let sync_group = adw::PreferencesGroup::builder()
-            .title("Sync")
-            .description("Matrix sync settings (changes apply on restart)")
-            .build();
-
-        let timeline_row = adw::SpinRow::builder()
-            .title("Timeline Limit")
-            .subtitle("Events fetched per room during sync")
-            .adjustment(&gtk::Adjustment::new(
-                cfg.sync.timeline_limit as f64, 1.0, 50.0, 1.0, 5.0, 0.0,
-            ))
-            .build();
-        sync_group.add(&timeline_row);
-
-        let timeout_row = adw::SpinRow::builder()
-            .title("Sync Timeout")
-            .subtitle("Seconds to wait for sync response")
-            .adjustment(&gtk::Adjustment::new(
-                cfg.sync.timeout_secs as f64, 10.0, 300.0, 10.0, 30.0, 0.0,
-            ))
-            .build();
-        sync_group.add(&timeout_row);
-
         // --- Appearance group ---
         let appearance_group = adw::PreferencesGroup::builder()
             .title("Appearance")
@@ -4217,19 +4351,6 @@ impl MxWindow {
             sidebar_tint_row_for_clear.set_subtitle("None");
         });
 
-        // Nick colorize toggle.
-        let nick_row = adw::SwitchRow::builder()
-            .title("Colorize Sender Names")
-            .subtitle("Assign a consistent color to each person's name")
-            .active(cfg.appearance.colorize_nicks)
-            .build();
-        appearance_group.add(&nick_row);
-        nick_row.connect_active_notify(move |row| {
-            let mut new_cfg = config::settings().clone();
-            new_cfg.appearance.colorize_nicks = row.is_active();
-            let _ = config::save_settings(&new_cfg);
-        });
-
         // Bookmark highlight color row.
         let bm_row = adw::ActionRow::builder()
             .title("Bookmark Highlight Color")
@@ -4280,10 +4401,12 @@ impl MxWindow {
             let _ = config::save_settings(&new_cfg);
         });
 
-        // --- AI group ---
+        // --- AI group (lives on its own page, shown only when AI plugin is enabled) ---
+        #[cfg(feature = "ai")]
+        let (ai_page, extra_row) = {
         let ai_group = adw::PreferencesGroup::builder()
             .title("AI (Ollama)")
-            .description("Local LLM for room metrics summaries. No data leaves the machine.")
+            .description("Local LLM for room summaries. No data leaves the machine.")
             .build();
 
         // Status row — probed asynchronously when the dialog opens.
@@ -4311,13 +4434,6 @@ impl MxWindow {
             .css_classes(["pill"])
             .build();
         model_row.add_suffix(&pull_btn);
-
-        let ollama_enabled_row = adw::SwitchRow::builder()
-            .title("Enable AI Summaries")
-            .subtitle("Ctrl+click a room to get a topic summary")
-            .active(cfg.ollama.enabled)
-            .build();
-        ai_group.add(&ollama_enabled_row);
 
         ai_group.add(&endpoint_row);
         ai_group.add(&model_row);
@@ -4360,7 +4476,6 @@ impl MxWindow {
                 let mut new_cfg = config::settings().clone();
                 new_cfg.ollama.endpoint = row.text().to_string();
                 let _ = config::save_settings(&new_cfg);
-                // Reset status — will re-probe on next dialog open.
                 status_row.set_subtitle("Changed — reopen Preferences to check");
             });
         }
@@ -4402,7 +4517,6 @@ impl MxWindow {
                             ));
                         }
                     ).await;
-                    // Clear the progress background.
                     provider.load_from_data("button {}");
                     match result {
                         Ok(()) => btn.set_label("Done ✓"),
@@ -4416,60 +4530,21 @@ impl MxWindow {
             });
         }
 
-        let window_weak_ai = self.downgrade();
-        ollama_enabled_row.connect_active_notify(move |row| {
-            if row.is_active() {
-                // Warn the user before enabling — AI uses significant RAM.
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Enable AI Summaries?")
-                    .body(
-                        "AI summaries use a local language model via Ollama.\n\n\
-                         ⚠ AI responses can be inaccurate or misleading — \
-                         always verify important information yourself.\n\n\
-                         Loading the model requires several GB of RAM and may \
-                         temporarily slow your machine on first use. The model \
-                         stays loaded for 15 minutes after last use. Smaller \
-                         models (e.g. llama3.2:1b, qwen2.5:0.5b) load much \
-                         faster and use less memory.\n\n\
-                         Make sure Ollama is installed and the model is \
-                         downloaded before enabling this feature."
-                    )
-                    .close_response("cancel")
-                    .default_response("enable")
-                    .build();
-                dialog.add_response("cancel", "Cancel");
-                dialog.add_response("enable", "Enable");
-                dialog.set_response_appearance(
-                    "enable",
-                    adw::ResponseAppearance::Suggested,
-                );
-                let row_weak = row.downgrade();
-                dialog.connect_response(None, move |_, response| {
-                    if response == "enable" {
-                        let mut new_cfg = config::settings().clone();
-                        new_cfg.ollama.enabled = true;
-                        let _ = config::save_settings(&new_cfg);
-                    } else {
-                        // User cancelled — revert the switch without re-triggering.
-                        if let Some(r) = row_weak.upgrade() {
-                            r.set_active(false);
-                        }
-                    }
-                });
-                if let Some(win) = window_weak_ai.upgrade() {
-                    dialog.present(Some(&win));
-                }
-            } else {
-                let mut new_cfg = config::settings().clone();
-                new_cfg.ollama.enabled = false;
-                let _ = config::save_settings(&new_cfg);
-            }
-        });
         extra_row.connect_apply(|row| {
             let mut new_cfg = config::settings().clone();
             new_cfg.ollama.room_preview_extra = row.text().to_string();
             let _ = config::save_settings(&new_cfg);
         });
+
+        // Build the AI page — added to the dialog only when the plugin is enabled.
+        let ai_page = adw::PreferencesPage::builder()
+            .icon_name("view-reveal-symbolic")
+            .title("AI")
+            .build();
+        ai_page.add(&ai_group);
+
+        (ai_page, extra_row)
+        }; // end #[cfg(feature = "ai")]
 
         // --- Info group ---
         let info_group = adw::PreferencesGroup::builder()
@@ -4511,10 +4586,7 @@ impl MxWindow {
             .icon_name("preferences-system-symbolic")
             .title("General")
             .build();
-        page.add(&sync_group);
         page.add(&appearance_group);
-        #[cfg(feature = "ai")]
-        page.add(&ai_group);
         page.add(&info_group);
         page.add(&account_group);
         dialog.add(&page);
@@ -4641,7 +4713,7 @@ impl MxWindow {
             .description("Enable or disable optional features. Changes take effect immediately.")
             .build();
 
-        // AI plugin — reuses the existing ollama-enabled setting.
+        // AI plugin toggle — enabling shows the AI settings tab; disabling removes it.
         #[cfg(feature = "ai")]
         {
             let ai_switch = adw::SwitchRow::builder()
@@ -4650,9 +4722,80 @@ impl MxWindow {
                 .active(cfg.ollama.enabled)
                 .build();
             plugins_group.add(&ai_switch);
-            ai_switch.connect_active_notify(|sw| {
+
+            // Add the AI page now if already enabled.
+            if cfg.ollama.enabled {
+                dialog.add(&ai_page);
+            }
+
+            let window_weak_ai = self.downgrade();
+            let dialog_weak = dialog.downgrade();
+            let ai_page_ref = ai_page.clone();
+            ai_switch.connect_active_notify(move |sw| {
                 let gs = crate::config::gsettings();
-                let _ = gs.set_boolean("ollama-enabled", sw.is_active());
+                if sw.is_active() {
+                    // Inform the user exactly what will be downloaded before
+                    // committing. Cancelling reverts the switch — nothing is saved.
+                    let already_setup = crate::config::settings().ollama.setup_done;
+                    let body = if already_setup {
+                        "AI summaries are powered by a local Ollama model.\n\n\
+                         ⚠ AI responses can be inaccurate — always verify \
+                         important information yourself."
+                            .to_string()
+                    } else {
+                        "Enabling AI will download:\n\
+                         • Ollama runtime  (~50 MB)\n\
+                         • A language model of your choice  (1–3 GB)\n\n\
+                         Your machine must be online for the download. \
+                         You will choose the model in the next step.\n\n\
+                         ⚠ AI responses can be inaccurate — always verify \
+                         important information yourself."
+                            .to_string()
+                    };
+                    let alert = adw::AlertDialog::builder()
+                        .heading("Enable AI Summaries?")
+                        .body(&body)
+                        .close_response("cancel")
+                        .default_response("enable")
+                        .build();
+                    alert.add_response("cancel", "Cancel");
+                    alert.add_response("enable", if already_setup { "Enable" } else { "Download & Enable" });
+                    alert.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+                    let sw_weak = sw.downgrade();
+                    let dialog_weak2 = dialog_weak.clone();
+                    let ai_page_ref2 = ai_page_ref.clone();
+                    let window_weak2 = window_weak_ai.clone();
+                    alert.connect_response(None, move |_, response| {
+                        if response == "enable" {
+                            let _ = gs.set_boolean("ollama-enabled", true);
+                            if let Some(d) = dialog_weak2.upgrade() {
+                                d.add(&ai_page_ref2);
+                            }
+                            // First enable ever → launch the setup wizard so the
+                            // user is walked through the Ollama + model download.
+                            if !crate::config::settings().ollama.setup_done {
+                                if let Some(win) = window_weak2.upgrade() {
+                                    glib::idle_add_local_once(move || {
+                                        show_ai_setup_dialog(&win);
+                                    });
+                                }
+                            }
+                        } else {
+                            // User cancelled — revert the switch without saving.
+                            if let Some(sw) = sw_weak.upgrade() {
+                                sw.set_active(false);
+                            }
+                        }
+                    });
+                    if let Some(win) = window_weak_ai.upgrade() {
+                        alert.present(Some(&win));
+                    }
+                } else {
+                    let _ = gs.set_boolean("ollama-enabled", false);
+                    if let Some(d) = dialog_weak.upgrade() {
+                        d.remove(&ai_page_ref);
+                    }
+                }
             });
         }
 
@@ -4791,26 +4934,6 @@ impl MxWindow {
         watch_page.add(&watch_group);
         dialog.add(&watch_page);
         } // #[cfg(feature = "ai")]
-
-        // Save when values change (font is saved directly from the FontDialog callback).
-        let save = {
-            let timeline_row = timeline_row.clone();
-            let timeout_row = timeout_row.clone();
-            let cfg = cfg.clone();
-            move || {
-                let mut new_cfg = cfg.clone();
-                new_cfg.sync.timeline_limit = timeline_row.value() as u32;
-                new_cfg.sync.timeout_secs = timeout_row.value() as u64;
-                if let Err(e) = config::save_settings(&new_cfg) {
-                    tracing::error!("Failed to save settings: {e}");
-                }
-            }
-        };
-
-        let s = save.clone();
-        timeline_row.connect_value_notify(move |_| s());
-        let s = save.clone();
-        timeout_row.connect_value_notify(move |_| s());
 
         dialog.present(Some(self));
     }
@@ -4969,13 +5092,11 @@ fn show_ai_setup_dialog(window: &MxWindow) {
     btn_row.append(&skip_btn);
     btn_row.append(&pull_btn);
 
-    // Skip → mark done, close.
+    // Skip → close without marking setup done. The wizard will reappear
+    // on next login so the user can complete setup when they're ready.
     {
         let dialog = dialog.clone();
         skip_btn.connect_clicked(move |_| {
-            let mut cfg = crate::config::settings().clone();
-            cfg.ollama.setup_done = true;
-            let _ = crate::config::save_settings(&cfg);
             dialog.close();
         });
     }
@@ -5072,9 +5193,60 @@ fn show_ai_setup_dialog(window: &MxWindow) {
                     ));
                 }
                 OllamaStatus::NeedDownload => {
-                    status_icon.set_icon_name(Some("dialog-error-symbolic"));
-                    status_label.set_label("Ollama not found — install it first");
-                    pull_btn.set_sensitive(false);
+                    status_icon.set_icon_name(Some("folder-download-symbolic"));
+                    status_label.set_label("Ollama not found — click to download (~50 MB)");
+                    pull_btn.set_label("Download Ollama first");
+                    // Wire pull_btn to download Ollama, then re-enable model pull.
+                    let status_icon2 = status_icon.clone();
+                    let status_label2 = status_label.clone();
+                    let pull_btn2 = pull_btn.clone();
+                    let progress_bar2 = progress_bar.clone();
+                    let progress_label2 = progress_label.clone();
+                    pull_btn.connect_clicked(move |btn| {
+                        btn.set_sensitive(false);
+                        btn.set_label("Downloading Ollama…");
+                        progress_bar2.set_visible(true);
+                        progress_label2.set_visible(true);
+                        progress_label2.set_label("Downloading Ollama…");
+                        let pb = progress_bar2.clone();
+                        let pl = progress_label2.clone();
+                        let btn2 = pull_btn2.clone();
+                        let si = status_icon2.clone();
+                        let sl = status_label2.clone();
+                        glib::spawn_future_local(async move {
+                            use crate::intelligence::ollama_manager::download_ollama_binary;
+                            let pb_cb = pb.clone();
+                            let pl_cb = pl.clone();
+                            let result = download_ollama_binary(move |p| {
+                                if p >= 0.0 {
+                                    pb_cb.set_fraction(p);
+                                    pl_cb.set_label(&format!(
+                                        "Downloading Ollama… {:.0}%", p * 100.0
+                                    ));
+                                } else {
+                                    pb_cb.pulse();
+                                }
+                            }).await;
+                            match result {
+                                Ok(_) => {
+                                    si.set_icon_name(Some("emblem-ok-symbolic"));
+                                    sl.set_label("Ollama downloaded — ready to use");
+                                    pl.set_label("Ollama downloaded. Now pull a model.");
+                                    pb.set_fraction(1.0);
+                                    // Re-wire pull_btn for model pull.
+                                    btn2.set_label("Download & Use");
+                                    btn2.set_sensitive(true);
+                                }
+                                Err(e) => {
+                                    si.set_icon_name(Some("dialog-error-symbolic"));
+                                    sl.set_label(&format!("Download failed: {e}"));
+                                    pl.set_label(&format!("Error: {e}"));
+                                    btn2.set_label("Retry");
+                                    btn2.set_sensitive(true);
+                                }
+                            }
+                        });
+                    });
                 }
                 OllamaStatus::NotAvailable => {
                     status_icon.set_icon_name(Some("dialog-error-symbolic"));

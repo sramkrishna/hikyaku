@@ -105,7 +105,7 @@
       <summary>Ollama model name for AI summaries (default: qwen2.5:3b)</summary>
     </key>
     <key name="ollama-enabled" type="b">
-      <default>true</default>
+      <default>false</default>
       <summary>Whether AI summaries (Ctrl+click popover) are enabled</summary>
     </key>
     <key name="ai-setup-done" type="b">

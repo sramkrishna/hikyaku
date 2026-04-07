@@ -146,6 +146,11 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            // Announce this widget as a list item so screen readers
+            // (via AT-SPI) know it represents a single message in a list.
+            use gtk::prelude::AccessibleExt;
+            self.obj().set_accessible_role(gtk::AccessibleRole::ListItem);
+
             // Build floating action bar — appears on hover without
             // affecting layout. Uses a Popover for zero-layout-impact.
             self.reply_button.set_icon_name("mail-reply-sender-symbolic");
@@ -1074,6 +1079,9 @@ impl MessageRow {
                     })
                     .unwrap_or_default();
                 imp.media_label.set_label(&format!("{}{size_str}", media.filename));
+                imp.media_button.update_property(&[gtk::accessible::Property::Label(
+                    &format!("{kind_str}: {}{size_str}", media.filename)
+                )]);
                 imp.media_button.set_visible(true);
 
                 imp.media_url.replace(media.url.clone());
@@ -1116,11 +1124,19 @@ impl MessageRow {
                     };
                     // Tooltip shows who reacted.
                     let tooltip = names.join(", ");
+                    // Accessible label gives screen readers a meaningful description
+                    // instead of just the raw emoji + count string.
+                    let a11y_label = if *count > 1 {
+                        format!("{count} reactions: {emoji}. From: {tooltip}")
+                    } else {
+                        format!("Reaction: {emoji}. From: {tooltip}")
+                    };
                     let pill = gtk::Label::builder()
                         .label(&label)
                         .tooltip_text(&tooltip)
                         .css_classes(["reaction-pill"])
                         .build();
+                    pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
                     imp.reactions_box.append(&pill);
                 }
                 imp.reactions_box.set_visible(true);
@@ -1204,8 +1220,10 @@ impl MessageRow {
     ) {
         let imp = self.imp();
 
-        // Sender label — always cheap to update.
-        if crate::config::settings().appearance.colorize_nicks && !sender_id.is_empty() {
+        // Sender label — always colorize by user ID for visual disambiguation.
+        // Color is supplementary (never the sole identifier): the text name is
+        // always present, so this is safe for color-blind users and screen readers.
+        if !sender_id.is_empty() {
             let color = nick_color(sender_id);
             let escaped = glib::markup_escape_text(sender);
             imp.sender_label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));

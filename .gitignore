@@ -1,1 +1,15 @@
 /target
+
+# Conduit test server data (generated at runtime)
+dev/conduit/data/
+
+# Profiling and debug artifacts
+*.syscap
+callgraph.txt
+output.txt
+output2.txt
+rust_out
+docs/
+.cargo/
+src/bin/
+data/gschemas.compiled

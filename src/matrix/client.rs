@@ -172,7 +172,7 @@ pub struct VerificationEmoji {
 pub enum MatrixEvent {
     /// No saved session found — show the login page.
     LoginRequired,
-    LoginSuccess { display_name: String, user_id: String },
+    LoginSuccess { display_name: String, user_id: String, from_registration: bool, is_fresh_login: bool },
     LoginFailed { error: String },
     SyncStarted,
     SyncError { error: String },
@@ -305,6 +305,12 @@ pub enum MatrixEvent {
     /// New room keys arrived (from backup retry or key forwarding).
     /// Re-fetch any of these rooms if currently visible.
     RoomKeysReceived { room_ids: Vec<String> },
+    /// Account registration succeeded.
+    RegistrationSuccess { display_name: String, user_id: String },
+    /// Account registration failed.
+    RegistrationFailed { error: String },
+    /// Recovery key was generated for a new account.
+    RecoveryKeyGenerated { key: String },
     /// Key file import result.
     KeysImported { imported: u64, total: u64 },
     KeyImportFailed { error: String },
@@ -455,6 +461,14 @@ pub enum MatrixCommand {
     /// Drain the command queue and then signal the sync loop to stop.
     /// Must be sent LAST by the application — all preceding commands run first.
     Shutdown,
+    /// Register a new account on a homeserver.
+    Register {
+        homeserver: String,
+        username: String,
+        password: String,
+        display_name: String,
+        email: String,
+    },
 }
 
 /// Session data serialized into the keyring. The access token and auth
@@ -474,6 +488,16 @@ struct PersistedSession {
 
 /// The attributes used to look up our secret in the keyring.
 const KEYRING_LABEL: &str = "Hikyaku Matrix session";
+
+/// Keyring application attribute — namespaced per-profile so the wizard
+/// sandbox never collides with the real session.
+fn keyring_app_attr() -> &'static str {
+    if std::env::var_os("HIKYAKU_WIZARD").is_some() {
+        "me.ramkrishna.hikyaku.wizard"
+    } else {
+        "me.ramkrishna.hikyaku"
+    }
+}
 
 /// Compute the number of unread messages when entering a room.
 ///
@@ -568,10 +592,16 @@ fn load_room_list_cache() -> Vec<RoomInfo> {
 
 
 fn db_dir_path(homeserver: &str) -> PathBuf {
+    // Sanitise the homeserver string into a safe directory name.
+    // Strip scheme, replace characters invalid in path components.
+    let clean = homeserver
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .replace(['/', '\\', ':', '?', '#'], "_");
     let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("hikyaku");
     path.push("db");
-    path.push(homeserver);
+    path.push(clean);
     path
 }
 
@@ -602,7 +632,7 @@ async fn save_session_to_keyring(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keyring = oo7::Keyring::new().await?;
     let json = serde_json::to_string(persisted)?;
-    let attributes = vec![("application", "me.ramkrishna.hikyaku")];
+    let attributes = vec![("application", keyring_app_attr())];
     keyring
         .create_item(KEYRING_LABEL, &attributes, json, true)
         .await?;
@@ -613,7 +643,7 @@ async fn save_session_to_keyring(
 /// Load session from GNOME Keyring.
 async fn load_session_from_keyring() -> Option<PersistedSession> {
     let keyring = oo7::Keyring::new().await.ok()?;
-    let attributes = vec![("application", "me.ramkrishna.hikyaku")];
+    let attributes = vec![("application", keyring_app_attr())];
     let items = keyring.search_items(&attributes).await.ok()?;
     let item = items.first()?;
     let secret = item.secret().await.ok()?;
@@ -624,7 +654,7 @@ async fn load_session_from_keyring() -> Option<PersistedSession> {
 /// Delete session from GNOME Keyring.
 async fn delete_session_from_keyring() {
     if let Ok(keyring) = oo7::Keyring::new().await {
-        let attributes = vec![("application", "me.ramkrishna.hikyaku")];
+        let attributes = vec![("application", keyring_app_attr())];
         if let Ok(items) = keyring.search_items(&attributes).await {
             for item in items {
                 let _ = item.delete().await;
@@ -689,8 +719,16 @@ async fn matrix_task(
     // sessions (password is never persisted to disk).
     let mut login_creds: Option<(String, String)> = None;
 
+    // In wizard mode there is no session to restore — always show the setup flow.
+    let client = if std::env::var_os("HIKYAKU_WIZARD").is_some() {
+        None
     // Try to restore a previous session first.
-    let client = if let Some(client) = try_restore_session(&event_tx).await {
+    } else if let Some(client) = try_restore_session(&event_tx).await {
+        Some(client)
+    } else {
+        None
+    };
+    let client = if let Some(client) = client {
         client
     } else {
         // No saved session — tell the UI to show the login page.
@@ -708,7 +746,7 @@ async fn matrix_task(
                             login_creds = Some((username.clone(), password.clone()));
                             let display_name = username.clone();
                             let user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
-                            let _ = event_tx.send(MatrixEvent::LoginSuccess { display_name, user_id }).await;
+                            let _ = event_tx.send(MatrixEvent::LoginSuccess { display_name, user_id, from_registration: false, is_fresh_login: true }).await;
                             break client;
                         }
                         Err(e) => {
@@ -718,6 +756,21 @@ async fn matrix_task(
                                     error: e.to_string(),
                                 })
                                 .await;
+                        }
+                    }
+                }
+                Ok(MatrixCommand::Register { homeserver, username, password, display_name, email }) => {
+                    match do_register(&homeserver, &username, &password, &display_name, &email).await {
+                        Ok(client) => {
+                            login_creds = Some((username.clone(), password.clone()));
+                            let display = if display_name.is_empty() { username.clone() } else { display_name.clone() };
+                            let user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+                            let _ = event_tx.send(MatrixEvent::LoginSuccess { display_name: display, user_id, from_registration: true, is_fresh_login: true }).await;
+                            break client;
+                        }
+                        Err(e) => {
+                            tracing::error!("Registration/login failed: {e}");
+                            let _ = event_tx.send(MatrixEvent::RegistrationFailed { error: e.to_string() }).await;
                         }
                     }
                 }
@@ -806,6 +859,9 @@ async fn matrix_task(
                 match cmd {
                     Ok(MatrixCommand::Login { .. }) => {
                         tracing::warn!("Already logged in, ignoring duplicate login command");
+                    }
+                    Ok(MatrixCommand::Register { .. }) => {
+                        tracing::warn!("Already logged in, ignoring register command");
                     }
                     Ok(MatrixCommand::SelectRoom { room_id, known_unread }) => {
                         // Zero this room in the disk cache so that merge-saves during
@@ -1241,25 +1297,37 @@ async fn matrix_task(
     }
 }
 
-async fn do_login(
+pub(crate) async fn do_login(
     homeserver: &str,
     username: &str,
     password: &str,
 ) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     let db_path = db_dir_path(homeserver);
+    tracing::info!("do_login: sqlite store path = {db_path:?}");
     std::fs::create_dir_all(&db_path)?;
 
-    // Parse homeserver as a server name (e.g., "matrix.org").
-    let server_name = ServerName::parse(homeserver)?;
+    let enc = matrix_sdk::encryption::EncryptionSettings {
+        backup_download_strategy:
+            matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
+        ..Default::default()
+    };
 
-    let client = Client::builder()
-        .server_name(&server_name)
-        .sqlite_store(&db_path, None)
-        .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
-            backup_download_strategy:
-                matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
-            ..Default::default()
-        })
+    // If the user supplied a full URL (http:// or https://) use it directly —
+    // this is needed for local dev servers (e.g. http://127.0.0.1:6167) where
+    // there is no .well-known and plain HTTP must be used.
+    // Otherwise treat the input as a bare server name and let the SDK resolve it.
+    let client = if homeserver.starts_with("http://") || homeserver.starts_with("https://") {
+        Client::builder()
+            .homeserver_url(homeserver)
+            .sqlite_store(&db_path, None)
+            .with_encryption_settings(enc)
+    } else {
+        let server_name = ServerName::parse(homeserver)?;
+        Client::builder()
+            .server_name(&server_name)
+            .sqlite_store(&db_path, None)
+            .with_encryption_settings(enc)
+    }
         .build()
         .await?;
 
@@ -1286,6 +1354,93 @@ async fn do_login(
     };
     save_session_to_keyring(&persisted).await?;
     Ok(client)
+}
+
+pub(crate) async fn do_register(
+    homeserver: &str,
+    username: &str,
+    password: &str,
+    display_name: &str,
+    _email: &str,
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    use matrix_sdk::ruma::api::client::account::register::v3::Request as RegisterRequest;
+    use matrix_sdk::ruma::api::client::account::register::RegistrationKind;
+
+    // No sqlite store for the registration client — it only needs to complete the
+    // UIAA exchange, not persist any state.  do_login() below creates the real
+    // persistent client; giving this client a store would initialize the crypto
+    // layer with a different device ID than the one login produces, causing a
+    // "account in store doesn't match" error.
+    let client = if homeserver.starts_with("http://") || homeserver.starts_with("https://") {
+        Client::builder()
+            .homeserver_url(homeserver)
+    } else {
+        let server_name = ServerName::parse(homeserver)?;
+        Client::builder()
+            .server_name(&server_name)
+    }
+    .build()
+    .await?;
+
+    use matrix_sdk::ruma::api::client::uiaa::{AuthData, Dummy};
+
+    let mut req = RegisterRequest::new();
+    req.username = Some(username.to_owned());
+    req.password = Some(password.to_owned());
+    req.initial_device_display_name = Some(
+        if display_name.is_empty() { "Hikyaku".to_owned() }
+        else { display_name.to_owned() }
+    );
+    req.kind = RegistrationKind::User;
+
+    // First attempt — open-registration servers (e.g. Conduit) return a UIAA 401
+    // with an m.login.dummy stage even when no token is required. Retry with the
+    // dummy auth stage to complete the flow.
+    match client.matrix_auth().register(req.clone()).await {
+        Ok(_) => {}
+        Err(e) => {
+            // Try the proper UIAA path first (well-formed servers that include `params`).
+            let session = if let Some(uiaa_info) = e.as_uiaa_response() {
+                uiaa_info.session.clone()
+            } else {
+                // Conduit omits the required `params` field from its UIAA 401, so
+                // ruma falls back to ClientApi instead of Uiaa.  Extract the session
+                // directly from the raw JSON body.
+                use matrix_sdk::ruma::api::client::error::ErrorBody;
+                e.as_client_api_error()
+                    .filter(|ce| ce.status_code.as_u16() == 401)
+                    .and_then(|ce| match &ce.body {
+                        ErrorBody::Json(v) => v.get("session")?.as_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .map(Some)
+                    .ok_or_else(|| {
+                        tracing::error!("Registration failed: {e}");
+                        e.to_string()
+                    })?
+            };
+
+            tracing::info!("UIAA required for registration, session={session:?}");
+            let mut dummy = Dummy::new();
+            dummy.session = session;
+            req.auth = Some(AuthData::Dummy(dummy));
+            client.matrix_auth().register(req).await
+                .map_err(|e| { tracing::error!("Registration retry failed: {e}"); e.to_string() })?;
+            tracing::info!("Registration succeeded");
+        }
+    }
+
+    // Wipe any stale crypto store before logging in with the new account.
+    // A previous failed or different-account run may have left state that would
+    // cause a "account in store doesn't match" error in do_login.
+    let db_path = db_dir_path(homeserver);
+    if db_path.exists() {
+        tracing::info!("Wiping stale store at {db_path:?} before first login");
+        let _ = std::fs::remove_dir_all(&db_path);
+    }
+
+    // Register doesn't give us a full session — log in with the new credentials.
+    do_login(homeserver, username, password).await
 }
 
 async fn try_restore_session(
@@ -1376,7 +1531,7 @@ async fn try_restore_session(
             .unwrap_or("User")
             .to_string();
         let _ = event_tx
-            .send(MatrixEvent::LoginSuccess { display_name, user_id })
+            .send(MatrixEvent::LoginSuccess { display_name, user_id, from_registration: false, is_fresh_login: false })
             .await;
         Some(client)
     } else {
@@ -2130,13 +2285,51 @@ async fn start_sync(
         // Running it here would just duplicate the work done 1-2 seconds later.
     }
 
-    // Interest watcher state: (watcher, terms_it_was_built_with, threshold).
-    // Storing the config lets us detect when settings change and re-init.
+    // Interest watcher: one dedicated OS thread owns the model and processes
+    // messages sequentially — same pattern as the community-health scorer.
+    // try_send drops under load; never blocks the sync loop; never spawns extra threads.
+    // The thread lazily inits/reinits the model when config changes.
     #[cfg(feature = "ai")]
-    type WatcherState = (Option<crate::intelligence::watcher::Watcher>, Vec<String>, f64);
+    let (watch_tx, watch_rx) =
+        std::sync::mpsc::sync_channel::<(String, String, String)>(32); // (body, room_id, room_name)
     #[cfg(feature = "ai")]
-    let watcher_arc: std::sync::Arc<std::sync::Mutex<WatcherState>> =
-        std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new(), 0.0)));
+    {
+        let watch_event_tx = event_tx.clone();
+        std::thread::Builder::new()
+            .name("watcher".into())
+            .spawn(move || {
+                let mut current_terms: Vec<String> = Vec::new();
+                let mut current_threshold: f64 = 0.0;
+                let mut watcher: Option<crate::intelligence::watcher::Watcher> = None;
+                while let Ok((body, room_id, room_name)) = watch_rx.recv() {
+                    let cfg = crate::config::settings();
+                    if !cfg.watch.enabled || cfg.watch.terms.is_empty() { continue; }
+                    // Reinit model only when terms or threshold actually changed.
+                    if watcher.is_none()
+                        || current_terms != cfg.watch.terms
+                        || (current_threshold - cfg.watch.threshold).abs() > 1e-9
+                    {
+                        current_terms = cfg.watch.terms.clone();
+                        current_threshold = cfg.watch.threshold;
+                        watcher = crate::intelligence::watcher::Watcher::new(
+                            &current_terms, current_threshold,
+                        );
+                    }
+                    if let Some(w) = &watcher {
+                        if let Some(term) = w.check(&body) {
+                            let _ = watch_event_tx.send_blocking(
+                                crate::matrix::MatrixEvent::RoomAlert {
+                                    room_id,
+                                    room_name,
+                                    matched_term: term,
+                                },
+                            );
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
 
     // Community health scoring: one dedicated OS thread reads from a bounded
     // channel and runs fastembed inference sequentially — no spawn_blocking
@@ -2146,23 +2339,6 @@ async fn start_sync(
     #[cfg(feature = "community-health")]
     let (health_score_tx, health_score_rx) =
         std::sync::mpsc::sync_channel::<(String, String)>(32);
-    #[cfg(feature = "ai")]
-    {
-        let settings = crate::config::settings();
-        if settings.watch.enabled && !settings.watch.terms.is_empty() {
-            let terms = settings.watch.terms.clone();
-            let threshold = settings.watch.threshold;
-            let arc = watcher_arc.clone();
-            tokio::spawn(async move {
-                let w = tokio::task::spawn_blocking({
-                    let terms = terms.clone();
-                    move || crate::intelligence::watcher::Watcher::new(&terms, threshold)
-                }).await.ok().flatten();
-                let mut g = arc.lock().unwrap();
-                *g = (w, terms, threshold);
-            });
-        }
-    }
     // Spawn the dedicated health scorer thread (one thread for all scoring).
     #[cfg(feature = "community-health")]
     {
@@ -2205,7 +2381,7 @@ async fn start_sync(
     let msg_dirty = dirty_rooms.clone();
     let msg_cache = timeline_cache.clone();
     #[cfg(feature = "ai")]
-    let msg_watcher = watcher_arc.clone();
+    let msg_watcher = watch_tx.clone();
     #[cfg(feature = "community-health")]
     let msg_health_score_tx = health_score_tx.clone();
     client.add_event_handler(
@@ -2216,7 +2392,7 @@ async fn start_sync(
             let cache = msg_cache.clone();
             let client = msg_client.clone();
             #[cfg(feature = "ai")]
-            let watcher = msg_watcher.clone();
+            let watcher = msg_watcher.clone(); // SyncSender<(body, room_id, room_name)>
             #[cfg(feature = "community-health")]
             let health_score_tx = msg_health_score_tx.clone();
             async move {
@@ -2396,44 +2572,17 @@ async fn start_sync(
                     })
                     .await;
 
-                // Check message against interest watcher (if active).
-                // Re-init the watcher if settings changed since last init
-                // (e.g. user added terms after the app started).
+                // Forward to the dedicated watcher thread via try_send.
+                // Drops the message if the thread is busy — never blocks sync.
                 #[cfg(feature = "ai")]
                 {
                     let cfg = crate::config::settings();
                     if cfg.watch.enabled && !cfg.watch.terms.is_empty() {
-                        let needs_reinit = {
-                            let g = watcher.lock().unwrap();
-                            g.1 != cfg.watch.terms || (g.2 - cfg.watch.threshold).abs() > 1e-9 || g.0.is_none()
-                        };
-                        if needs_reinit {
-                            let terms = cfg.watch.terms.clone();
-                            let threshold = cfg.watch.threshold;
-                            let arc2 = watcher.clone();
-                            tokio::spawn(async move {
-                                let w = tokio::task::spawn_blocking({
-                                    let terms = terms.clone();
-                                    move || crate::intelligence::watcher::Watcher::new(&terms, threshold)
-                                }).await.ok().flatten();
-                                let mut g = arc2.lock().unwrap();
-                                *g = (w, terms, threshold);
-                            });
-                        }
-                    }
-                    let body_check = body.clone();
-                    let matched = tokio::task::spawn_blocking(move || {
-                        let guard = watcher.lock().unwrap();
-                        let cfg = crate::config::settings();
-                        if !cfg.watch.enabled { return None; }
-                        guard.0.as_ref().and_then(|w| w.check(&body_check))
-                    }).await.ok().flatten();
-                    if let Some(term) = matched {
-                        let _ = tx.send(MatrixEvent::RoomAlert {
-                            room_id: room_id_str.clone(),
-                            room_name: room_name_str,
-                            matched_term: term,
-                        }).await;
+                        let _ = watcher.try_send((
+                            body.clone(),
+                            room_id_str.clone(),
+                            room_name_str.clone(),
+                        ));
                     }
                 }
 
@@ -4229,8 +4378,10 @@ async fn handle_browse_public_rooms(
         }
     }
 
+    tracing::info!("BrowsePublicRooms: spaces_only={spaces_only} server={server:?}");
     match client.send(request).await {
         Ok(response) => {
+            tracing::info!("BrowsePublicRooms: got {} rooms", response.chunk.len());
             let joined_rooms: std::collections::HashSet<String> = client
                 .joined_rooms()
                 .iter()
@@ -4320,10 +4471,17 @@ async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_
     match client.join_room_by_id_or_alias(&id, &[]).await {
         Ok(room) => {
             let room_id = room.room_id().to_string();
+            // display_name() fetches from server if not yet cached — use it
+            // so the toast shows the human-readable name, not the room ID.
             let room_name = room
-                .cached_display_name()
+                .display_name()
+                .await
                 .map(|n| n.to_string())
-                .unwrap_or_else(|| room_id.clone());
+                .unwrap_or_else(|_| {
+                    room.cached_display_name()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| room_id_or_alias.to_string())
+                });
             tracing::info!("Joined room: {room_name} ({room_id})");
             let _ = event_tx
                 .send(MatrixEvent::RoomJoined { room_id, room_name })

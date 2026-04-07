@@ -5,6 +5,7 @@
 //
 // All functions run on the GLib main thread and use libsoup for HTTP.
 
+pub mod gpu_detect;
 pub mod ollama_manager;
 #[cfg(feature = "ai")]
 pub mod watcher;
