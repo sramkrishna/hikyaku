@@ -4479,16 +4479,30 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
                 .map(|r| r.room_id().to_string())
                 .collect();
 
+            // Fallback server: use the space's own server for rooms that come
+            // back with no server component in their room_id (buggy servers).
+            let space_server = room_id.server_name().map(|s| s.to_string());
+
             let rooms: Vec<SpaceDirectoryRoom> = response
                 .rooms
                 .into_iter()
                 .filter(|r| r.room_id != room_id) // Skip the space itself
                 .map(|r| {
                     let alias = r.canonical_alias.as_ref().map(|a| a.to_string());
-                    let rid_server = r.room_id.server_name().map(|s| s.to_string());
+                    // Patch malformed room IDs (no :server part) using the space server.
+                    let raw_rid = r.room_id.to_string();
+                    let room_id_str = if raw_rid.contains(':') {
+                        raw_rid
+                    } else if let Some(srv) = &space_server {
+                        format!("{}:{}", raw_rid, srv)
+                    } else {
+                        raw_rid
+                    };
+                    let rid_server = room_id_str.splitn(2, ':').nth(1).map(|s| s.to_string())
+                        .or_else(|| alias.as_ref().and_then(|a| a.splitn(2, ':').nth(1).map(|s| s.to_string())));
                     SpaceDirectoryRoom {
-                        already_joined: joined_rooms.contains(&r.room_id.to_string()),
-                        room_id: r.room_id.to_string(),
+                        already_joined: joined_rooms.contains(&room_id_str),
+                        room_id: room_id_str,
                         name: r.name.clone().unwrap_or_else(|| {
                             alias.clone().unwrap_or_else(|| r.room_id.to_string())
                         }),
