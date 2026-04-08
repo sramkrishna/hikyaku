@@ -154,10 +154,18 @@ pub struct RoomMeta {
 #[derive(Debug, Clone)]
 pub struct SpaceDirectoryRoom {
     pub room_id: String,
+    /// Canonical alias, if the room has one (e.g. `#gnome-shell:gnome.org`).
+    /// Prefer this over room_id for joining — alias resolution returns live
+    /// federation servers, avoiding "M_UNKNOWN: no known servers".
+    pub canonical_alias: Option<String>,
     pub name: String,
     pub topic: String,
     pub member_count: u64,
     pub already_joined: bool,
+    /// The homeserver that returned this room in its public directory.
+    /// Passed as a `via` hint so federation works even when the room_id's
+    /// original server is no longer in the room.
+    pub via_server: Option<String>,
 }
 
 /// A single emoji from SAS verification.
@@ -399,7 +407,7 @@ pub enum MatrixCommand {
     /// Fetch the room directory for a space.
     BrowseSpaceRooms { space_id: String },
     /// Join a room by ID or alias.
-    JoinRoom { room_id_or_alias: String },
+    JoinRoom { room_id_or_alias: String, via_servers: Vec<String> },
     /// Delete (redact) a message.
     RedactMessage { room_id: String, event_id: String },
     /// Edit a message (send replacement).
@@ -1110,8 +1118,8 @@ async fn matrix_task(
                     Ok(MatrixCommand::BrowseSpaceRooms { space_id }) => {
                         handle_browse_space(&client, &event_tx, &space_id).await;
                     }
-                    Ok(MatrixCommand::JoinRoom { room_id_or_alias }) => {
-                        handle_join_room(&client, &event_tx, &room_id_or_alias).await;
+                    Ok(MatrixCommand::JoinRoom { room_id_or_alias, via_servers }) => {
+                        handle_join_room(&client, &event_tx, &room_id_or_alias, &via_servers).await;
                     }
                     Ok(MatrixCommand::RedactMessage { room_id, event_id }) => {
                         if let (Ok(rid), Ok(eid)) = (RoomId::parse(&room_id), matrix_sdk::ruma::EventId::parse(&event_id)) {
@@ -4397,16 +4405,19 @@ async fn handle_browse_public_rooms(
             let rooms: Vec<SpaceDirectoryRoom> = response
                 .chunk
                 .into_iter()
-                .map(|r| SpaceDirectoryRoom {
-                    already_joined: joined_rooms.contains(&r.room_id.to_string()),
-                    room_id: r.room_id.to_string(),
-                    name: r.name.unwrap_or_else(|| {
-                        r.canonical_alias
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|| r.room_id.to_string())
-                    }),
-                    topic: r.topic.unwrap_or_default(),
-                    member_count: r.num_joined_members.into(),
+                .map(|r| {
+                    let alias = r.canonical_alias.as_ref().map(|a| a.to_string());
+                    SpaceDirectoryRoom {
+                        already_joined: joined_rooms.contains(&r.room_id.to_string()),
+                        room_id: r.room_id.to_string(),
+                        name: r.name.clone().unwrap_or_else(|| {
+                            alias.clone().unwrap_or_else(|| r.room_id.to_string())
+                        }),
+                        canonical_alias: alias,
+                        topic: r.topic.unwrap_or_default(),
+                        member_count: r.num_joined_members.into(),
+                        via_server: server.map(|s| s.to_string()),
+                    }
                 })
                 .collect();
 
@@ -4440,12 +4451,20 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
                 .rooms
                 .into_iter()
                 .filter(|r| r.room_id != room_id) // Skip the space itself
-                .map(|r| SpaceDirectoryRoom {
-                    already_joined: joined_rooms.contains(&r.room_id.to_string()),
-                    room_id: r.room_id.to_string(),
-                    name: r.name.unwrap_or_else(|| r.room_id.to_string()),
-                    topic: r.topic.unwrap_or_default(),
-                    member_count: r.num_joined_members.into(),
+                .map(|r| {
+                    let alias = r.canonical_alias.as_ref().map(|a| a.to_string());
+                    let rid_server = r.room_id.server_name().map(|s| s.to_string());
+                    SpaceDirectoryRoom {
+                        already_joined: joined_rooms.contains(&r.room_id.to_string()),
+                        room_id: r.room_id.to_string(),
+                        name: r.name.clone().unwrap_or_else(|| {
+                            alias.clone().unwrap_or_else(|| r.room_id.to_string())
+                        }),
+                        canonical_alias: alias,
+                        topic: r.topic.unwrap_or_default(),
+                        member_count: r.num_joined_members.into(),
+                        via_server: rid_server,
+                    }
                 })
                 .collect();
 
@@ -4462,7 +4481,12 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
     }
 }
 
-async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id_or_alias: &str) {
+async fn handle_join_room(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id_or_alias: &str,
+    extra_via: &[String],
+) {
     use matrix_sdk::ruma::{RoomOrAliasId, ServerName};
 
     let Ok(id) = RoomOrAliasId::parse(room_id_or_alias) else {
@@ -4474,16 +4498,23 @@ async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_
         return;
     };
 
-    // Extract the server name from the alias/room-id (the part after ':') and
-    // pass it as a `via` hint so the homeserver knows where to federate.
-    // Without this, joining rooms on foreign servers fails with M_UNKNOWN /
-    // "no known servers".
-    let via: Vec<matrix_sdk::ruma::OwnedServerName> = room_id_or_alias
+    // Build a de-duplicated set of via hints:
+    //   1. The server embedded in the room ID / alias (e.g. "gnome.org" from "!abc:gnome.org")
+    //   2. Any extra servers supplied by the caller (e.g. the directory server)
+    let mut via: Vec<matrix_sdk::ruma::OwnedServerName> = room_id_or_alias
         .splitn(2, ':')
         .nth(1)
         .and_then(|s| ServerName::parse(s).ok().map(|n| n.to_owned()))
         .into_iter()
         .collect();
+    for s in extra_via {
+        if let Ok(name) = ServerName::parse(s.as_str()) {
+            let owned = name.to_owned();
+            if !via.contains(&owned) {
+                via.push(owned);
+            }
+        }
+    }
 
     match client.join_room_by_id_or_alias(&id, &via).await {
         Ok(room) => {

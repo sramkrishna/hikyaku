@@ -687,7 +687,7 @@ impl MxWindow {
                 let tx = cmd_tx.clone();
                 glib::spawn_future_local(async move {
                     for alias in room_aliases {
-                        let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: alias }).await;
+                        let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: alias, via_servers: vec![] }).await;
                     }
                 });
             });
@@ -3338,7 +3338,7 @@ impl MxWindow {
             let dismiss = dismiss2.clone();
             let _toast = toast2.clone();
             glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias }).await;
+                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias, via_servers: vec![] }).await;
                 dismiss();
             });
         };
@@ -3513,14 +3513,23 @@ impl MxWindow {
                     .valign(gtk::Align::Center)
                     .build();
                 let tx = tx.clone();
-                let rid = room.room_id.clone();
+                // Prefer alias for joining — alias resolution returns live
+                // federation servers, avoiding "no known servers" errors.
+                let room_id_or_alias = room.canonical_alias.clone()
+                    .unwrap_or_else(|| room.room_id.clone());
+                let mut via_servers: Vec<String> = Vec::new();
+                if let Some(v) = &room.via_server { via_servers.push(v.clone()); }
                 join_btn.connect_clicked(move |btn| {
                     btn.set_sensitive(false);
                     btn.set_label("Joining…");
                     let tx = tx.clone();
-                    let rid = rid.clone();
+                    let roa = room_id_or_alias.clone();
+                    let via = via_servers.clone();
                     glib::spawn_future_local(async move {
-                        let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: rid }).await;
+                        let _ = tx.send(MatrixCommand::JoinRoom {
+                            room_id_or_alias: roa,
+                            via_servers: via,
+                        }).await;
                     });
                 });
                 join_buttons.insert(room.room_id.clone(), join_btn.clone());
@@ -3768,6 +3777,7 @@ impl MxWindow {
                     glib::spawn_future_local(async move {
                         let _ = tx.send(MatrixCommand::JoinRoom {
                             room_id_or_alias: matrix_id.clone(),
+                            via_servers: vec![],
                         }).await;
                         if let Some(win) = win_weak.upgrade() {
                             win.handle_matrix_link(&matrix_id);
