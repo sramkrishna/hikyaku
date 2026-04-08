@@ -259,6 +259,11 @@ pub enum MatrixEvent {
         space_id: String,
         rooms: Vec<SpaceDirectoryRoom>,
     },
+    /// Space listings from a server's public directory (spaces_only browse).
+    PublicSpacesForServer {
+        server: String,
+        rooms: Vec<SpaceDirectoryRoom>,
+    },
     /// Media downloaded to a temp file — show preview.
     MediaReady { url: String, path: String },
     /// A member avatar has been downloaded and is available at `path`.
@@ -4439,9 +4444,18 @@ async fn handle_browse_public_rooms(
                 })
                 .collect();
 
-            let _ = event_tx
-                .send(MatrixEvent::PublicRoomDirectory { title: title.to_string(), rooms })
-                .await;
+            if spaces_only {
+                let _ = event_tx
+                    .send(MatrixEvent::PublicSpacesForServer {
+                        server: server.unwrap_or("").to_string(),
+                        rooms,
+                    })
+                    .await;
+            } else {
+                let _ = event_tx
+                    .send(MatrixEvent::PublicRoomDirectory { title: title.to_string(), rooms })
+                    .await;
+            }
         }
         Err(e) => {
             tracing::error!("Failed to fetch public rooms: {e}");
