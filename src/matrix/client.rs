@@ -5224,11 +5224,20 @@ async fn handle_fetch_room_preview(
         lines.drain(0..lines.len() - unread_count as usize);
     }
 
-    if lines.is_empty() || ollama_endpoint.is_empty() || ollama_model.is_empty() {
-        // No messages or Ollama not configured — dismiss spinner.
+    if ollama_endpoint.is_empty() || ollama_model.is_empty() {
+        tracing::debug!("FetchRoomPreview: Ollama not configured, skipping");
         let _ = event_tx.send(MatrixEvent::OllamaChunk {
             context: format!("preview:{room_id}"),
             chunk: String::new(),
+            done: true,
+        }).await;
+        return;
+    }
+    if lines.is_empty() {
+        tracing::debug!("FetchRoomPreview: no readable messages for {room_id}");
+        let _ = event_tx.send(MatrixEvent::OllamaChunk {
+            context: format!("preview:{room_id}"),
+            chunk: "\u{26a0} No readable messages found (room may be encrypted without keys)".to_string(),
             done: true,
         }).await;
         return;
@@ -5535,8 +5544,11 @@ async fn ollama_stream_to_event(
 
     // Start Ollama if needed, bail if unavailable.
     if !ensure_ollama_running_tokio(endpoint).await {
+        tracing::warn!("ollama_stream_to_event: Ollama not reachable at {endpoint}");
         let _ = event_tx.send(MatrixEvent::OllamaChunk {
-            context: context.to_string(), chunk: String::new(), done: true,
+            context: context.to_string(),
+            chunk: format!("\u{26a0} Ollama not running at {endpoint}"),
+            done: true,
         }).await;
         return;
     }
@@ -5557,11 +5569,31 @@ async fn ollama_stream_to_event(
         Err(e) => {
             tracing::warn!("Ollama HTTP error: {e}");
             let _ = event_tx.send(MatrixEvent::OllamaChunk {
-                context: context.to_string(), chunk: String::new(), done: true,
+                context: context.to_string(),
+                chunk: format!("\u{26a0} Ollama connection error: {e}"),
+                done: true,
             }).await;
             return;
         }
     };
+
+    // Check for HTTP errors (e.g. 404 when the model isn't downloaded).
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Try to extract Ollama's error message from the body.
+        let body_text = resp.text().await.unwrap_or_default();
+        let ollama_error = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        tracing::warn!("Ollama /api/chat error: {ollama_error}");
+        let _ = event_tx.send(MatrixEvent::OllamaChunk {
+            context: context.to_string(),
+            chunk: format!("\u{26a0} {ollama_error}"),
+            done: true,
+        }).await;
+        return;
+    }
 
     use futures_util::StreamExt;
     let mut stream = Box::pin(resp.bytes_stream());

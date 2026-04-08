@@ -2028,15 +2028,15 @@ impl MxWindow {
                             if window.imp().hover_room_id.borrow().as_deref() != Some(room_id) {
                                 // Stale — ignore.
                             } else if done && chunk.is_empty() {
-                                // Empty done = Ollama unavailable, no messages, or
-                                // the final protocol terminator after real content.
-                                // Only dismiss if no content was ever shown — otherwise
-                                // let the user read and close manually.
+                                // Empty done = final protocol terminator after real content.
+                                // Let the user read and close manually — don't auto-dismiss.
                                 let has_content = window.imp().hover_popover.child()
                                     .and_then(|w| w.downcast::<gtk::Box>().ok())
                                     .map(|b| b.has_css_class("preview-content"))
                                     .unwrap_or(false);
                                 if !has_content {
+                                    // Nothing ever rendered — Ollama unavailable or no messages.
+                                    // Show a brief error instead of silently dismissing.
                                     if let Some(sid) = window.imp().hover_pulse_timer.borrow_mut().take() {
                                         sid.remove();
                                     }
