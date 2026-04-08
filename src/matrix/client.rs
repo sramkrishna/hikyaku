@@ -4487,7 +4487,7 @@ async fn handle_join_room(
     room_id_or_alias: &str,
     extra_via: &[String],
 ) {
-    use matrix_sdk::ruma::{RoomOrAliasId, ServerName};
+    use matrix_sdk::ruma::{RoomAliasId, RoomOrAliasId, ServerName};
 
     let Ok(id) = RoomOrAliasId::parse(room_id_or_alias) else {
         let _ = event_tx
@@ -4498,23 +4498,48 @@ async fn handle_join_room(
         return;
     };
 
-    // Build a de-duplicated set of via hints:
-    //   1. The server embedded in the room ID / alias (e.g. "gnome.org" from "!abc:gnome.org")
-    //   2. Any extra servers supplied by the caller (e.g. the directory server)
-    let mut via: Vec<matrix_sdk::ruma::OwnedServerName> = room_id_or_alias
-        .splitn(2, ':')
-        .nth(1)
-        .and_then(|s| ServerName::parse(s).ok().map(|n| n.to_owned()))
-        .into_iter()
-        .collect();
-    for s in extra_via {
-        if let Ok(name) = ServerName::parse(s.as_str()) {
-            let owned = name.to_owned();
-            if !via.contains(&owned) {
-                via.push(owned);
+    // If the input is a room alias, resolve it first to get the live list of
+    // servers currently participating in the room.  This is much more reliable
+    // than guessing via servers from the room ID alone — the resolution
+    // response always includes currently-active federation servers.
+    let via: Vec<matrix_sdk::ruma::OwnedServerName> = if id.is_room_alias_id() {
+        if let Ok(alias) = RoomAliasId::parse(room_id_or_alias) {
+            match client.resolve_room_alias(&alias).await {
+                Ok(resolved) => {
+                    tracing::debug!(
+                        "Resolved alias {} → {} via {:?}",
+                        alias, resolved.room_id, resolved.servers
+                    );
+                    resolved.servers.into_iter().take(3).collect()
+                }
+                Err(e) => {
+                    tracing::warn!("Alias resolution failed for {alias}: {e}");
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        }
+    } else {
+        // Room ID: build via from the embedded server + any caller-supplied hints.
+        let mut v: Vec<matrix_sdk::ruma::OwnedServerName> = room_id_or_alias
+            .splitn(2, ':')
+            .nth(1)
+            .and_then(|s| ServerName::parse(s).ok().map(|n| n.to_owned()))
+            .into_iter()
+            .collect();
+        for s in extra_via {
+            if let Ok(name) = ServerName::parse(s.as_str()) {
+                let owned = name.to_owned();
+                if !v.contains(&owned) {
+                    v.push(owned);
+                }
             }
         }
-    }
+        v
+    };
+
+    tracing::info!("Joining {room_id_or_alias} via {:?}", via);
 
     match client.join_room_by_id_or_alias(&id, &via).await {
         Ok(room) => {
