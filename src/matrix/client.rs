@@ -4463,7 +4463,7 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
 }
 
 async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id_or_alias: &str) {
-    use matrix_sdk::ruma::RoomOrAliasId;
+    use matrix_sdk::ruma::{RoomOrAliasId, ServerName};
 
     let Ok(id) = RoomOrAliasId::parse(room_id_or_alias) else {
         let _ = event_tx
@@ -4474,7 +4474,18 @@ async fn handle_join_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_
         return;
     };
 
-    match client.join_room_by_id_or_alias(&id, &[]).await {
+    // Extract the server name from the alias/room-id (the part after ':') and
+    // pass it as a `via` hint so the homeserver knows where to federate.
+    // Without this, joining rooms on foreign servers fails with M_UNKNOWN /
+    // "no known servers".
+    let via: Vec<matrix_sdk::ruma::OwnedServerName> = room_id_or_alias
+        .splitn(2, ':')
+        .nth(1)
+        .and_then(|s| ServerName::parse(s).ok().map(|n| n.to_owned()))
+        .into_iter()
+        .collect();
+
+    match client.join_room_by_id_or_alias(&id, &via).await {
         Ok(room) => {
             let room_id = room.room_id().to_string();
             // display_name() fetches from server if not yet cached — use it
