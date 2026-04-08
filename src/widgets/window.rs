@@ -3713,7 +3713,7 @@ impl MxWindow {
 
         let server_entry = adw::EntryRow::builder()
             .title("Homeserver")
-            .text("matrix.org")
+            .text(&homeserver)
             .show_apply_button(true)
             .build();
         dir_group.add(&server_entry);
@@ -3821,9 +3821,9 @@ impl MxWindow {
 
         dialog.present(Some(self));
 
-        // Initial public directory fetch — matrix.org, no filter.
+        // Initial public directory fetch — user's homeserver, no filter.
         glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-            let server = if homeserver.is_empty() { None } else { Some("matrix.org".to_string()) };
+            let server = if homeserver.is_empty() { None } else { Some(homeserver.clone()) };
             glib::spawn_future_local(async move {
                 let _ = tx.send(MatrixCommand::BrowsePublicRooms {
                     search_term: None,
