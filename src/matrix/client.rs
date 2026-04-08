@@ -4539,7 +4539,7 @@ async fn handle_join_room(
         v
     };
 
-    tracing::info!("Joining {room_id_or_alias} via {:?}", via);
+    tracing::warn!("Joining '{}' via {:?}", room_id_or_alias, via);
 
     match client.join_room_by_id_or_alias(&id, &via).await {
         Ok(room) => {
