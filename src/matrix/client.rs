@@ -4407,9 +4407,21 @@ async fn handle_browse_public_rooms(
                 .into_iter()
                 .map(|r| {
                     let alias = r.canonical_alias.as_ref().map(|a| a.to_string());
+                    // Some buggy servers return room IDs without the :server component.
+                    // Patch them by appending the directory server so via_servers is never empty.
+                    let raw_id = r.room_id.to_string();
+                    let room_id = if !raw_id.contains(':') {
+                        if let Some(srv) = server {
+                            format!("{}:{}", raw_id, srv)
+                        } else {
+                            raw_id
+                        }
+                    } else {
+                        raw_id
+                    };
                     SpaceDirectoryRoom {
-                        already_joined: joined_rooms.contains(&r.room_id.to_string()),
-                        room_id: r.room_id.to_string(),
+                        already_joined: joined_rooms.contains(&room_id),
+                        room_id,
                         name: r.name.clone().unwrap_or_else(|| {
                             alias.clone().unwrap_or_else(|| r.room_id.to_string())
                         }),
