@@ -959,11 +959,11 @@ mod imp {
 
             // Model picker — only visible when switch is on.
             const MODELS: &[(&str, &str)] = &[
-                ("qwen2.5:3b", "Best balance of accuracy and size — recommended"),
-                ("llama3.2",   "Meta's 3B model, good general-purpose chat"),
-                ("mistral",    "Larger 7B model, higher accuracy, needs more RAM"),
-                ("phi4-mini",  "Smallest model, lowest RAM usage"),
-                ("gemma3",     "Google's open model"),
+                ("qwen2.5:3b",   "Best balance of accuracy and size — recommended"),
+                ("llama3.2:3b",  "Meta's 3B model, good general-purpose chat"),
+                ("mistral:7b",   "Larger 7B model, higher accuracy, needs more RAM"),
+                ("phi4-mini:3.8b", "Smallest model, lowest RAM usage"),
+                ("gemma3:4b",    "Google's open model, 4B variant"),
             ];
 
             let model_list = gtk::StringList::new(&[]);
