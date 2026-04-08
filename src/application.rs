@@ -172,8 +172,15 @@ mod imp {
 use gtk::glib;
 use gtk::gio;
 
-/// Extract a Matrix room ID or alias from a matrix: URI.
+/// Extract a Matrix room ID or alias from a matrix: URI or https://matrix.to link.
+///
+/// Handles:
+///   - `matrix:r/alias/server` → `#alias:server`
+///   - `matrix:roomid/!id/server` → `!id:server`
+///   - `https://matrix.to/#/!roomid:server` → `!roomid:server`
+///   - `https://matrix.to/#/#alias:server` → `#alias:server`
 fn parse_matrix_uri(uri: &str) -> Option<String> {
+    // matrix: URI scheme (MSC2312).
     if let Some(rest) = uri.strip_prefix("matrix:r/") {
         let alias = rest.split('?').next().unwrap_or(rest);
         return Some(format!("#{}", alias.replacen('/', ":", 1)));
@@ -182,7 +189,37 @@ fn parse_matrix_uri(uri: &str) -> Option<String> {
         let id = rest.split('?').next().unwrap_or(rest);
         return Some(format!("!{}", id.replacen('/', ":", 1)));
     }
+    // https://matrix.to/#/ links (opened via xdg-open when registered as handler).
+    if let Some(rest) = uri.strip_prefix("https://matrix.to/#/") {
+        let id = rest.split('?').next().unwrap_or(rest);
+        // Minimal percent-decode for %21 (!) and %23 (#).
+        let id = percent_decode(id);
+        if id.starts_with('!') || id.starts_with('#') {
+            return Some(id);
+        }
+    }
     None
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 glib::wrapper! {

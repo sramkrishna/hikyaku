@@ -118,6 +118,9 @@ mod imp {
         /// Join buttons currently in "Joining…" state, keyed by room_id.
         /// Cleared and updated when RoomJoined / JoinFailed arrives.
         pub directory_join_buttons: RefCell<std::collections::HashMap<String, gtk::Button>>,
+        /// The gtk::Stack inside the open directory dialog — flipped from "empty"
+        /// to "results" when the first search response arrives.
+        pub directory_stack: RefCell<Option<gtk::Stack>>,
         /// GObject list model for the personal contact book (Rolodex).
         /// Shared between the prefs page and the add/remove callbacks.
         pub rolodex_store: gio::ListStore,
@@ -211,6 +214,7 @@ mod imp {
                 directory_list_box: RefCell::new(None),
                 directory_spaces_only: Cell::new(false),
                 directory_join_buttons: RefCell::new(std::collections::HashMap::new()),
+                directory_stack: RefCell::new(None),
                 rolodex_store: {
                     let store = gio::ListStore::new::<crate::models::RolodexEntryObject>();
                     // Populate from JSON on startup.
@@ -3185,26 +3189,16 @@ impl MxWindow {
                         window.show_new_dm_bar();
                     }
                     Some("rooms") => {
-                        let tx = window.imp().command_tx.get().unwrap().clone();
-                        window.imp().directory_spaces_only.set(false);
-                        glib::spawn_future_local(async move {
-                            let _ = tx.send(crate::matrix::MatrixCommand::BrowsePublicRooms {
-                                search_term: None,
-                                spaces_only: false,
-                                server: None,
-                            }).await;
-                        });
+                        if window.imp().directory_dialog.borrow().is_none() {
+                            window.imp().directory_spaces_only.set(false);
+                            window.show_space_directory("Browse Rooms & Spaces", &[]);
+                        }
                     }
                     Some("spaces") => {
-                        let tx = window.imp().command_tx.get().unwrap().clone();
-                        window.imp().directory_spaces_only.set(true);
-                        glib::spawn_future_local(async move {
-                            let _ = tx.send(crate::matrix::MatrixCommand::BrowsePublicRooms {
-                                search_term: None,
-                                spaces_only: true,
-                                server: None,
-                            }).await;
-                        });
+                        if window.imp().directory_dialog.borrow().is_none() {
+                            window.imp().directory_spaces_only.set(true);
+                            window.show_space_directory("Browse Spaces", &[]);
+                        }
                     }
                     _ => {
                         window.show_join_bar();
@@ -3275,7 +3269,7 @@ impl MxWindow {
 
         // Create an inline entry bar for the room ID/alias.
         let entry = gtk::Entry::builder()
-            .placeholder_text("#room:server or !id:server")
+            .placeholder_text("#room:server, !id:server, or https://matrix.to/…")
             .hexpand(true)
             .build();
         if let Some(text) = initial {
@@ -3334,13 +3328,15 @@ impl MxWindow {
         let dismiss2 = dismiss.clone();
         let toast2 = toast_overlay.clone();
         let do_join = move || {
-            let text = entry2.text().to_string();
-            if text.is_empty() { return; }
+            let raw = entry2.text().to_string();
+            if raw.is_empty() { return; }
+            // Parse matrix.to / matrix: links into canonical room IDs/aliases.
+            let room_id_or_alias = parse_matrix_link_or_id(&raw).unwrap_or(raw);
             let tx = tx2.clone();
             let dismiss = dismiss2.clone();
             let _toast = toast2.clone();
             glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: text }).await;
+                let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias }).await;
                 dismiss();
             });
         };
@@ -3444,6 +3440,12 @@ impl MxWindow {
                 imp.command_tx.get().unwrap(),
                 &mut imp.directory_join_buttons.borrow_mut(),
             );
+            // Flip the stack from "empty" to "results" if rooms arrived.
+            if !rooms.is_empty() {
+                if let Some(stack) = imp.directory_stack.borrow().as_ref() {
+                    stack.set_visible_child_name("results");
+                }
+            }
             return;
         }
         self.show_space_directory(title, rooms);
@@ -3524,43 +3526,36 @@ impl MxWindow {
 
         let dialog = adw::Dialog::builder()
             .title(title)
-            .content_width(420)
-            .content_height(540)
+            .content_width(460)
+            .content_height(560)
             .build();
 
         let toolbar = adw::ToolbarView::new();
         let header = adw::HeaderBar::new();
 
-        // Room name search entry in the header title.
+        // Search entry is the header title — immediately obvious.
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Search rooms…")
+            .placeholder_text(if spaces_only { "Search spaces…" } else { "Search rooms and spaces…" })
             .hexpand(true)
             .build();
         header.set_title_widget(Some(&search_entry));
         toolbar.add_top_bar(&header);
 
-        // Server entry row — lets the user browse any other homeserver.
-        let server_entry = gtk::Entry::builder()
-            .placeholder_text("homeserver (e.g. matrix.org)")
+        // Server entry — inline below header, less prominent than the search.
+        let server_entry = adw::EntryRow::builder()
+            .title("Homeserver")
             .text(&homeserver)
-            .hexpand(true)
+            .show_apply_button(true)
             .build();
-        let server_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+
+        let server_group = adw::PreferencesGroup::builder()
             .margin_start(12)
             .margin_end(12)
             .margin_top(6)
-            .margin_bottom(2)
             .build();
-        let server_label = gtk::Label::builder()
-            .label("Server:")
-            .css_classes(["dim-label"])
-            .build();
-        server_row.append(&server_label);
-        server_row.append(&server_entry);
-        let server_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        server_group.add(&server_entry);
 
+        // Results list.
         let list_box = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
@@ -3570,28 +3565,47 @@ impl MxWindow {
             .margin_bottom(12)
             .build();
 
-        let content_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
+        // Empty / loading state shown when the list has no results yet.
+        let status_page = adw::StatusPage::builder()
+            .icon_name("system-search-symbolic")
+            .title("Search for Rooms")
+            .description(if spaces_only {
+                "Type to find spaces on your homeserver"
+            } else {
+                "Type to find rooms and spaces on your homeserver"
+            })
+            .vexpand(true)
             .build();
-        content_box.append(&server_row);
-        content_box.append(&server_separator);
+
+        let stack = gtk::Stack::new();
+        stack.add_named(&status_page, Some("empty"));
 
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .child(&list_box)
             .build();
-        content_box.append(&scroll);
+        stack.add_named(&scroll, Some("results"));
+        stack.set_visible_child_name("empty");
+
+        let content_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        content_box.append(&server_group);
+        content_box.append(&stack);
         toolbar.set_content(Some(&content_box));
 
-        Self::populate_directory_list(
-            &list_box,
-            rooms,
-            &tx,
-            &mut imp.directory_join_buttons.borrow_mut(),
-        );
+        if !rooms.is_empty() {
+            Self::populate_directory_list(
+                &list_box,
+                rooms,
+                &tx,
+                &mut imp.directory_join_buttons.borrow_mut(),
+            );
+            stack.set_visible_child_name("results");
+        }
 
-        // Shared debounce timer — cancelled and restarted by either entry changing.
+        // Shared debounce timer.
         let debounce: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
             std::rc::Rc::new(std::cell::Cell::new(None));
 
@@ -3600,20 +3614,33 @@ impl MxWindow {
             let search_entry = search_entry.clone();
             let server_entry = server_entry.clone();
             let debounce = debounce.clone();
+            let win_weak = self.downgrade();
             move || {
                 let tx = tx.clone();
                 let text = search_entry.text().to_string();
                 let srv = server_entry.text().to_string();
-                // Cancel any pending timer.  Only call remove() when the ID is
-                // still in the cell — the timer clears itself on fire, so if
-                // the cell is already None the timer already ran.
                 if let Some(id) = debounce.take() { id.remove(); }
+
+                // If the input looks like a direct room identifier or a matrix.to
+                // link, route straight to JoinRoom instead of browsing.
+                if let Some(matrix_id) = parse_matrix_link_or_id(&text) {
+                    let win_weak = win_weak.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::JoinRoom {
+                            room_id_or_alias: matrix_id.clone(),
+                        }).await;
+                        // Also navigate if we already have the room.
+                        if let Some(win) = win_weak.upgrade() {
+                            win.handle_matrix_link(&matrix_id);
+                        }
+                    });
+                    return;
+                }
+
                 let debounce_self = debounce.clone();
                 let id = glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(400),
+                    std::time::Duration::from_millis(350),
                     move || {
-                        // Clear our own ID so a future cancel doesn't call
-                        // remove() on an already-fired source.
                         debounce_self.set(None);
                         let term = if text.is_empty() { None } else { Some(text.clone()) };
                         let server = if srv.is_empty() { None } else { Some(srv.clone()) };
@@ -3632,13 +3659,20 @@ impl MxWindow {
 
         let fetch2 = do_fetch.clone();
         search_entry.connect_search_changed(move |_| fetch2());
-        server_entry.connect_changed(move |_| do_fetch());
+        // Trigger fetch when the user hits Enter / Apply on the server entry.
+        server_entry.connect_apply(move |_| do_fetch());
 
         dialog.set_child(Some(&toolbar));
 
-        // Store references so we can update the list in-place on search responses.
+        // Auto-focus the search entry once the dialog is mapped.
+        let se = search_entry.clone();
+        dialog.connect_map(move |_| { se.grab_focus(); });
+
+        // Store references for in-place updates when search results arrive.
         *imp.directory_dialog.borrow_mut() = Some(dialog.clone());
         *imp.directory_list_box.borrow_mut() = Some(list_box);
+        // Store the stack so show_or_update_directory can flip between states.
+        *imp.directory_stack.borrow_mut() = Some(stack);
 
         // Clear stored refs when the dialog closes.
         let win_weak = self.downgrade();
@@ -3646,11 +3680,27 @@ impl MxWindow {
             if let Some(win) = win_weak.upgrade() {
                 *win.imp().directory_dialog.borrow_mut() = None;
                 *win.imp().directory_list_box.borrow_mut() = None;
+                *win.imp().directory_stack.borrow_mut() = None;
                 win.imp().directory_join_buttons.borrow_mut().clear();
             }
         });
 
         dialog.present(Some(self));
+
+        // Fire an initial search immediately so rooms load on open.
+        // Delay 50 ms so the dialog renders first.
+        let tx2 = tx.clone();
+        let hs = homeserver.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+            let server = if hs.is_empty() { None } else { Some(hs.clone()) };
+            glib::spawn_future_local(async move {
+                let _ = tx2.send(MatrixCommand::BrowsePublicRooms {
+                    search_term: None,
+                    spaces_only,
+                    server,
+                }).await;
+            });
+        });
     }
 
     fn show_room_details(&self) {
@@ -5700,4 +5750,62 @@ fn build_invite_dialog(
     } else {
         dialog.present(Some(fallback_parent));
     }
+}
+
+/// Detect whether `text` is a directly-joinable Matrix identifier or link.
+///
+/// Accepts:
+///   - `https://matrix.to/#/!roomid:server`
+///   - `https://matrix.to/#/#alias:server`
+///   - `matrix:r/alias/server` / `matrix:roomid/id/server`
+///   - `#alias:server`
+///   - `!roomid:server`
+///
+/// Returns the canonical room ID or alias if recognised, else `None`.
+fn parse_matrix_link_or_id(text: &str) -> Option<String> {
+    let t = text.trim();
+    // https://matrix.to/#/ prefix.
+    if let Some(rest) = t.strip_prefix("https://matrix.to/#/") {
+        let id = rest.split('?').next().unwrap_or(rest);
+        let id = percent_decode_simple(id);
+        if id.starts_with('!') || id.starts_with('#') {
+            return Some(id);
+        }
+    }
+    // matrix: URI scheme (MSC2312).
+    if let Some(rest) = t.strip_prefix("matrix:r/") {
+        let alias = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("#{}", alias.replacen('/', ":", 1)));
+    }
+    if let Some(rest) = t.strip_prefix("matrix:roomid/") {
+        let id = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("!{}", id.replacen('/', ":", 1)));
+    }
+    // Bare room alias / ID (must contain a colon separating localpart from server).
+    if (t.starts_with('#') || t.starts_with('!')) && t.contains(':') {
+        return Some(t.to_string());
+    }
+    None
+}
+
+/// Minimal percent-decode for %21 and %23 (common in matrix.to links).
+fn percent_decode_simple(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
