@@ -4419,6 +4419,12 @@ async fn handle_browse_public_rooms(
                     } else {
                         raw_id
                     };
+                    // The via hint must be the room's own server, not the directory server.
+                    // The room's server is in the room_id or canonical_alias.  Fall back to
+                    // the directory server only if neither has a server component.
+                    let via_server = room_id.splitn(2, ':').nth(1).map(|s| s.to_string())
+                        .or_else(|| alias.as_ref().and_then(|a| a.splitn(2, ':').nth(1).map(|s| s.to_string())))
+                        .or_else(|| server.map(|s| s.to_string()));
                     SpaceDirectoryRoom {
                         already_joined: joined_rooms.contains(&room_id),
                         room_id,
@@ -4428,7 +4434,7 @@ async fn handle_browse_public_rooms(
                         canonical_alias: alias,
                         topic: r.topic.unwrap_or_default(),
                         member_count: r.num_joined_members.into(),
-                        via_server: server.map(|s| s.to_string()),
+                        via_server,
                     }
                 })
                 .collect();
@@ -4525,8 +4531,10 @@ async fn handle_join_room(
                     resolved.servers.into_iter().take(3).collect()
                 }
                 Err(e) => {
-                    tracing::warn!("Alias resolution failed for {alias}: {e}");
-                    vec![]
+                    tracing::warn!("Alias resolution failed for {alias}: {e}, falling back to caller-supplied via hints");
+                    extra_via.iter()
+                        .filter_map(|s| ServerName::parse(s.as_str()).ok().map(|n| n.to_owned()))
+                        .collect()
                 }
             }
         } else {
