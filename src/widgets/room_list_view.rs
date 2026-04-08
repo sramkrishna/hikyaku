@@ -589,6 +589,22 @@ impl RoomListView {
         self.imp().view_stack.visible_child_name()
     }
 
+    /// Return all joined spaces as (room_id, display_name) pairs, sorted by name.
+    pub fn joined_spaces(&self) -> Vec<(String, String)> {
+        let registry = self.imp().room_registry.borrow();
+        let mut spaces: Vec<(String, String)> = registry.values()
+            .filter(|o| o.kind() == crate::matrix::RoomKind::Space)
+            .map(|o| (o.room_id(), o.name().to_string()))
+            .collect();
+        spaces.sort_by(|a, b| a.1.cmp(&b.1));
+        spaces
+    }
+
+    /// The room_id of the space currently being browsed in the Spaces tab, if any.
+    pub fn current_space_id(&self) -> Option<String> {
+        self.imp().current_space_id.borrow().clone()
+    }
+
     /// Toggle the search bar on/off.
     pub fn toggle_search(&self) {
         let bar = &self.imp().search_bar;

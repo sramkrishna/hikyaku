@@ -111,16 +111,17 @@ mod imp {
         pub inline_bar_active: Cell<bool>,
         /// Currently open public room directory dialog (if any).
         pub directory_dialog: RefCell<Option<adw::Dialog>>,
-        /// The ListBox inside the open directory dialog — updated in-place on search.
+        /// The ListBox inside the open directory dialog — updated in-place on global search.
         pub directory_list_box: RefCell<Option<gtk::ListBox>>,
-        /// Whether the open directory dialog is showing spaces (true) or rooms (false).
-        pub directory_spaces_only: Cell<bool>,
         /// Join buttons currently in "Joining…" state, keyed by room_id.
         /// Cleared and updated when RoomJoined / JoinFailed arrives.
         pub directory_join_buttons: RefCell<std::collections::HashMap<String, gtk::Button>>,
         /// The gtk::Stack inside the open directory dialog — flipped from "empty"
         /// to "results" when the first search response arrives.
         pub directory_stack: RefCell<Option<gtk::Stack>>,
+        /// ListBoxes inside each per-space expander row, keyed by space room_id.
+        /// SpaceDirectory events are routed here to populate the right expander.
+        pub directory_space_expanders: RefCell<std::collections::HashMap<String, gtk::ListBox>>,
         /// GObject list model for the personal contact book (Rolodex).
         /// Shared between the prefs page and the add/remove callbacks.
         pub rolodex_store: gio::ListStore,
@@ -212,9 +213,9 @@ mod imp {
                 inline_bar_active: Cell::new(false),
                 directory_dialog: RefCell::new(None),
                 directory_list_box: RefCell::new(None),
-                directory_spaces_only: Cell::new(false),
                 directory_join_buttons: RefCell::new(std::collections::HashMap::new()),
                 directory_stack: RefCell::new(None),
+                directory_space_expanders: RefCell::new(std::collections::HashMap::new()),
                 rolodex_store: {
                     let store = gio::ListStore::new::<crate::models::RolodexEntryObject>();
                     // Populate from JSON on startup.
@@ -2168,8 +2169,10 @@ impl MxWindow {
                             window.show_or_update_directory(&title, &rooms);
                         }
                     }
-                    MatrixEvent::SpaceDirectory { space_id: _, rooms } => {
-                        window.show_space_directory("Space Rooms", &rooms);
+                    MatrixEvent::SpaceDirectory { space_id, rooms } => {
+                        // Route into the expander for this space, or into the
+                        // scoped dialog list box if we're in single-space mode.
+                        window.populate_space_expander(&space_id, &rooms);
                     }
                     MatrixEvent::RoomLeft { room_id: _ } => {
                         // Room list will refresh on next sync.
@@ -3183,25 +3186,24 @@ impl MxWindow {
         let join_action = ActionEntryBuilder::new("join-room")
             .activate(|window: &Self, _, _| {
                 if window.imp().content_page.get().is_none() { return; }
+                if window.imp().directory_dialog.borrow().is_some() { return; }
                 let tab = window.imp().room_list_view.visible_tab();
                 match tab.as_deref() {
                     Some("messages") => {
                         window.show_new_dm_bar();
                     }
-                    Some("rooms") => {
-                        if window.imp().directory_dialog.borrow().is_none() {
-                            window.imp().directory_spaces_only.set(false);
-                            window.show_space_directory("Browse Rooms & Spaces", &[]);
-                        }
-                    }
                     Some("spaces") => {
-                        if window.imp().directory_dialog.borrow().is_none() {
-                            window.imp().directory_spaces_only.set(true);
-                            window.show_space_directory("Browse Spaces", &[]);
-                        }
+                        // If the user has drilled into a space, scope the dialog to it.
+                        let scoped = window.imp().room_list_view.current_space_id()
+                            .and_then(|id| {
+                                let reg = window.imp().room_list_view.imp().room_registry.borrow();
+                                reg.get(&id).map(|o| (id.clone(), o.name().to_string()))
+                            });
+                        window.show_space_directory(scoped);
                     }
                     _ => {
-                        window.show_join_bar();
+                        // "rooms" tab or fallback: global browser.
+                        window.show_space_directory(None);
                     }
                 }
             })
@@ -3429,10 +3431,9 @@ impl MxWindow {
         cancel_btn.connect_clicked(move |_| dismiss());
     }
 
-    /// Show the directory dialog or update it in-place if already open.
-    fn show_or_update_directory(&self, title: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+    /// `PublicRoomDirectory` arrived: update the global-search results list in-place.
+    fn show_or_update_directory(&self, _title: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
         let imp = self.imp();
-        // If the dialog is already open, just repopulate the list in-place.
         if let Some(list_box) = imp.directory_list_box.borrow().as_ref() {
             Self::populate_directory_list(
                 list_box,
@@ -3440,33 +3441,53 @@ impl MxWindow {
                 imp.command_tx.get().unwrap(),
                 &mut imp.directory_join_buttons.borrow_mut(),
             );
-            // Flip the stack from "empty" to "results" if rooms arrived.
             if !rooms.is_empty() {
                 if let Some(stack) = imp.directory_stack.borrow().as_ref() {
                     stack.set_visible_child_name("results");
                 }
             }
-            return;
         }
-        self.show_space_directory(title, rooms);
+    }
+
+    /// `SpaceDirectory` arrived: populate the matching expander (or scoped list).
+    fn populate_space_expander(&self, space_id: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+        let imp = self.imp();
+        // Scoped mode: the directory_list_box IS the space's room list.
+        // Global mode: find the ListBox stored in directory_space_expanders.
+        let target = {
+            let exp = imp.directory_space_expanders.borrow();
+            exp.get(space_id).cloned()
+        }.or_else(|| imp.directory_list_box.borrow().clone());
+
+        if let Some(list_box) = target {
+            Self::populate_directory_list(
+                &list_box,
+                rooms,
+                imp.command_tx.get().unwrap(),
+                &mut imp.directory_join_buttons.borrow_mut(),
+            );
+            if !rooms.is_empty() {
+                if let Some(stack) = imp.directory_stack.borrow().as_ref() {
+                    stack.set_visible_child_name("results");
+                }
+            }
+        }
     }
 
     /// Fill a ListBox with directory room rows.
-    ///
-    /// `join_buttons` is cleared and repopulated with the new Join buttons so
-    /// the `RoomJoined` / `JoinFailed` event handlers can update them.
     fn populate_directory_list(
         list_box: &gtk::ListBox,
         rooms: &[crate::matrix::SpaceDirectoryRoom],
         tx: &async_channel::Sender<MatrixCommand>,
         join_buttons: &mut std::collections::HashMap<String, gtk::Button>,
     ) {
-        join_buttons.clear();
+        // Remove old rows but keep any non-row children (spinner placeholder etc.).
         while let Some(child) = list_box.first_child() {
             list_box.remove(&child);
         }
+        join_buttons.retain(|k, _| rooms.iter().any(|r| &r.room_id == k));
+
         for room in rooms {
-            // Room topics can contain Pango-unsafe characters (& in URLs etc.).
             let safe_name = glib::markup_escape_text(&room.name);
             let safe_topic = glib::markup_escape_text(&room.topic);
             let subtitle = if safe_topic.is_empty() {
@@ -3481,11 +3502,10 @@ impl MxWindow {
                 .build();
 
             if room.already_joined {
-                let badge = gtk::Label::builder()
+                row.add_suffix(&gtk::Label::builder()
                     .label("Joined")
                     .css_classes(["dim-label", "caption"])
-                    .build();
-                row.add_suffix(&badge);
+                    .build());
             } else {
                 let join_btn = gtk::Button::builder()
                     .label("Join")
@@ -3500,112 +3520,233 @@ impl MxWindow {
                     let tx = tx.clone();
                     let rid = rid.clone();
                     glib::spawn_future_local(async move {
-                        let _ = tx.send(MatrixCommand::JoinRoom {
-                            room_id_or_alias: rid,
-                        }).await;
+                        let _ = tx.send(MatrixCommand::JoinRoom { room_id_or_alias: rid }).await;
                     });
                 });
                 join_buttons.insert(room.room_id.clone(), join_btn.clone());
                 row.add_suffix(&join_btn);
             }
-
             list_box.append(&row);
         }
     }
 
-    fn show_space_directory(&self, title: &str, rooms: &[crate::matrix::SpaceDirectoryRoom]) {
+    /// Open the room/space browser dialog.
+    ///
+    /// `scoped_space`: when `Some((space_id, space_name))` the dialog opens
+    /// pre-constrained to that space.  `None` opens the full browser with
+    /// per-joined-space expanders plus a global public-directory search.
+    fn show_space_directory(&self, scoped_space: Option<(String, String)>) {
         let imp = self.imp();
         let tx = imp.command_tx.get().unwrap().clone();
-        let spaces_only = imp.directory_spaces_only.get();
 
-        // Derive the user's homeserver from their user ID (@user:server → server).
         let homeserver = {
             let uid = imp.user_id.borrow();
             uid.splitn(2, ':').nth(1).unwrap_or("").to_string()
         };
 
+        let (dialog_title, placeholder) = match &scoped_space {
+            Some((_, name)) => (format!("Rooms in {name}"), "Filter rooms…"),
+            None            => ("Join a Room or Space".to_string(), "Search rooms and spaces, or paste a matrix.to link…"),
+        };
+
         let dialog = adw::Dialog::builder()
-            .title(title)
-            .content_width(460)
-            .content_height(560)
+            .title(&dialog_title)
+            .content_width(480)
+            .content_height(600)
             .build();
 
         let toolbar = adw::ToolbarView::new();
         let header = adw::HeaderBar::new();
 
-        // Search entry is the header title — immediately obvious.
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text(if spaces_only { "Search spaces…" } else { "Search rooms and spaces…" })
+            .placeholder_text(placeholder)
             .hexpand(true)
             .build();
         header.set_title_widget(Some(&search_entry));
         toolbar.add_top_bar(&header);
 
-        // Server entry — inline below header, less prominent than the search.
+        let content_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .vexpand(true)
+            .build();
+
+        // ── Scoped mode: show one space's rooms with a filter ─────────────────
+        if let Some((space_id, _space_name)) = &scoped_space {
+            let list_box = gtk::ListBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .css_classes(["boxed-list"])
+                .margin_start(12).margin_end(12)
+                .margin_top(6).margin_bottom(12)
+                .build();
+
+            let spinner = gtk::Spinner::builder().spinning(true).build();
+            let spinner_row = adw::ActionRow::builder()
+                .title("Loading rooms…")
+                .build();
+            spinner_row.add_suffix(&spinner);
+            list_box.append(&spinner_row);
+
+            let scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&list_box)
+                .build();
+            content_box.append(&scroll);
+            toolbar.set_content(Some(&content_box));
+
+            *imp.directory_dialog.borrow_mut() = Some(dialog.clone());
+            *imp.directory_list_box.borrow_mut() = Some(list_box.clone());
+
+            // Filter in-place as user types (client-side, after first load).
+            let lb = list_box.clone();
+            search_entry.connect_search_changed(move |se| {
+                let q = se.text().to_string().to_lowercase();
+                let mut child = lb.first_child();
+                while let Some(w) = child {
+                    child = w.next_sibling();
+                    if let Some(row) = w.downcast_ref::<adw::ActionRow>() {
+                        row.set_visible(q.is_empty() ||
+                            row.title().to_lowercase().contains(&q) ||
+                            row.subtitle().unwrap_or_default().to_lowercase().contains(&q));
+                    }
+                }
+            });
+
+            let win_weak = self.downgrade();
+            dialog.connect_closed(move |_| {
+                if let Some(win) = win_weak.upgrade() {
+                    *win.imp().directory_dialog.borrow_mut() = None;
+                    *win.imp().directory_list_box.borrow_mut() = None;
+                    win.imp().directory_join_buttons.borrow_mut().clear();
+                    *win.imp().directory_stack.borrow_mut() = None;
+                    win.imp().directory_space_expanders.borrow_mut().clear();
+                }
+            });
+
+            dialog.set_child(Some(&toolbar));
+            let se = search_entry.clone();
+            dialog.connect_map(move |_| { se.grab_focus(); });
+            dialog.present(Some(self));
+
+            // Fetch space rooms immediately.
+            let sid = space_id.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                let tx2 = tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx2.send(MatrixCommand::BrowseSpaceRooms { space_id: sid }).await;
+                });
+            });
+            return;
+        }
+
+        // ── Global mode: per-joined-space expanders + public directory search ─
+
+        let scroll_outer = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+
+        let outer_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(12).margin_end(12)
+            .margin_top(6).margin_bottom(12)
+            .spacing(12)
+            .build();
+        scroll_outer.set_child(Some(&outer_box));
+
+        // ── Joined spaces expanders ───────────────────────────────────────────
+        let joined = imp.room_list_view.joined_spaces();
+        if !joined.is_empty() {
+            let spaces_group = adw::PreferencesGroup::builder()
+                .title("Your Spaces")
+                .build();
+
+            for (space_id, space_name) in joined {
+                let expander = adw::ExpanderRow::builder()
+                    .title(&space_name)
+                    .build();
+
+                // ListBox for the rooms inside this space.
+                let inner_lb = gtk::ListBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .css_classes(["boxed-list"])
+                    .margin_start(12).margin_end(12)
+                    .margin_top(4).margin_bottom(4)
+                    .build();
+
+                // Placeholder spinner row shown before rooms load.
+                let spinner_row = adw::ActionRow::builder()
+                    .title("Loading…")
+                    .build();
+                spinner_row.add_suffix(&gtk::Spinner::builder().spinning(true).build());
+                inner_lb.append(&spinner_row);
+
+                expander.add_row(&inner_lb);
+                spaces_group.add(&expander);
+
+                // Store for routing SpaceDirectory events.
+                imp.directory_space_expanders.borrow_mut()
+                    .insert(space_id.clone(), inner_lb);
+
+                // Fetch rooms when the user expands the row.
+                let tx2 = tx.clone();
+                let sid = space_id.clone();
+                let already_fetched = std::rc::Rc::new(std::cell::Cell::new(false));
+                expander.connect_expanded_notify(move |exp| {
+                    if exp.is_expanded() && !already_fetched.get() {
+                        already_fetched.set(true);
+                        let tx3 = tx2.clone();
+                        let s = sid.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx3.send(MatrixCommand::BrowseSpaceRooms { space_id: s }).await;
+                        });
+                    }
+                });
+            }
+            outer_box.append(&spaces_group);
+        }
+
+        // ── Public directory search ───────────────────────────────────────────
+        let dir_group = adw::PreferencesGroup::builder()
+            .title("Public Directory")
+            .build();
+
         let server_entry = adw::EntryRow::builder()
             .title("Homeserver")
-            .text(&homeserver)
+            .text("matrix.org")
             .show_apply_button(true)
             .build();
+        dir_group.add(&server_entry);
+        outer_box.append(&dir_group);
 
-        let server_group = adw::PreferencesGroup::builder()
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .build();
-        server_group.add(&server_entry);
-
-        // Results list.
-        let list_box = gtk::ListBox::builder()
+        // Results list for public directory.
+        let pub_list_box = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(12)
             .build();
 
-        // Empty / loading state shown when the list has no results yet.
         let status_page = adw::StatusPage::builder()
             .icon_name("system-search-symbolic")
-            .title("Search for Rooms")
-            .description(if spaces_only {
-                "Type to find spaces on your homeserver"
-            } else {
-                "Type to find rooms and spaces on your homeserver"
-            })
+            .title("Search Public Rooms")
+            .description("Type above or change the homeserver to browse")
             .vexpand(true)
             .build();
 
         let stack = gtk::Stack::new();
         stack.add_named(&status_page, Some("empty"));
-
-        let scroll = gtk::ScrolledWindow::builder()
+        let scroll_inner = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&list_box)
+            .min_content_height(200)
+            .child(&pub_list_box)
             .build();
-        stack.add_named(&scroll, Some("results"));
+        stack.add_named(&scroll_inner, Some("results"));
         stack.set_visible_child_name("empty");
+        outer_box.append(&stack);
 
-        let content_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .build();
-        content_box.append(&server_group);
-        content_box.append(&stack);
+        content_box.append(&scroll_outer);
         toolbar.set_content(Some(&content_box));
 
-        if !rooms.is_empty() {
-            Self::populate_directory_list(
-                &list_box,
-                rooms,
-                &tx,
-                &mut imp.directory_join_buttons.borrow_mut(),
-            );
-            stack.set_visible_child_name("results");
-        }
-
-        // Shared debounce timer.
+        // Debounced fetch for public directory.
         let debounce: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
             std::rc::Rc::new(std::cell::Cell::new(None));
 
@@ -3621,15 +3762,13 @@ impl MxWindow {
                 let srv = server_entry.text().to_string();
                 if let Some(id) = debounce.take() { id.remove(); }
 
-                // If the input looks like a direct room identifier or a matrix.to
-                // link, route straight to JoinRoom instead of browsing.
+                // Direct join for matrix.to / #alias:server input.
                 if let Some(matrix_id) = parse_matrix_link_or_id(&text) {
                     let win_weak = win_weak.clone();
                     glib::spawn_future_local(async move {
                         let _ = tx.send(MatrixCommand::JoinRoom {
                             room_id_or_alias: matrix_id.clone(),
                         }).await;
-                        // Also navigate if we already have the room.
                         if let Some(win) = win_weak.upgrade() {
                             win.handle_matrix_link(&matrix_id);
                         }
@@ -3647,7 +3786,7 @@ impl MxWindow {
                         glib::spawn_future_local(async move {
                             let _ = tx.send(MatrixCommand::BrowsePublicRooms {
                                 search_term: term,
-                                spaces_only,
+                                spaces_only: false,
                                 server,
                             }).await;
                         });
@@ -3659,22 +3798,16 @@ impl MxWindow {
 
         let fetch2 = do_fetch.clone();
         search_entry.connect_search_changed(move |_| fetch2());
-        // Trigger fetch when the user hits Enter / Apply on the server entry.
         server_entry.connect_apply(move |_| do_fetch());
 
         dialog.set_child(Some(&toolbar));
-
-        // Auto-focus the search entry once the dialog is mapped.
         let se = search_entry.clone();
         dialog.connect_map(move |_| { se.grab_focus(); });
 
-        // Store references for in-place updates when search results arrive.
         *imp.directory_dialog.borrow_mut() = Some(dialog.clone());
-        *imp.directory_list_box.borrow_mut() = Some(list_box);
-        // Store the stack so show_or_update_directory can flip between states.
+        *imp.directory_list_box.borrow_mut() = Some(pub_list_box);
         *imp.directory_stack.borrow_mut() = Some(stack);
 
-        // Clear stored refs when the dialog closes.
         let win_weak = self.downgrade();
         dialog.connect_closed(move |_| {
             if let Some(win) = win_weak.upgrade() {
@@ -3682,21 +3815,19 @@ impl MxWindow {
                 *win.imp().directory_list_box.borrow_mut() = None;
                 *win.imp().directory_stack.borrow_mut() = None;
                 win.imp().directory_join_buttons.borrow_mut().clear();
+                win.imp().directory_space_expanders.borrow_mut().clear();
             }
         });
 
         dialog.present(Some(self));
 
-        // Fire an initial search immediately so rooms load on open.
-        // Delay 50 ms so the dialog renders first.
-        let tx2 = tx.clone();
-        let hs = homeserver.clone();
+        // Initial public directory fetch — matrix.org, no filter.
         glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-            let server = if hs.is_empty() { None } else { Some(hs.clone()) };
+            let server = if homeserver.is_empty() { None } else { Some("matrix.org".to_string()) };
             glib::spawn_future_local(async move {
-                let _ = tx2.send(MatrixCommand::BrowsePublicRooms {
+                let _ = tx.send(MatrixCommand::BrowsePublicRooms {
                     search_term: None,
-                    spaces_only,
+                    spaces_only: false,
                     server,
                 }).await;
             });
