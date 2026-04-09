@@ -1756,10 +1756,18 @@ impl MxWindow {
                             // Re-check the current room inside the idle: a stale idle
                             // that fires after the user has switched rooms would otherwise
                             // splice the wrong data into the new room's list_store.
+                            // Consume any pending flash event_id.  For background
+                            // refreshes set_messages is deferred to an idle, so we
+                            // must defer the scroll too — otherwise scroll_to_event
+                            // fires before event_index is populated and falls through
+                            // to SeekToEvent even when the event is in the batch.
+                            let pending_flash = window.imp().pending_flash_event_id.take();
+
                             if is_background {
                                 let mv = message_view.clone();
                                 let weak_win = window.downgrade();
                                 let guard_rid = room_id.clone();
+                                let tx_seek = command_tx.clone();
                                 glib::idle_add_local_once(move || {
                                     let still_here = weak_win.upgrade()
                                         .map(|w| w.imp().current_room_id.borrow()
@@ -1768,32 +1776,40 @@ impl MxWindow {
                                     if still_here {
                                         mv.set_messages(&messages, prev_batch_token);
                                     }
+                                    // Scroll after set_messages so event_index is populated.
+                                    if let Some(eid) = pending_flash {
+                                        let found = mv.scroll_to_event(&eid);
+                                        if !found {
+                                            mv.start_seek_loading();
+                                            glib::spawn_future_local(async move {
+                                                let _ = tx_seek.send(MatrixCommand::SeekToEvent {
+                                                    room_id: guard_rid,
+                                                    event_id: eid,
+                                                }).await;
+                                            });
+                                        }
+                                    }
                                 });
                             } else {
                                 message_view.set_messages(&messages, prev_batch_token);
-                            }
-                            let mv_bm2 = message_view.clone();
-                            let rid_bm2 = room_id.clone();
-                            glib::idle_add_local_once(move || mv_bm2.load_bookmarks(&rid_bm2));
-
-                            // Flash a bookmarked message if one is pending.
-                            if let Some(eid) = window.imp().pending_flash_event_id.take() {
-                                let mv = message_view.clone();
-                                let found = mv.scroll_to_event(&eid);
-                                if !found {
-                                    // Event not in loaded timeline — show loading banner
-                                    // immediately so the user gets instant feedback.
-                                    mv.start_seek_loading();
-                                    let rid = room_id.clone();
-                                    let tx = command_tx.clone();
-                                    glib::idle_add_local_once(move || {
-                                        glib::spawn_future_local(async move {
-                                            let _ = tx.send(MatrixCommand::SeekToEvent {
-                                                room_id: rid,
-                                                event_id: eid,
-                                            }).await;
+                                // For fresh loads set_messages ran synchronously above,
+                                // so event_index is already populated — scroll immediately.
+                                if let Some(eid) = pending_flash {
+                                    let mv = message_view.clone();
+                                    let found = mv.scroll_to_event(&eid);
+                                    if !found {
+                                        mv.start_seek_loading();
+                                        let rid = room_id.clone();
+                                        let tx = command_tx.clone();
+                                        glib::idle_add_local_once(move || {
+                                            glib::spawn_future_local(async move {
+                                                let _ = tx.send(MatrixCommand::SeekToEvent {
+                                                    room_id: rid,
+                                                    event_id: eid,
+                                                }).await;
+                                            });
                                         });
-                                    });
+                                    }
                                 }
                             }
                             for (uid, mxc) in to_fetch {
