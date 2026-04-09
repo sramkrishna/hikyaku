@@ -5715,54 +5715,41 @@ fn show_ai_setup_dialog(window: &MxWindow) {
     // Track selected model tag.
     let selected_model = std::rc::Rc::new(std::cell::RefCell::new("qwen2.5:3b".to_string()));
 
-    // Build a checkmark toggle for each model row.
-    let checks: Vec<gtk::Image> = models.iter().enumerate().map(|(i, (name, tag, desc))| {
-        let row = adw::ActionRow::builder()
-            .title(*name)
-            .subtitle(*desc)
-            .activatable(true)
-            .build();
-        let check = gtk::Image::builder()
-            .icon_name(if i == 0 { "emblem-ok-symbolic" } else { "" })
-            .build();
-        row.add_suffix(&check);
-        model_group.add(&row);
+    // Build (ActionRow, Image, tag) triples so we can wire everything in one
+    // place without re-querying the PreferencesGroup widget tree (unreliable).
+    let model_triples: Vec<(adw::ActionRow, gtk::Image, String)> = models.iter().enumerate()
+        .map(|(i, (name, tag, desc))| {
+            let row = adw::ActionRow::builder()
+                .title(*name)
+                .subtitle(*desc)
+                .activatable(true)
+                .build();
+            let check = gtk::Image::new();
+            // First entry is pre-selected; rest show no icon (None ≠ "").
+            if i == 0 {
+                check.set_icon_name(Some("emblem-ok-symbolic"));
+            }
+            row.add_suffix(&check);
+            model_group.add(&row);
+            (row, check, tag.to_string())
+        })
+        .collect();
 
+    // Wire each row: on activate, update selected_model and repaint all
+    // checkmarks in a single pass over the triples vec.
+    let tags: Vec<String> = model_triples.iter().map(|(_, _, t)| t.clone()).collect();
+    let checks: Vec<gtk::Image> = model_triples.iter().map(|(_, c, _)| c.clone()).collect();
+    for (row, _check, tag) in &model_triples {
         let sel = selected_model.clone();
-        let tag_str = tag.to_string();
+        let tag_str = tag.clone();
+        let checks_inner = checks.clone();
+        let tags_inner = tags.clone();
         row.connect_activated(move |_| {
             *sel.borrow_mut() = tag_str.clone();
-        });
-        check
-    }).collect();
-
-    // Update checkmarks when selection changes.
-    {
-        let checks = checks.clone();
-        let sel = selected_model.clone();
-        // Wire activated signal to update all checkmarks.
-        for (i, (_name, tag, _desc)) in models.iter().enumerate() {
-            let checks_inner = checks.clone();
-            let tag_str = tag.to_string();
-            let sel_inner = sel.clone();
-            // Re-read sel after activate to refresh checkmarks.
-            // Connect a second time for the visual update.
-            let rows: Vec<adw::ActionRow> = model_group
-                .observe_children()
-                .into_iter()
-                .filter_map(|o| o.ok()?.downcast::<adw::ActionRow>().ok())
-                .collect();
-            if let Some(row) = rows.get(i) {
-                row.connect_activated(move |_| {
-                    let current = sel_inner.borrow().clone();
-                    for (j, c) in checks_inner.iter().enumerate() {
-                        c.set_icon_name(
-                            if models[j].1 == current { Some("emblem-ok-symbolic") } else { None }
-                        );
-                    }
-                });
+            for (c, t) in checks_inner.iter().zip(tags_inner.iter()) {
+                c.set_icon_name(if *t == tag_str { Some("emblem-ok-symbolic") } else { None });
             }
-        }
+        });
     }
 
     // Custom model entry — lets knowledgeable users type any Ollama model tag.
