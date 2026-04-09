@@ -426,7 +426,7 @@ pub enum MatrixCommand {
     /// Delete (redact) a message.
     RedactMessage { room_id: String, event_id: String },
     /// Edit a message (send replacement).
-    EditMessage { room_id: String, event_id: String, new_body: String },
+    EditMessage { room_id: String, event_id: String, new_body: String, new_formatted_body: Option<String> },
     /// Upload and send a media file.
     SendMedia { room_id: String, file_path: String },
     /// Download media and open with system viewer.
@@ -1153,21 +1153,29 @@ async fn matrix_task(
                             }
                         }
                     }
-                    Ok(MatrixCommand::EditMessage { room_id, event_id, new_body }) => {
+                    Ok(MatrixCommand::EditMessage { room_id, event_id, new_body, new_formatted_body }) => {
                         if let (Ok(rid), Ok(eid)) = (RoomId::parse(&room_id), matrix_sdk::ruma::EventId::parse(&event_id)) {
                             if let Some(room) = client.get_room(&rid) {
                                 use matrix_sdk::ruma::events::room::message::{
                                     RoomMessageEventContent, ReplacementMetadata,
                                 };
-                                // Update memory cache incrementally — no full wipe needed.
-                                let new_formatted = crate::markdown::md_to_html(&new_body);
+                                let new_formatted = new_formatted_body
+                                    .as_deref()
+                                    .unwrap_or_else(|| "")
+                                    .to_string();
+                                let use_html = !new_formatted.is_empty();
                                 timeline_cache.update_message_body_in_cache(
-                                    &room_id, &event_id, &new_body, Some(&new_formatted),
+                                    &room_id, &event_id, &new_body,
+                                    if use_html { Some(&new_formatted) } else { None },
                                 );
-                                // Cache already patched in-place; no dirty/refresh needed.
                                 let metadata = ReplacementMetadata::new(eid.to_owned(), None);
-                                let content = RoomMessageEventContent::text_plain(&new_body)
-                                    .make_replacement(metadata, None);
+                                let content = if use_html {
+                                    RoomMessageEventContent::text_html(&new_body, &new_formatted)
+                                        .make_replacement(metadata, None)
+                                } else {
+                                    RoomMessageEventContent::text_plain(&new_body)
+                                        .make_replacement(metadata, None)
+                                };
                                 if let Err(e) = room.send(content).await {
                                     tracing::error!("Failed to edit message: {e}");
                                 }

@@ -1131,7 +1131,7 @@ impl MxWindow {
             if let Some(room_id) = room_id {
                 let tx = cmd_tx_edit.clone();
                 glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::EditMessage { room_id, event_id, new_body }).await;
+                    let _ = tx.send(MatrixCommand::EditMessage { room_id, event_id, new_body, new_formatted_body: None }).await;
                 });
             }
         });
@@ -1145,22 +1145,24 @@ impl MxWindow {
                 // Check if this is an edit (reply_to starts with "edit:").
                 if let Some(ref rt) = reply_to {
                     if let Some(event_id) = rt.strip_prefix("edit:") {
-                        // Update locally immediately.
+                        // Update locally immediately using the already-processed
+                        // formatted_body (which has mention pills from prepare_send).
                         let edit_preview = match body.char_indices().nth(50) {
                             Some((i, _)) => &body[..i],
                             None => &body,
                         };
                         tracing::info!("Editing message {} with new body: {}", event_id, edit_preview);
-                        let formatted = crate::markdown::md_to_html(&body);
-                        msg_view_for_send.update_message_body(event_id, &body, Some(&formatted));
+                        let fmt_ref = formatted_body.as_deref();
+                        msg_view_for_send.update_message_body(event_id, &body, fmt_ref);
 
                         let tx = cmd_tx_edit2.clone();
                         let eid = event_id.to_string();
                         let new_body = body.clone();
+                        let new_fmt = formatted_body.clone();
                         let rid = room_id.clone();
                         glib::spawn_future_local(async move {
                             let _ = tx.send(MatrixCommand::EditMessage {
-                                room_id: rid, event_id: eid, new_body,
+                                room_id: rid, event_id: eid, new_body, new_formatted_body: new_fmt,
                             }).await;
                         });
                         return;

@@ -642,23 +642,33 @@ mod imp {
                 imp.history_draft.borrow_mut().clear();
             }
 
+            // Helper: build (expanded_text, formatted_body, mentioned_ids) from raw input.
+            fn prepare_send(imp: &MessageView, raw: &str) -> (String, Option<String>, Vec<String>) {
+                let members = imp.room_members.borrow();
+                let mut pending = imp.pending_mentions.borrow().clone();
+                // Auto-resolve bare @word patterns not already in pending.
+                let (text, auto) = super::auto_resolve_mentions(raw, &members, &pending);
+                pending.extend(auto);
+                drop(members);
+                imp.pending_mentions.borrow_mut().clear();
+                let html = crate::markdown::md_to_html(&text);
+                let (html_with_pills, mentioned_ids) = super::inject_mention_pills(&html, &pending);
+                (text, Some(html_with_pills), mentioned_ids)
+            }
+
             // Send on button click.
             let obj = self.obj();
             let tv = self.input_view.clone();
             let view = obj.clone();
             self.send_button.connect_clicked(move |_| {
                 let buf = tv.buffer();
-                let text = buf_text(&buf);
-                if !text.trim().is_empty() {
+                let raw = buf_text(&buf);
+                if !raw.trim().is_empty() {
                     let imp = view.imp();
                     let reply_to = imp.reply_to_event.borrow().clone();
                     let quote = imp.reply_quote.borrow().clone();
-                    let html = crate::markdown::md_to_html(&text);
-                    let pending = imp.pending_mentions.borrow().clone();
-                    let (html_with_pills, mentioned_ids) = super::inject_mention_pills(&html, &pending);
-                    let formatted = Some(html_with_pills);
-                    push_history(imp, &text);
-                    imp.pending_mentions.borrow_mut().clear();
+                    let (text, formatted, mentioned_ids) = prepare_send(imp, &raw);
+                    push_history(imp, &raw);
                     if let Some(ref cb) = *imp.on_send.borrow() {
                         cb(text, reply_to, quote, formatted, mentioned_ids);
                     }
@@ -681,22 +691,21 @@ mod imp {
                     return glib::Propagation::Proceed;
                 }
                 if mods.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-                    // Shift+Enter → insert newline via default TextView handling.
                     return glib::Propagation::Proceed;
                 }
-                // Plain Enter → send.
                 let imp = view_for_enter.imp();
+                // If the nick-complete popover is open, Enter should complete
+                // the nick, not send the message.
+                if imp.nick_popover.is_visible() {
+                    return glib::Propagation::Proceed; // let nick popover handle it
+                }
                 let buf = imp.input_view.buffer();
-                let text = buf_text(&buf);
-                if !text.trim().is_empty() {
+                let raw = buf_text(&buf);
+                if !raw.trim().is_empty() {
                     let reply_to = imp.reply_to_event.borrow().clone();
                     let quote = imp.reply_quote.borrow().clone();
-                    let html = crate::markdown::md_to_html(&text);
-                    let pending = imp.pending_mentions.borrow().clone();
-                    let (html_with_pills, mentioned_ids) = super::inject_mention_pills(&html, &pending);
-                    let formatted = Some(html_with_pills);
-                    push_history(imp, &text);
-                    imp.pending_mentions.borrow_mut().clear();
+                    let (text, formatted, mentioned_ids) = prepare_send(imp, &raw);
+                    push_history(imp, &raw);
                     if let Some(ref cb) = *imp.on_send.borrow() {
                         cb(text, reply_to, quote, formatted, mentioned_ids);
                     }
@@ -1282,6 +1291,75 @@ glib::wrapper! {
 /// `<a href="https://matrix.to/#/{uid}">@name</a>` and returns the list of
 /// user IDs that were actually found. pulldown-cmark HTML-escapes `&`, `<`,
 /// `>` in text, so we search for the escaped form.
+/// Scan `text` for bare `@word` patterns not already covered by `pending`.
+/// For each, try a case-insensitive prefix lookup in the sorted `members` list.
+/// Returns the text with matched tokens expanded to `@DisplayName` plus the
+/// newly resolved `display_name → user_id` pairs to merge into pending_mentions.
+fn auto_resolve_mentions(
+    text: &str,
+    members: &[(String, String, String)], // (lowercase, display, uid), sorted
+    pending: &std::collections::HashMap<String, String>, // display_name → uid
+) -> (String, std::collections::HashMap<String, String>) {
+    let mut result = String::with_capacity(text.len() + 32);
+    let mut new_mentions = std::collections::HashMap::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '@' {
+            result.push(ch);
+            continue;
+        }
+        // Collect the token after '@': stop at whitespace or another '@'.
+        let mut word = String::new();
+        while chars.peek().map(|c| !c.is_whitespace() && *c != '@').unwrap_or(false) {
+            word.push(chars.next().unwrap());
+        }
+        if word.is_empty() {
+            result.push('@');
+            continue;
+        }
+        // Already a full MXID (@user:server) — leave it alone.
+        if word.contains(':') {
+            result.push('@');
+            result.push_str(&word);
+            continue;
+        }
+        let lower = word.to_lowercase();
+        // Already resolved by nick-completion (by display-name prefix) — skip.
+        if pending.keys().any(|dn| dn.to_lowercase().starts_with(&lower)) {
+            result.push('@');
+            result.push_str(&word);
+            continue;
+        }
+        // Binary-search for prefix matches in the sorted member list.
+        let start = members.partition_point(|(ln, _, _)| ln.as_str() < lower.as_str());
+        let matches: Vec<_> = members[start..]
+            .iter()
+            .take_while(|(ln, _, _)| ln.starts_with(&lower))
+            .collect();
+        let resolved = if matches.len() == 1 {
+            Some((&matches[0].1, &matches[0].2)) // unique prefix match
+        } else if matches.len() > 1 {
+            // Prefer exact match over ambiguous prefix.
+            matches.iter().find(|(ln, _, _)| *ln == lower).map(|(_, dn, uid)| (dn, uid))
+        } else {
+            None
+        };
+        match resolved {
+            Some((display, uid)) => {
+                new_mentions.insert(display.to_string(), uid.to_string());
+                result.push('@');
+                result.push_str(display); // expand to full display name
+            }
+            None => {
+                result.push('@');
+                result.push_str(&word);
+            }
+        }
+    }
+    (result, new_mentions)
+}
+
 fn inject_mention_pills(
     html: &str,
     mentions: &std::collections::HashMap<String, String>,
