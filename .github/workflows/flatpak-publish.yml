@@ -1,13 +1,14 @@
 name: Publish Flatpak Repo
 
-# Builds a full OSTree flatpak repository and deploys it to GitHub Pages.
+# Builds the flatpak and publishes to the OSTree repo on GitHub Pages.
 #
-# Once GitHub Pages is enabled (Settings → Pages → source: gh-pages branch),
-# users on other machines can install with:
+# Two branches are maintained in the same repo at hikyaku.ramkrishna.me:
+#   stable  — built from version tags (v*)
+#   beta    — built from every push to main
 #
-#   flatpak install --user hikyaku.flatpakref
-#
-# or just download the single-file bundle from the GitHub release page.
+# Install:
+#   flatpak install --user hikyaku.flatpakref        # stable
+#   flatpak install --user hikyaku-beta.flatpakref   # beta
 
 on:
   push:
@@ -19,7 +20,7 @@ jobs:
     name: Build and publish
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # required by peaceiris/actions-gh-pages
+      contents: write
 
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
@@ -29,48 +30,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Build the .flatpak bundle (same as the CI workflow).
-      # The flatpak-github-actions action handles SDK installation and caching.
+      # Determine which OSTree branch this build targets.
+      - name: Determine flatpak branch
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "flatpak_branch=stable" >> $GITHUB_OUTPUT
+            echo "is_release=true"       >> $GITHUB_OUTPUT
+          else
+            echo "flatpak_branch=beta"   >> $GITHUB_OUTPUT
+            echo "is_release=false"      >> $GITHUB_OUTPUT
+          fi
+
       - name: Build Flatpak bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: hikyaku.flatpak
           manifest-path: flatpak/me.ramkrishna.hikyaku.json
           cache-key: flatpak-builder-${{ github.sha }}
-          branch: stable
+          branch: ${{ steps.meta.outputs.flatpak_branch }}
 
-      # Keep the bundle as a downloadable artifact (14-day retention).
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hikyaku-flatpak-${{ github.sha }}
+          name: hikyaku-${{ steps.meta.outputs.flatpak_branch }}-${{ github.sha }}
           path: hikyaku.flatpak
           retention-days: 14
 
-      # Attach the bundle to the GitHub release when a version tag is pushed.
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.meta.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: hikyaku.flatpak
           generate_release_notes: true
 
-      # Import the bundle into a local OSTree repo and generate static deltas
-      # so clients can download incremental updates rather than full re-installs.
-      - name: Build OSTree repo
+      # Fetch the existing gh-pages OSTree repo so we accumulate both
+      # stable and beta refs rather than overwriting one with the other.
+      - name: Restore existing OSTree repo from gh-pages
+        run: |
+          mkdir -p repo
+          git fetch origin gh-pages 2>/dev/null || true
+          if git rev-parse origin/gh-pages >/dev/null 2>&1; then
+            git archive origin/gh-pages | tar -x -C repo/
+          fi
+
+      - name: Import bundle into OSTree repo
         run: |
           flatpak build-import-bundle --update-appstream repo/ hikyaku.flatpak
           flatpak build-update-repo --generate-static-deltas repo/
 
-      # Push the repo directory to the gh-pages branch.
-      # force_orphan keeps the branch history clean (OSTree repo is the truth).
-      # cname causes the action to write a CNAME file so GitHub Pages serves
-      # the site at hikyaku.ramkrishna.me (requires a CNAME DNS record pointing
-      # hikyaku.ramkrishna.me → sramkrishna.github.io).
+      # Re-write the CNAME (git archive may have extracted an old one; this ensures
+      # it is always correct after force_orphan wipes gh-pages history).
+      - name: Write CNAME
+        run: echo "hikyaku.ramkrishna.me" > repo/CNAME
+
+      # force_orphan keeps gh-pages history lean; accumulated content is already
+      # in repo/ from the restore step above, so nothing is lost.
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./repo
           force_orphan: true
-          cname: hikyaku.ramkrishna.me
