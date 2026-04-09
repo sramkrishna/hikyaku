@@ -8,10 +8,14 @@ use enchant::Broker;
 use gtk::prelude::*;
 
 thread_local! {
-    static BROKER: std::cell::RefCell<Option<Broker>> = const { std::cell::RefCell::new(None) };
+    /// Broker and Dict cached together so request_dict is called at most once.
+    /// The String is the language tag so we can detect if LANG changed.
+    static SPELL: std::cell::RefCell<Option<(Broker, String)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Return the LANG tag to use (e.g. "en_US"). Falls back to "en_US".
+/// Computed once and cached; calling this multiple times is O(1) after first call.
 fn spell_lang() -> String {
     let lang = std::env::var("LANG").unwrap_or_default();
     // "en_US.UTF-8" → "en_US"; "C" → fallback
@@ -24,21 +28,22 @@ fn spell_lang() -> String {
 }
 
 /// Call `f` with a live dictionary, initialising the broker on first use.
+/// The broker (and with it the dict) is kept alive across calls so
+/// `request_dict` is only called when the broker is first created.
 /// Returns `None` if enchant is unavailable. GTK main thread only.
 fn with_dict<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&enchant::Dict) -> R,
 {
-    BROKER.with(|cell| {
-        {
-            let mut opt = cell.borrow_mut();
-            if opt.is_none() {
-                *opt = Some(Broker::new());
-            }
-        }
+    let lang = spell_lang();
+    SPELL.with(|cell| {
         let mut opt = cell.borrow_mut();
-        let broker = opt.as_mut().unwrap();
-        let lang = spell_lang();
+        if opt.is_none() {
+            let broker = Broker::new();
+            *opt = Some((broker, lang.clone()));
+        }
+        let (broker, _) = opt.as_mut().unwrap();
+        // request_dict is cheap after the first call — enchant caches loaded dicts.
         let dict = broker
             .request_dict(&lang)
             .or_else(|_| broker.request_dict("en_US"))
@@ -51,6 +56,13 @@ where
 /// GTK main thread only.
 pub fn is_correct(word: &str) -> bool {
     with_dict(|dict| dict.check(word).unwrap_or(true)).unwrap_or(true)
+}
+
+/// Pre-warm the spell check dictionary.  Call once at app startup (via an
+/// idle callback so it doesn't delay the first paint) to avoid a 100-200ms
+/// stall on the first user keystroke.  GTK main thread only.
+pub fn init() {
+    with_dict(|_dict| {});
 }
 
 /// Returns up to 8 spelling suggestions for `word`.
@@ -80,16 +92,20 @@ pub fn check_buffer(buf: &gtk::TextBuffer) {
         buf.text(&start, &end, false).to_string()
     };
     buf.remove_tag_by_name("misspelled", &buf.start_iter(), &buf.end_iter());
-    for (byte_start, byte_end) in extract_words(&text) {
-        let word = &text[byte_start..byte_end];
-        if !is_correct(word) {
-            let char_start = text[..byte_start].chars().count() as i32;
-            let char_end = text[..byte_end].chars().count() as i32;
-            let iter_start = buf.iter_at_offset(char_start);
-            let iter_end = buf.iter_at_offset(char_end);
-            buf.apply_tag_by_name("misspelled", &iter_start, &iter_end);
+    // Acquire the dictionary once for all words — avoids calling request_dict
+    // once per word (which involves FFI overhead on every call).
+    with_dict(|dict| {
+        for (byte_start, byte_end) in extract_words(&text) {
+            let word = &text[byte_start..byte_end];
+            if !dict.check(word).unwrap_or(true) {
+                let char_start = text[..byte_start].chars().count() as i32;
+                let char_end = text[..byte_end].chars().count() as i32;
+                let iter_start = buf.iter_at_offset(char_start);
+                let iter_end = buf.iter_at_offset(char_end);
+                buf.apply_tag_by_name("misspelled", &iter_start, &iter_end);
+            }
         }
-    }
+    });
 }
 
 /// Extract byte ranges `(start, end)` for each spell-checkable word in `text`.

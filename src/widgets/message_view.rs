@@ -1222,13 +1222,18 @@ mod imp {
             // Typing indicator. Also dismiss nick popover on text change
             // (unless the change was from Tab completion itself).
             let view_for_typing = obj.clone();
+            // Pre-warm the spell-check dictionary on the first idle cycle after
+            // the widget is realized so the 100-200ms first-use cost doesn't
+            // happen on the user's first keystroke.
+            glib::idle_add_local_once(crate::spell_check::init);
+
             self.input_view.buffer().connect_changed(move |buf| {
                 let imp = view_for_typing.imp();
                 if imp.nick_popover.is_visible() && imp.nick_completion_state.borrow().is_none() {
                     imp.nick_popover.popdown();
                 }
-                // Show/hide placeholder.
-                let empty = buf_text(buf).is_empty();
+                // Show/hide placeholder — char_count() is O(1), no String alloc.
+                let empty = buf.char_count() == 0;
                 imp.input_placeholder.set_visible(empty);
                 let is_typing = !empty;
                 // Cancel any pending debounce timer.
@@ -1302,58 +1307,121 @@ fn auto_resolve_mentions(
 ) -> (String, std::collections::HashMap<String, String>) {
     let mut result = String::with_capacity(text.len() + 32);
     let mut new_mentions = std::collections::HashMap::new();
-    let mut chars = text.chars().peekable();
+    // Use index-based iteration so we can roll back over-consumed words.
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
 
-    while let Some(ch) = chars.next() {
-        if ch != '@' {
-            result.push(ch);
+    while i < chars.len() {
+        if chars[i] != '@' {
+            result.push(chars[i]);
+            i += 1;
             continue;
         }
-        // Collect the token after '@': stop at whitespace or another '@'.
-        let mut word = String::new();
-        while chars.peek().map(|c| !c.is_whitespace() && *c != '@').unwrap_or(false) {
-            word.push(chars.next().unwrap());
+        i += 1; // consume '@'
+
+        // Collect first word (stop at whitespace or '@').
+        let word_start = i;
+        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '@' {
+            i += 1;
         }
+        let word: String = chars[word_start..i].iter().collect();
+
         if word.is_empty() {
             result.push('@');
             continue;
         }
-        // Already a full MXID (@user:server) — leave it alone.
+        // Already a full MXID (@user:server) — leave alone.
         if word.contains(':') {
             result.push('@');
             result.push_str(&word);
             continue;
         }
         let lower = word.to_lowercase();
-        // Already resolved by nick-completion (by display-name prefix) — skip.
+        // Already resolved by nick-completion — skip.
         if pending.keys().any(|dn| dn.to_lowercase().starts_with(&lower)) {
             result.push('@');
             result.push_str(&word);
             continue;
         }
+
         // Binary-search for prefix matches in the sorted member list.
         let start = members.partition_point(|(ln, _, _)| ln.as_str() < lower.as_str());
-        let matches: Vec<_> = members[start..]
+        let mut candidates: Vec<&(String, String, String)> = members[start..]
             .iter()
             .take_while(|(ln, _, _)| ln.starts_with(&lower))
             .collect();
-        let resolved = if matches.len() == 1 {
-            Some((&matches[0].1, &matches[0].2)) // unique prefix match
-        } else if matches.len() > 1 {
-            // Prefer exact match over ambiguous prefix.
-            matches.iter().find(|(ln, _, _)| *ln == lower).map(|(_, dn, uid)| (dn, uid))
+
+        if candidates.is_empty() {
+            result.push('@');
+            result.push_str(&word);
+            continue;
+        }
+
+        // Greedily extend with subsequent words to handle multi-word display
+        // names (e.g. "John Smith").  Only extends while ambiguous — a unique
+        // single-word match is accepted immediately.
+        let after_first_word = i; // save for rollback on no-match
+        let mut extended_lower = lower.clone();
+        let mut consumed_end = i;
+
+        while candidates.len() > 1 && consumed_end < chars.len() && chars[consumed_end] == ' ' {
+            let next_start = consumed_end + 1;
+            let mut next_end = next_start;
+            while next_end < chars.len() && !chars[next_end].is_whitespace() && chars[next_end] != '@' {
+                next_end += 1;
+            }
+            if next_start == next_end { break; } // trailing space, stop
+            let next_word: String = chars[next_start..next_end].iter().collect();
+            let trial = format!("{} {}", extended_lower, next_word.to_lowercase());
+            let ts = members.partition_point(|(ln, _, _)| ln.as_str() < trial.as_str());
+            let trial_cands: Vec<&(String, String, String)> = members[ts..]
+                .iter()
+                .take_while(|(ln, _, _)| ln.starts_with(&trial))
+                .collect();
+            if trial_cands.is_empty() { break; } // no improvement — stop
+            extended_lower = trial;
+            consumed_end = next_end;
+            candidates = trial_cands;
+        }
+
+        let resolved = if candidates.len() == 1 {
+            Some((&candidates[0].1, &candidates[0].2))
         } else {
-            None
+            // Ambiguous prefix — prefer exact match.
+            candidates.iter().find(|(ln, _, _)| *ln == extended_lower).map(|(_, dn, uid)| (dn, uid))
         };
+
         match resolved {
             Some((display, uid)) => {
+                // If the resolved display name has words beyond what we consumed
+                // during the extension loop (unique match on first word only, but
+                // display = "John Smith"), try to consume those words from the
+                // input to avoid duplicating them in the output.
+                let display_lower = display.to_lowercase();
+                if display_lower.len() > extended_lower.len() {
+                    let suffix: Vec<char> = display_lower[extended_lower.len()..].chars().collect();
+                    let mut j = consumed_end;
+                    let mut k = 0;
+                    while k < suffix.len() && j < chars.len() {
+                        if chars[j].to_lowercase().next() == Some(suffix[k]) {
+                            j += 1; k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if k == suffix.len() {
+                        consumed_end = j; // full suffix matched — consume it
+                    }
+                }
                 new_mentions.insert(display.to_string(), uid.to_string());
                 result.push('@');
-                result.push_str(display); // expand to full display name
+                result.push_str(display);
+                i = consumed_end;
             }
             None => {
                 result.push('@');
                 result.push_str(&word);
+                i = after_first_word; // roll back any words over-consumed during extension
             }
         }
     }
