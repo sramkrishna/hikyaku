@@ -39,6 +39,22 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
           branch: stable
 
+      # Keep the bundle as a downloadable artifact (14-day retention).
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hikyaku-flatpak-${{ github.sha }}
+          path: hikyaku.flatpak
+          retention-days: 14
+
+      # Attach the bundle to the GitHub release when a version tag is pushed.
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hikyaku.flatpak
+          generate_release_notes: true
+
       # Import the bundle into a local OSTree repo and generate static deltas
       # so clients can download incremental updates rather than full re-installs.
       - name: Build OSTree repo

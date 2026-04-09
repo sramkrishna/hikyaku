@@ -1,9 +1,10 @@
 name: Flatpak
 
+# PR-only CI build: validates that the flatpak still builds on every pull request.
+# Push-to-main builds are handled by flatpak-publish.yml, which also exports
+# the OSTree repo to GitHub Pages and uploads release artifacts.
+
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -19,28 +20,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # cargo-sources.json is committed and kept in sync with Cargo.lock manually.
-      # Regenerate it locally with:
-      #   python3 flatpak/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
-      # then commit both files whenever Cargo.lock changes.
-
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: hikyaku.flatpak
           manifest-path: flatpak/me.ramkrishna.hikyaku.json
           cache-key: flatpak-builder-${{ github.sha }}
-
-      - name: Upload bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: hikyaku-flatpak-${{ github.sha }}
-          path: hikyaku.flatpak
-          retention-days: 14
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: hikyaku.flatpak
-          generate_release_notes: true
