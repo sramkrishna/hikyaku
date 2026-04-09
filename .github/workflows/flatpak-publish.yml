@@ -15,6 +15,12 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Only one publish job runs at a time. A new push queues behind the current
+# run rather than racing to write gh-pages simultaneously.
+concurrency:
+  group: flatpak-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Build and publish
