@@ -48,9 +48,13 @@ jobs:
 
       # Push the repo directory to the gh-pages branch.
       # force_orphan keeps the branch history clean (OSTree repo is the truth).
+      # cname causes the action to write a CNAME file so GitHub Pages serves
+      # the site at hikyaku.ramkrishna.me (requires a CNAME DNS record pointing
+      # hikyaku.ramkrishna.me → sramkrishna.github.io).
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./repo
           force_orphan: true
+          cname: hikyaku.ramkrishna.me
