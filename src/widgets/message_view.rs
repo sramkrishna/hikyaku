@@ -2231,21 +2231,12 @@ impl MessageView {
         use gio::prelude::ListModelExt;
         let n = list_store.n_items();
         if n == 0 { return 0; }
-        let mut lo = 0u32;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let item_ts = list_store.item(mid)
+        sorted_insert_pos_in(n, ts, |mid| {
+            list_store.item(mid)
                 .and_downcast::<crate::models::MessageObject>()
                 .map(|o| o.timestamp())
-                .unwrap_or(0);
-            if item_ts <= ts {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
+                .unwrap_or(0)
+        })
     }
 
     fn find_message_row(widget: &gtk::Widget) -> Option<crate::widgets::message_row::MessageRow> {
@@ -2777,11 +2768,50 @@ pub(crate) fn effective_unread_count(messages_loaded: bool, current: u32, new_co
     if messages_loaded { current.max(new_count) } else { new_count }
 }
 
+/// Pure binary-search helper: given `n` items and a function `ts_at(i)` that
+/// returns the timestamp at position `i`, return the insertion index for `ts`
+/// such that timestamps remain sorted oldest→newest.  Duplicates are inserted
+/// AFTER existing equal timestamps (stable ordering).
+///
+/// Extracted from `sorted_insert_pos` so the algorithm can be unit-tested
+/// without a live GtkListStore.
+pub(crate) fn sorted_insert_pos_in<F>(n: u32, ts: u64, ts_at: F) -> u32
+where
+    F: Fn(u32) -> u64,
+{
+    let mut lo = 0u32;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if ts_at(mid) <= ts {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Pure helper: should `set_messages` skip the splice when the payload is empty?
 /// An empty placeholder from a bg_refresh timeout must not clear messages that
 /// are already displayed — only the first-load path may process an empty slice.
 pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -> bool {
     messages_empty && !first_load
+}
+
+/// Pure helper: choose the room to evict from the view cache.
+///
+/// Returns the first entry in `order` that is neither `current_room` nor
+/// `incoming_room`.  Returns `None` if every entry is one of the two protected
+/// rooms (cache too small to evict safely).
+///
+/// `order` is the insertion-order queue: oldest entry is at index 0.
+pub(crate) fn lru_evict_candidate<'a>(
+    order: &'a [&'a str],
+    current_room: &str,
+    incoming_room: &str,
+) -> Option<&'a str> {
+    order.iter().copied().find(|&rid| rid != current_room && rid != incoming_room)
 }
 
 /// Pure helper: should a live-appended message be tinted as "new"?
@@ -2890,7 +2920,8 @@ pub(crate) fn divider_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_divider_pos, divider_decision, divider_should_mark, is_echo_duplicate, unread_label,
+        compute_divider_pos, divider_decision, divider_should_mark, is_echo_duplicate,
+        lru_evict_candidate, sorted_insert_pos_in, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
@@ -3493,5 +3524,96 @@ mod tests {
         // Multiple echoes in flight — only the matching one is a dupe.
         assert!(is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg2"));
         assert!(!is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg4"));
+    }
+
+    // ── sorted_insert_pos_in ────────────────────────────────────────────────
+    // These tests guard the binary-search used in the incremental set_messages
+    // path.  A bug here means messages land at the wrong position in the
+    // timeline, which is both a correctness and a scroll-position regression.
+
+    fn make_ts_store(timestamps: &[u64]) -> Vec<u64> {
+        timestamps.to_vec()
+    }
+
+    fn insert_pos(timestamps: &[u64], ts: u64) -> u32 {
+        let store = make_ts_store(timestamps);
+        sorted_insert_pos_in(store.len() as u32, ts, |i| store[i as usize])
+    }
+
+    #[test]
+    fn insert_into_empty_store() {
+        assert_eq!(insert_pos(&[], 100), 0);
+    }
+
+    #[test]
+    fn insert_before_all() {
+        // ts=5 is older than all items → goes at position 0.
+        assert_eq!(insert_pos(&[10, 20, 30], 5), 0);
+    }
+
+    #[test]
+    fn insert_after_all() {
+        // ts=40 is newer than all items → goes at end.
+        assert_eq!(insert_pos(&[10, 20, 30], 40), 3);
+    }
+
+    #[test]
+    fn insert_in_middle() {
+        assert_eq!(insert_pos(&[10, 20, 30], 15), 1);
+        assert_eq!(insert_pos(&[10, 20, 30], 25), 2);
+    }
+
+    #[test]
+    fn insert_duplicate_timestamp_after_existing() {
+        // Equal timestamps: new message is inserted AFTER existing one (stable).
+        assert_eq!(insert_pos(&[10, 20, 20, 30], 20), 3);
+    }
+
+    #[test]
+    fn insert_single_item_before() {
+        assert_eq!(insert_pos(&[50], 10), 0);
+    }
+
+    #[test]
+    fn insert_single_item_after() {
+        assert_eq!(insert_pos(&[50], 100), 1);
+    }
+
+    // ── lru_evict_candidate ─────────────────────────────────────────────────
+    // Guards the room_view_cache eviction logic.  A regression here means
+    // the wrong room gets evicted (possibly the room the user is in), causing
+    // an O(n) full-splice on a room the user never left.
+
+    #[test]
+    fn evict_oldest_non_current() {
+        let order = ["room_a", "room_b", "room_c", "room_d"];
+        // room_a is oldest; not current or incoming → should be evicted.
+        assert_eq!(lru_evict_candidate(&order, "room_d", "room_e"), Some("room_a"));
+    }
+
+    #[test]
+    fn evict_skips_current_room() {
+        let order = ["room_a", "room_b"];
+        // room_a is oldest but it IS current — skip it, evict room_b.
+        assert_eq!(lru_evict_candidate(&order, "room_a", "room_c"), Some("room_b"));
+    }
+
+    #[test]
+    fn evict_skips_incoming_room() {
+        let order = ["room_a", "room_b", "room_c"];
+        // room_a is oldest but it IS the incoming room — skip it, evict room_b.
+        assert_eq!(lru_evict_candidate(&order, "room_d", "room_a"), Some("room_b"));
+    }
+
+    #[test]
+    fn evict_returns_none_when_all_protected() {
+        // Only current and incoming in the cache — nothing safe to evict.
+        let order = ["room_a", "room_b"];
+        assert_eq!(lru_evict_candidate(&order, "room_a", "room_b"), None);
+    }
+
+    #[test]
+    fn evict_empty_order() {
+        assert_eq!(lru_evict_candidate(&[], "room_a", "room_b"), None);
     }
 }
