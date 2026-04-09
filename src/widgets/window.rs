@@ -2465,7 +2465,7 @@ impl MxWindow {
             .can_target(false)
             .build();
 
-        let bell_image = gtk::Image::from_icon_name("notification-bell-symbolic");
+        let bell_image = gtk::Image::from_icon_name("alarm-symbolic");
         let bell_overlay = gtk::Overlay::builder()
             .child(&bell_btn)
             .build();
