@@ -1891,6 +1891,18 @@ impl MessageView {
                 {
                     let mut idx = imp.event_index.borrow_mut();
                     for m in &new_msgs {
+                        // If a local echo exists for this message (empty event_id,
+                        // same body), patch it instead of appending a duplicate.
+                        // This handles the race where bg_refresh arrives between
+                        // the echo being appended and MessageSent patching its event_id.
+                        // Drop the index borrow first — patch_echo_event_id borrows it.
+                        drop(idx);
+                        if self.patch_echo_event_id(&m.body, &m.event_id) {
+                            idx = imp.event_index.borrow_mut();
+                            any_at_end = true; // patched echo is at the end
+                            continue;
+                        }
+                        idx = imp.event_index.borrow_mut();
                         let obj = Self::info_to_obj(m);
                         let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
                         let n = list_store.n_items();
@@ -2786,6 +2798,16 @@ pub(crate) fn divider_should_mark(sender_id: &str, my_id: &str) -> bool {
     my_id.is_empty() || sender_id != my_id
 }
 
+/// Pure helper: given a list of pending echo bodies (messages appended locally
+/// with an empty event_id) and an incoming server message body, returns true if
+/// the server message is a duplicate of a pending echo and should be skipped.
+///
+/// Used in the bg_refresh incremental path to suppress the race where a server
+/// confirmation arrives before MessageSent has patched the local echo's event_id.
+pub(crate) fn is_echo_duplicate(pending_echo_bodies: &[&str], incoming_body: &str) -> bool {
+    pending_echo_bodies.contains(&incoming_body)
+}
+
 /// Pure helper: should the "Updating messages" banner be shown?
 /// The banner is only useful on first load (empty timeline).  Background
 /// re-fetches (SyncGap) run silently to avoid flashing the banner every
@@ -2868,7 +2890,7 @@ pub(crate) fn divider_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_divider_pos, divider_decision, divider_should_mark, unread_label,
+        compute_divider_pos, divider_decision, divider_should_mark, is_echo_duplicate, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
@@ -3446,5 +3468,30 @@ mod tests {
     fn different_server_not_own() {
         // Same localpart but different homeserver — not the same user.
         assert!(divider_should_mark("@me:other.org", "@me:example.org"));
+    }
+
+    // ── is_echo_duplicate ───────────────────────────────────────────────────
+
+    #[test]
+    fn echo_duplicate_detected() {
+        // If "Hello" is a pending echo, the server confirmation is a duplicate.
+        assert!(is_echo_duplicate(&["Hello"], "Hello"));
+    }
+
+    #[test]
+    fn no_echo_duplicate_different_body() {
+        assert!(!is_echo_duplicate(&["Hello"], "World"));
+    }
+
+    #[test]
+    fn no_echo_duplicate_empty_list() {
+        assert!(!is_echo_duplicate(&[], "Hello"));
+    }
+
+    #[test]
+    fn echo_duplicate_multiple_pending() {
+        // Multiple echoes in flight — only the matching one is a dupe.
+        assert!(is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg2"));
+        assert!(!is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg4"));
     }
 }
