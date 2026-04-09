@@ -42,6 +42,8 @@ mod imp {
         pub room_list_placeholder: TemplateChild<gtk::Box>,
         /// room_id → (scrolled_window, list_view, list_store)
         pub room_view_cache: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::ListView, gio::ListStore)>>,
+        /// Insertion-order queue for room_view_cache LRU eviction.
+        pub room_view_order: RefCell<std::collections::VecDeque<String>>,
         /// Currently visible room id (empty string = no room selected).
         pub current_room_id: RefCell<String>,
         /// Current room's list_store — updated by switch_room() for O(1) access.
@@ -215,6 +217,7 @@ mod imp {
                 seek_list_view: std::cell::OnceCell::new(),
                 room_list_placeholder: Default::default(),
                 room_view_cache: RefCell::new(HashMap::new()),
+                room_view_order: RefCell::new(std::collections::VecDeque::new()),
                 current_room_id: RefCell::new(String::new()),
                 cur_list_store: RefCell::new(gio::ListStore::new::<MessageObject>()),
                 saved_event_indices: RefCell::new(HashMap::new()),
@@ -334,6 +337,12 @@ mod imp {
                 .expect("scrolled_window() called with no current room")
         }
 
+        /// Maximum number of per-room (ScrolledWindow, ListView, ListStore) triples to
+        /// keep in memory.  When exceeded the oldest room is evicted — its GTK widgets
+        /// are removed from room_stack and dropped, freeing the ~20 pool-slot MessageRow
+        /// widgets (each backed by a heavy selectable GtkLabel / GtkTextView).
+        const MAX_CACHED_ROOMS: usize = 25;
+
         /// Get or create the per-room (scrolled_window, list_view, list_store) triple.
         /// On first call for a given room_id, creates a new ListView with the shared
         /// factory and adds a ScrolledWindow to room_stack.  Subsequent calls return
@@ -349,6 +358,25 @@ mod imp {
             if let Some(entry) = self.room_view_cache.borrow().get(room_id) {
                 return entry.clone();
             }
+
+            // Evict the oldest room if the cache is full.  Skip the currently
+            // visible room (current_room_id) since it may still be in use.
+            let current = self.current_room_id.borrow().clone();
+            while self.room_view_cache.borrow().len() >= Self::MAX_CACHED_ROOMS {
+                let candidate = self.room_view_order.borrow_mut()
+                    .iter()
+                    .find(|rid| **rid != current && **rid != room_id)
+                    .cloned();
+                let Some(evict_id) = candidate else { break };
+                self.room_view_order.borrow_mut().retain(|rid| rid != &evict_id);
+                if let Some((sw, _, _)) = self.room_view_cache.borrow_mut().remove(&evict_id) {
+                    self.room_stack.remove(&sw);
+                }
+                self.saved_event_indices.borrow_mut().remove(&evict_id);
+                self.saved_messages_loaded.borrow_mut().remove(&evict_id);
+                tracing::debug!("room_view_cache: evicted {evict_id}");
+            }
+
             let list_store = gio::ListStore::new::<crate::models::MessageObject>();
             let no_sel = gtk::NoSelection::new(Some(list_store.clone()));
             let list_view = gtk::ListView::builder().build();
@@ -379,6 +407,7 @@ mod imp {
                 room_id.to_string(),
                 (scrolled_window.clone(), list_view.clone(), list_store.clone()),
             );
+            self.room_view_order.borrow_mut().push_back(room_id.to_string());
             (scrolled_window, list_view, list_store)
         }
     }
@@ -1838,29 +1867,17 @@ impl MessageView {
                     && !imp.event_index.borrow().contains_key(&m.event_id))
                 .collect();
 
-            // Collect changed messages (body, formatted_body, or reactions differ).
-            let edited_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
-                .filter(|m| {
-                    if m.event_id.is_empty() { return false; }
-                    let incoming_reactions = serde_json::to_string(&m.reactions).unwrap_or_default();
-                    imp.event_index.borrow()
-                        .get(&m.event_id)
-                        .map(|obj| obj.body() != m.body
-                            || obj.formatted_body() != m.formatted_body.as_deref().unwrap_or("")
-                            || obj.reactions_json() != incoming_reactions)
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            // Apply changes in-place — O(visible_rows) per message, no splice needed.
-            for m in &edited_msgs {
-                let incoming_reactions = serde_json::to_string(&m.reactions).unwrap_or_default();
-                self.update_message_in_place(&m.event_id, |obj| {
-                    obj.set_body(m.body.clone());
-                    obj.set_formatted_body(m.formatted_body.as_deref().unwrap_or("").to_string());
-                    obj.set_reactions_json(incoming_reactions.clone());
-                });
-            }
+            // NOTE: we deliberately do NOT apply body/formatted_body/reaction diffs here.
+            //
+            // Live edits and reactions arrive via MatrixEvent::MessageEdited /
+            // MatrixEvent::ReactionAdded through the sync handler — those paths are
+            // authoritative and always reflect the latest state.
+            //
+            // Applying diffs here would create a race condition: if the bg_refresh
+            // fetch completes AFTER the user applies a local edit (but before the
+            // server echo arrives), the stale server body would overwrite the local
+            // edit.  The live-sync path handles all correctness; bg_refresh is only
+            // responsible for gap-filling new messages.
 
             // Insert new messages at the correct timestamp position.
             // new_msgs is already sorted oldest→newest (inherited from the sorted `messages`
@@ -1901,8 +1918,8 @@ impl MessageView {
             }
 
             tracing::info!(
-                "set_messages: incremental new={} edits={} room={}",
-                new_msgs.len(), edited_msgs.len(),
+                "set_messages: incremental new={} room={}",
+                new_msgs.len(),
                 imp.current_room_id.borrow()
             );
 
