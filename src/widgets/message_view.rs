@@ -31,7 +31,12 @@ mod imp {
         /// Shared factory for all per-room ListViews (set once in constructed).
         pub factory: std::cell::OnceCell<gtk::SignalListItemFactory>,
         /// Stack holding per-room ScrolledWindow+ListView widgets (one per visited room).
+        /// Also holds the "__seek__" page added at construction time.
         pub room_stack: gtk::Stack,
+        /// Dedicated store for the seek context window — never the live store.
+        pub seek_store: gio::ListStore,
+        /// ListView for the seek page (set once in constructed).
+        pub seek_list_view: std::cell::OnceCell<gtk::ListView>,
         /// Blueprint placeholder that room_stack is inserted into.
         #[template_child]
         pub room_list_placeholder: TemplateChild<gtk::Box>,
@@ -206,6 +211,8 @@ mod imp {
                 room_stack: gtk::Stack::builder()
                     .transition_type(gtk::StackTransitionType::None)
                     .build(),
+                seek_store: gio::ListStore::new::<crate::models::MessageObject>(),
+                seek_list_view: std::cell::OnceCell::new(),
                 room_list_placeholder: Default::default(),
                 room_view_cache: RefCell::new(HashMap::new()),
                 current_room_id: RefCell::new(String::new()),
@@ -598,6 +605,21 @@ mod imp {
                 let Some(view) = view_weak.upgrade() else { return };
                 view.cancel_seek();
             });
+
+            // Create the seek page in room_stack — one dedicated page, never
+            // modified, switched in/out in O(1) with no model changes on live views.
+            let seek_no_sel = gtk::NoSelection::new(Some(self.seek_store.clone()));
+            let seek_lv = gtk::ListView::builder().build();
+            seek_lv.set_model(Some(&seek_no_sel));
+            seek_lv.set_factory(self.factory.get());
+            let seek_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&seek_lv)
+                .css_classes(["mx-tinted-bg"])
+                .build();
+            self.room_stack.add_named(&seek_scroll, Some("__seek__"));
+            self.seek_list_view.set(seek_lv).ok();
 
             // Helper: get full text from the TextView buffer.
             fn buf_text(buf: &gtk::TextBuffer) -> String {
@@ -1590,9 +1612,16 @@ impl MessageView {
             Some(m) => m,
             None => return false,
         };
-        // list_store.find() uses GObject identity — encapsulated library call.
-        let Some(i) = imp.list_store().find(&msg) else { return false };
-        imp.list_view().scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
+        // In seek mode use the seek store/list_view; otherwise use the live room's.
+        let in_seek = imp.seek_saved_event_index.borrow().is_some();
+        let (store, list_view): (gio::ListStore, gtk::ListView) = if in_seek {
+            let lv = imp.seek_list_view.get().cloned().expect("seek_list_view not initialised");
+            (imp.seek_store.clone(), lv)
+        } else {
+            (imp.list_store(), imp.list_view())
+        };
+        let Some(i) = store.find(&msg) else { return false };
+        list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
         // Trigger flash via GObject property — the notify::is-flashing handler
         // in bind_message_object applies the CSS class reactively, no widget walk.
         msg.set_is_flashing(true);
@@ -1904,44 +1933,31 @@ impl MessageView {
 
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
 
-        // Build a temporary seek ListStore — never touch the room's real ListStore.
-        let seek_store = gio::ListStore::new::<MessageObject>();
-        seek_store.splice(0, 0, &objs);
+        // Populate the dedicated seek_store (never touches the live store).
+        let n_old = imp.seek_store.n_items();
+        imp.seek_store.splice(0, n_old, &objs);
 
         // Build seek event_index; save the live one for restore on cancel.
         let mut seek_idx = std::collections::HashMap::new();
         for obj in &objs {
             let eid = obj.event_id();
-            if !eid.is_empty() {
-                seek_idx.insert(eid, obj.clone());
-            }
+            if !eid.is_empty() { seek_idx.insert(eid, obj.clone()); }
         }
         let live_idx = imp.event_index.borrow().clone();
         *imp.seek_saved_event_index.borrow_mut() = Some(live_idx);
         *imp.event_index.borrow_mut() = seek_idx;
 
-        // Swap the ListView's model to the seek store; save cur_list_store ref.
-        let live_store = imp.cur_list_store.borrow().clone();
-        *imp.cur_list_store.borrow_mut() = seek_store.clone();
-        imp.list_view().set_model(gtk::SelectionModel::NONE);
-        let no_sel = gtk::NoSelection::new(Some(seek_store));
-        imp.list_view().set_model(Some(&no_sel));
-        // Stash the live store under the seek_saved key so cancel can restore it.
-        // Re-use seek_saved_event_index being Some() as the "in seek mode" flag;
-        // the live store is retrievable from room_view_cache.
-        drop(live_store); // room_view_cache still owns it
-
-        // Store seek state.
+        // Store seek state (don't overwrite prev_batch_token — live store's token untouched).
         *imp.seek_before_token.borrow_mut() = before_token;
         *imp.seek_target_event_id.borrow_mut() = Some(target_event_id.to_string());
-        imp.prev_batch_token.replace(imp.seek_before_token.borrow().clone());
-        imp.fetching_older.set(false);
+
+        // Switch to the seek page in room_stack — O(1), no model changes on live views.
+        imp.room_stack.set_visible_child_name("__seek__");
 
         // Transition seek banner from "Finding…" → "Historical context" state.
         imp.seek_spinner.set_spinning(false);
         imp.seek_spinner.set_visible(false);
         imp.seek_banner_label.set_text("Viewing historical context");
-        // Show "Jump to latest" button (last child).
         if let Some(btn) = imp.seek_banner.last_child() { btn.set_visible(true); }
         imp.seek_banner.set_visible(true);
 
@@ -1962,27 +1978,23 @@ impl MessageView {
         });
     }
 
-    /// Exit seek mode: restore the live timeline and fire the seek-cancelled
-    /// callback so the window reloads the room.
+    /// Exit seek mode: switch the room_stack back to the live page (O(1)),
+    /// restore the event_index, and clear the seek store.
+    /// The live ListStore and its model are never touched — no freeze, no gap.
     pub fn cancel_seek(&self) {
         let imp = self.imp();
 
-        // Restore the live ListStore from room_view_cache (never destroyed).
+        // Switch back to the live room page — O(1), no model changes.
         let room_id = imp.current_room_id.borrow().clone();
-        let live_store = imp.room_view_cache.borrow()
-            .get(&room_id)
-            .map(|(_, _, ls)| ls.clone());
-        if let Some(ls) = live_store {
-            *imp.cur_list_store.borrow_mut() = ls.clone();
-            imp.list_view().set_model(gtk::SelectionModel::NONE);
-            let no_sel = gtk::NoSelection::new(Some(ls));
-            imp.list_view().set_model(Some(&no_sel));
-        }
+        imp.room_stack.set_visible_child_name(&room_id);
 
         // Restore the live event_index.
         if let Some(saved) = imp.seek_saved_event_index.borrow_mut().take() {
             *imp.event_index.borrow_mut() = saved;
         }
+
+        // Clear the seek store so its memory is released.
+        imp.seek_store.remove_all();
 
         // Reset seek state and banner.
         imp.seek_spinner.set_spinning(false);

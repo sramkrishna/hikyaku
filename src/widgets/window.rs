@@ -1094,21 +1094,8 @@ impl MxWindow {
             }
         });
 
-        // Wire seek-cancelled: "Jump to latest" re-fetches the live timeline.
-        {
-            let cmd_tx = command_tx.clone();
-            let window_weak = window.downgrade();
-            imp.message_view.connect_seek_cancelled(move || {
-                let Some(win) = window_weak.upgrade() else { return };
-                let room_id = win.imp().current_room_id.borrow().clone();
-                if let Some(room_id) = room_id {
-                    let tx = cmd_tx.clone();
-                    glib::spawn_future_local(async move {
-                        let _ = tx.send(MatrixCommand::RefreshRoom { room_id }).await;
-                    });
-                }
-            });
-        }
+        // Seek-cancelled: the live store was never modified (GtkStack page switch),
+        // so no refresh is needed — live messages are already intact.
 
         // Wire up send message → send SendMessage command.
         let cmd_tx = command_tx.clone();
