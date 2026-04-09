@@ -182,6 +182,15 @@ mod imp {
         /// Pending timer to show the "loading" view after a delay.
         /// Cancelled when RoomMessages arrives so warm-cache rooms never flash.
         pub loading_timer: RefCell<Option<glib::SourceId>>,
+        /// When Some, the timeline shows a historical context window (seek mode).
+        /// Contains the before_token for loading older messages from the seek position.
+        pub seek_before_token: RefCell<Option<String>>,
+        /// The event_id we seeked to — used to scroll after the seek result loads.
+        pub seek_target_event_id: RefCell<Option<String>>,
+        /// Callback fired when the user clicks "Jump to latest" in seek mode.
+        pub on_seek_cancelled: RefCell<Option<Box<dyn Fn()>>>,
+        /// Inline banner shown when the timeline is in seek (historical context) mode.
+        pub seek_banner: gtk::Box,
     }
 
     impl Default for MessageView {
@@ -268,6 +277,28 @@ mod imp {
                 history_cursor: Cell::new(0),
                 history_draft: RefCell::new(String::new()),
                 loading_timer: RefCell::new(None),
+                seek_before_token: RefCell::new(None),
+                seek_target_event_id: RefCell::new(None),
+                on_seek_cancelled: RefCell::new(None),
+                seek_banner: {
+                    let banner = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(6)
+                        .visible(false)
+                        .css_classes(["osd", "toolbar"])
+                        .build();
+                    let label = gtk::Label::builder()
+                        .label("Viewing historical context")
+                        .hexpand(true)
+                        .xalign(0.0)
+                        .build();
+                    let btn = gtk::Button::builder()
+                        .label("Jump to latest")
+                        .build();
+                    banner.append(&label);
+                    banner.append(&btn);
+                    banner
+                },
             }
         }
     }
@@ -552,6 +583,22 @@ mod imp {
             // ScrolledWindow+ListView widgets are added inside room_stack
             // by ensure_room_view() on each room's first visit.
             self.room_list_placeholder.append(&self.room_stack);
+
+            // Insert the seek banner above the room_stack.  It is hidden by
+            // default and shown when the timeline is in seek (historical context) mode.
+            self.room_list_placeholder.prepend(&self.seek_banner);
+
+            // Wire the "Jump to latest" button inside the seek banner.
+            let seek_btn = self.seek_banner
+                .first_child()
+                .and_then(|w| w.next_sibling())
+                .and_downcast::<gtk::Button>()
+                .expect("seek banner button missing");
+            let view_weak = self.obj().downgrade();
+            seek_btn.connect_clicked(move |_| {
+                let Some(view) = view_weak.upgrade() else { return };
+                view.cancel_seek();
+            });
 
             // Helper: get full text from the TextView buffer.
             fn buf_text(buf: &gtk::TextBuffer) -> String {
@@ -1832,6 +1879,81 @@ impl MessageView {
         drop(idx);
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
+    }
+
+    /// Load a seek (historical context) result: replace the timeline with the
+    /// context window around `target_event_id` and show the seek banner.
+    pub fn load_seek_result(
+        &self,
+        messages: &[crate::matrix::MessageInfo],
+        target_event_id: &str,
+        before_token: Option<String>,
+    ) {
+        let imp = self.imp();
+
+        // Replace the current timeline with the context window.
+        // This is a first-load style splice (prev n = current items in store).
+        let n = imp.list_store().n_items();
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+
+        // Detach model, splice, re-attach (same pattern as first-load in set_messages).
+        imp.list_view().set_model(gtk::SelectionModel::NONE);
+        imp.list_store().splice(0, n, &objs);
+        let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
+        imp.list_view().set_model(Some(&no_sel));
+
+        // Rebuild event_index.
+        let mut idx = imp.event_index.borrow_mut();
+        idx.clear();
+        for obj in &objs {
+            let eid = obj.event_id();
+            if !eid.is_empty() {
+                idx.insert(eid, obj.clone());
+            }
+        }
+        drop(idx);
+
+        // Store seek state.
+        *imp.seek_before_token.borrow_mut() = before_token;
+        *imp.seek_target_event_id.borrow_mut() = Some(target_event_id.to_string());
+        imp.prev_batch_token.replace(imp.seek_before_token.borrow().clone());
+        imp.fetching_older.set(false);
+
+        // Show seek banner.
+        imp.seek_banner.set_visible(true);
+
+        // Ensure message view is showing.
+        imp.view_stack.set_visible_child_name("messages");
+
+        tracing::info!(
+            "load_seek_result: {} messages, target={target_event_id}",
+            messages.len()
+        );
+
+        // Scroll to target event after GTK lays out the list.
+        let view_weak = self.downgrade();
+        let eid = target_event_id.to_string();
+        glib::idle_add_local_once(move || {
+            let Some(view) = view_weak.upgrade() else { return };
+            view.scroll_to_event(&eid);
+        });
+    }
+
+    /// Exit seek mode: hide the banner and fire the seek-cancelled callback
+    /// so the window can reload the live timeline.
+    pub fn cancel_seek(&self) {
+        let imp = self.imp();
+        imp.seek_banner.set_visible(false);
+        *imp.seek_before_token.borrow_mut() = None;
+        *imp.seek_target_event_id.borrow_mut() = None;
+        if let Some(ref cb) = *imp.on_seek_cancelled.borrow() {
+            cb();
+        }
+    }
+
+    /// Register a callback for when the user clicks "Jump to latest" in seek mode.
+    pub fn connect_seek_cancelled<F: Fn() + 'static>(&self, f: F) {
+        *self.imp().on_seek_cancelled.borrow_mut() = Some(Box::new(f));
     }
 
     /// Serialize all messages currently in the list store to JSON Lines and

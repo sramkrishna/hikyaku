@@ -1094,6 +1094,22 @@ impl MxWindow {
             }
         });
 
+        // Wire seek-cancelled: "Jump to latest" re-fetches the live timeline.
+        {
+            let cmd_tx = command_tx.clone();
+            let window_weak = window.downgrade();
+            imp.message_view.connect_seek_cancelled(move || {
+                let Some(win) = window_weak.upgrade() else { return };
+                let room_id = win.imp().current_room_id.borrow().clone();
+                if let Some(room_id) = room_id {
+                    let tx = cmd_tx.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::RefreshRoom { room_id }).await;
+                    });
+                }
+            });
+        }
+
         // Wire up send message → send SendMessage command.
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
@@ -1733,9 +1749,20 @@ impl MxWindow {
                             // Flash a bookmarked message if one is pending.
                             if let Some(eid) = window.imp().pending_flash_event_id.take() {
                                 let mv = message_view.clone();
-                                glib::idle_add_local_once(move || {
-                                    mv.scroll_to_event(&eid);
-                                });
+                                let found = mv.scroll_to_event(&eid);
+                                if !found {
+                                    // Event not in loaded timeline — fetch context from server.
+                                    let rid = room_id.clone();
+                                    let tx = command_tx.clone();
+                                    glib::idle_add_local_once(move || {
+                                        glib::spawn_future_local(async move {
+                                            let _ = tx.send(MatrixCommand::SeekToEvent {
+                                                room_id: rid,
+                                                event_id: eid,
+                                            }).await;
+                                        });
+                                    });
+                                }
                             }
                             for (uid, mxc) in to_fetch {
                                 let tx = command_tx.clone();
@@ -1757,6 +1784,12 @@ impl MxWindow {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             message_view.prepend_messages(&messages, prev_batch_token);
+                        }
+                    }
+                    MatrixEvent::SeekResult { room_id, target_event_id, messages, before_token } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.load_seek_result(&messages, &target_event_id, before_token);
                         }
                     }
                     MatrixEvent::MessageSent { room_id, echo_body, event_id } => {

@@ -206,6 +206,16 @@ pub enum MatrixEvent {
         messages: Vec<MessageInfo>,
         prev_batch_token: Option<String>,
     },
+    /// Result of a SeekToEvent — events around the target, for replacing the timeline.
+    SeekResult {
+        room_id: String,
+        /// The event the user wanted to jump to.
+        target_event_id: String,
+        /// Events in chronological order (before + target + after), ready to display.
+        messages: Vec<MessageInfo>,
+        /// Pagination token for loading events older than this window.
+        before_token: Option<String>,
+    },
     NewMessage {
         room_id: String,
         room_name: String,
@@ -471,6 +481,11 @@ pub enum MatrixCommand {
     },
     /// Preload the Ollama model in the background so the first inference is fast.
     WarmupOllama { endpoint: String, model: String },
+    /// Fetch event context so the UI can jump to a specific event in the timeline.
+    SeekToEvent {
+        room_id: String,
+        event_id: String,
+    },
     /// Drain the command queue and then signal the sync loop to stop.
     /// Must be sent LAST by the application — all preceding commands run first.
     Shutdown,
@@ -1228,6 +1243,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::FetchThreadReplies { room_id, thread_root_id }) => {
                         handle_fetch_thread(&client, &event_tx, &room_id, &thread_root_id).await;
+                    }
+                    Ok(MatrixCommand::SeekToEvent { room_id, event_id }) => {
+                        handle_seek_to_event(&client, &event_tx, &room_id, &event_id).await;
                     }
                     Ok(MatrixCommand::Logout) => {
                         tracing::info!("Logging out…");
@@ -4815,6 +4833,64 @@ async fn handle_fetch_thread(
         root_message,
         replies,
     }).await;
+}
+
+/// Fetch event context for a seek-to-event jump.
+async fn handle_seek_to_event(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    event_id: &str,
+) {
+    use matrix_sdk::ruma::api::client::context::get_context;
+    use matrix_sdk::ruma::EventId;
+
+    let Ok(rid) = RoomId::parse(room_id) else { return };
+    let Ok(eid) = EventId::parse(event_id) else { return };
+    let Some(room) = client.get_room(&rid) else { return };
+
+    let mut request = get_context::v3::Request::new(rid.to_owned(), eid.to_owned());
+    request.limit = matrix_sdk::ruma::UInt::from(40u32);
+
+    match client.send(request).await {
+        Ok(response) => {
+            // events_before is reverse-chronological; reverse to get chronological order.
+            // Convert Raw<AnyTimelineEvent> → Raw<AnySyncTimelineEvent> via cast() (same JSON).
+            let mut all_raw: Vec<matrix_sdk::deserialized_responses::TimelineEvent> =
+                response.events_before
+                    .into_iter()
+                    .rev()
+                    .map(|r| matrix_sdk::deserialized_responses::TimelineEvent::new(r.cast()))
+                    .collect();
+
+            if let Some(evt) = response.event {
+                all_raw.push(matrix_sdk::deserialized_responses::TimelineEvent::new(evt.cast()));
+            }
+            all_raw.extend(
+                response.events_after
+                    .into_iter()
+                    .map(|r| matrix_sdk::deserialized_responses::TimelineEvent::new(r.cast())),
+            );
+
+            let messages = extract_messages(&room, &all_raw, false, client.user_id()).await;
+
+            tracing::info!(
+                "SeekToEvent {event_id}: fetched {} context events → {} messages",
+                all_raw.len(),
+                messages.len()
+            );
+
+            let _ = event_tx.send(MatrixEvent::SeekResult {
+                room_id: room_id.to_string(),
+                target_event_id: event_id.to_string(),
+                messages,
+                before_token: response.start,
+            }).await;
+        }
+        Err(e) => {
+            tracing::error!("SeekToEvent failed for {event_id}: {e}");
+        }
+    }
 }
 
 /// Find an existing DM room with a user, or create a new one.
