@@ -142,8 +142,6 @@ mod imp {
         pub notif_store: gio::ListStore,
         /// Revealer for the notifications right sidebar.
         pub notif_revealer: gtk::Revealer,
-        /// Separator between message view and notifications sidebar.
-        pub notif_separator: OnceCell<gtk::Separator>,
         /// Bell toggle button in the sidebar header — shows/hides the notif panel.
         pub notif_bell_button: OnceCell<gtk::ToggleButton>,
         /// Number of unread notifications — drives the bell badge label.
@@ -256,7 +254,6 @@ mod imp {
                     .reveal_child(false)
                     .visible(false)
                     .build(),
-                notif_separator: OnceCell::new(),
                 notif_bell_button: OnceCell::new(),
                 notif_unread_count: Cell::new(0),
                 notif_badge: OnceCell::new(),
@@ -525,7 +522,11 @@ thread_local! {
                margin-top: 2px; \
                margin-end: 2px; \
              } \
-             .notif-bell-unread image { color: @accent_color; }"
+             .notif-bell-unread image { color: @accent_color; } \
+             .notif-sidebar { \
+               background-color: @sidebar_bg_color; \
+               border-left: 1px solid @borders; \
+             }"
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -2751,6 +2752,7 @@ impl MxWindow {
         let notif_wrapper = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .width_request(280)
+            .css_classes(["notif-sidebar"])
             .build();
         notif_wrapper.append(&notif_header_box);
         notif_wrapper.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -2777,14 +2779,10 @@ impl MxWindow {
 
         // Bell button toggles the notification sidebar.
         let notif_revealer_for_bell = imp.notif_revealer.clone();
-        let notif_sep_cell = imp.notif_separator.clone();
         bell_btn.connect_toggled(move |btn| {
             let visible = btn.is_active();
             notif_revealer_for_bell.set_visible(visible);
             notif_revealer_for_bell.set_reveal_child(visible);
-            if let Some(sep) = notif_sep_cell.get() {
-                sep.set_visible(visible);
-            }
         });
 
         // Content area: message view + optional notifications sidebar + optional details sidebar.
@@ -2796,13 +2794,7 @@ impl MxWindow {
             .visible(false)
             .build();
         imp.details_separator.set(details_separator.clone()).ok();
-        let notif_separator = gtk::Separator::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .visible(false)
-            .build();
-        imp.notif_separator.set(notif_separator.clone()).ok();
         content_box.append(&imp.message_view);
-        content_box.append(&notif_separator);
         content_box.append(&imp.notif_revealer);
         content_box.append(&details_separator);
         content_box.append(&imp.details_revealer);
@@ -3453,9 +3445,6 @@ impl MxWindow {
             }
             imp.notif_revealer.set_reveal_child(false);
             imp.notif_revealer.set_visible(false);
-            if let Some(sep) = imp.notif_separator.get() {
-                sep.set_visible(false);
-            }
         });
 
         row
