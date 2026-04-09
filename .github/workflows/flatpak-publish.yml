@@ -1,0 +1,56 @@
+name: Publish Flatpak Repo
+
+# Builds a full OSTree flatpak repository and deploys it to GitHub Pages.
+#
+# Once GitHub Pages is enabled (Settings → Pages → source: gh-pages branch),
+# users on other machines can install with:
+#
+#   flatpak install --user hikyaku.flatpakref
+#
+# or just download the single-file bundle from the GitHub release page.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required by peaceiris/actions-gh-pages
+
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Build the .flatpak bundle (same as the CI workflow).
+      # The flatpak-github-actions action handles SDK installation and caching.
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: hikyaku.flatpak
+          manifest-path: flatpak/me.ramkrishna.hikyaku.json
+          cache-key: flatpak-builder-${{ github.sha }}
+          branch: stable
+
+      # Import the bundle into a local OSTree repo and generate static deltas
+      # so clients can download incremental updates rather than full re-installs.
+      - name: Build OSTree repo
+        run: |
+          flatpak build-import-bundle --update-appstream repo/ hikyaku.flatpak
+          flatpak build-update-repo --generate-static-deltas repo/
+
+      # Push the repo directory to the gh-pages branch.
+      # force_orphan keeps the branch history clean (OSTree repo is the truth).
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          force_orphan: true
