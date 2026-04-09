@@ -5684,16 +5684,20 @@ fn show_ai_setup_dialog(window: &MxWindow) {
     // Model choices — displayed as a list of radio-style ActionRows.
     // (name, tag, description)
     let models: &[(&str, &str, &str)] = &[
-        ("Qwen 2.5 1.5B",    "qwen2.5:1.5b",    "Recommended · ~1 GB · fast, multilingual"),
-        ("DeepSeek-R1 1.5B", "deepseek-r1:1.5b", "Reasoning distillation · ~1 GB"),
-        ("MiniCPM 3",        "minicpm3",          "Efficient · ~2.5 GB · strong for its size"),
+        ("Qwen 2.5 3B",      "qwen2.5:3b",       "Recommended · ~2 GB · best balance of speed and quality"),
+        ("Qwen 2.5 1.5B",    "qwen2.5:1.5b",     "Lightweight · ~1 GB · faster on low-end hardware"),
+        ("Llama 3.2 3B",     "llama3.2:3b",       "Meta's 3B model · ~2 GB · good general-purpose chat"),
+        ("DeepSeek-R1 7B",   "deepseek-r1:7b",    "Strong reasoning · ~4.5 GB · needs 6 GB+ RAM"),
     ];
 
-    let model_group = adw::PreferencesGroup::new();
+    let model_group = adw::PreferencesGroup::builder()
+        .title("Choose a model")
+        .description("All models run locally — nothing leaves your machine")
+        .build();
     vbox.append(&model_group);
 
     // Track selected model tag.
-    let selected_model = std::rc::Rc::new(std::cell::RefCell::new("qwen2.5:1.5b".to_string()));
+    let selected_model = std::rc::Rc::new(std::cell::RefCell::new("qwen2.5:3b".to_string()));
 
     // Build a checkmark toggle for each model row.
     let checks: Vec<gtk::Image> = models.iter().enumerate().map(|(i, (name, tag, desc))| {
@@ -5743,6 +5747,33 @@ fn show_ai_setup_dialog(window: &MxWindow) {
                 });
             }
         }
+    }
+
+    // Custom model entry — lets knowledgeable users type any Ollama model tag.
+    let custom_group = adw::PreferencesGroup::builder()
+        .title("Or enter any Ollama model tag")
+        .build();
+    vbox.append(&custom_group);
+
+    let custom_entry = adw::EntryRow::builder()
+        .title("Model tag  (e.g. mistral:7b, phi4:latest)")
+        .build();
+    custom_group.add(&custom_entry);
+
+    // Typing in the custom entry deselects the radio list and uses the typed tag.
+    {
+        let sel = selected_model.clone();
+        let checks_ref = checks.clone();
+        custom_entry.connect_changed(move |entry| {
+            let text = entry.text().to_string();
+            if !text.is_empty() {
+                *sel.borrow_mut() = text;
+                // Clear all radio checkmarks — custom overrides.
+                for c in &checks_ref {
+                    c.set_icon_name(None::<&str>);
+                }
+            }
+        });
     }
 
     // Progress label + bar (hidden until pull starts).
