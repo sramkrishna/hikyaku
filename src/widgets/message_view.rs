@@ -2535,16 +2535,22 @@ impl MessageView {
     /// current window.  Auto-dismisses the banner after 10 seconds.
     fn insert_divider_by_count(&self, unread_count: u32) {
         let imp = self.imp();
+        let my_id = imp.user_id.borrow().clone();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         let pos = n.saturating_sub(unread_count);
         // Mark all messages after the divider position as new and track them
         // so remove_dividers can clear them in O(unread) not O(total).
+        // Never mark own messages as new — the user doesn't need to be notified
+        // about messages they sent themselves.
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in pos..n {
             if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i)
                 .and_downcast::<MessageObject>()
             {
+                if !divider_should_mark(&obj.sender_id(), &my_id) {
+                    continue;
+                }
                 obj.set_is_new_message(true);
                 new_objs.push(obj);
             }
@@ -2565,6 +2571,7 @@ impl MessageView {
     /// `insert_divider_by_count`.
     fn insert_divider_after_event(&self, event_id: &str) -> bool {
         let imp = self.imp();
+        let my_id = imp.user_id.borrow().clone();
         let Some(marker_obj) = imp.event_index.borrow().get(event_id).cloned() else {
             return false; // Event not in the current window (case C).
         };
@@ -2577,12 +2584,17 @@ impl MessageView {
             return false; // Event is the last item — unread messages not yet loaded (case B).
         }
         // Mark messages after the divider position as new.
+        // Never mark own messages as new — the user doesn't need to be notified
+        // about messages they sent themselves.
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in insert_pos..n {
             if let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i)
                 .and_downcast::<MessageObject>()
             {
+                if !divider_should_mark(&obj.sender_id(), &my_id) {
+                    continue;
+                }
                 obj.set_is_new_message(true);
                 new_objs.push(obj);
             }
@@ -2761,10 +2773,17 @@ pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -
 }
 
 /// Pure helper: should a live-appended message be tinted as "new"?
-/// Only tint when the window is not focused — if the user is actively watching
-/// the room there is no need to highlight messages as they arrive.
+/// Only tint when the window is not focused AND the message is not from
+/// the current user — own messages never need a "new" highlight.
 pub(crate) fn should_mark_as_new(window_focused: bool) -> bool {
     !window_focused
+}
+
+/// Pure helper: should a divider-placement loop mark this message as new?
+/// Skips messages sent by the local user so their own messages are never
+/// highlighted as unread, whether on initial room load or incremental update.
+pub(crate) fn divider_should_mark(sender_id: &str, my_id: &str) -> bool {
+    my_id.is_empty() || sender_id != my_id
 }
 
 /// Pure helper: should the "Updating messages" banner be shown?
@@ -2849,7 +2868,7 @@ pub(crate) fn divider_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_divider_pos, divider_decision, unread_label,
+        compute_divider_pos, divider_decision, divider_should_mark, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
@@ -3402,5 +3421,30 @@ mod tests {
         // Since messages_loaded was restored to true, first_load = false → no auto-scroll.
         let first_load = !was_loaded;
         assert!(!first_load, "return visit must not trigger first-load auto-scroll");
+    }
+
+    // ── divider_should_mark ──────────────────────────────────────────────────
+
+    #[test]
+    fn own_message_not_marked_new() {
+        // When sender_id matches my_id, we must NOT mark the message as new.
+        assert!(!divider_should_mark("@me:example.org", "@me:example.org"));
+    }
+
+    #[test]
+    fn other_message_marked_new() {
+        assert!(divider_should_mark("@alice:example.org", "@me:example.org"));
+    }
+
+    #[test]
+    fn empty_my_id_marks_all_new() {
+        // If user_id is not yet known, mark everything as new (safe fallback).
+        assert!(divider_should_mark("@me:example.org", ""));
+    }
+
+    #[test]
+    fn different_server_not_own() {
+        // Same localpart but different homeserver — not the same user.
+        assert!(divider_should_mark("@me:other.org", "@me:example.org"));
     }
 }
