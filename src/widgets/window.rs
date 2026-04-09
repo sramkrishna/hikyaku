@@ -137,6 +137,21 @@ mod imp {
         /// `UserSearchResults` so the dialog can update its results list without
         /// going through the full event channel.  Cleared when the dialog closes.
         pub user_search_cb: RefCell<Option<Box<dyn Fn(Vec<(String, String)>) + 'static>>>,
+        /// In-session notification log (@mentions and DMs).  Max 50 entries;
+        /// oldest are dropped when the list is full.
+        pub notif_store: gio::ListStore,
+        /// Revealer for the notifications right sidebar.
+        pub notif_revealer: gtk::Revealer,
+        /// Separator between message view and notifications sidebar.
+        pub notif_separator: OnceCell<gtk::Separator>,
+        /// Bell toggle button in the sidebar header — shows/hides the notif panel.
+        pub notif_bell_button: OnceCell<gtk::ToggleButton>,
+        /// Number of unread notifications — drives the bell badge label.
+        pub notif_unread_count: Cell<u32>,
+        /// The badge label overlaid on the bell button (shows unread count).
+        pub notif_badge: OnceCell<gtk::Label>,
+        /// ListBox inside the notification sidebar — rebuilt on each push.
+        pub notif_list_box: OnceCell<gtk::ListBox>,
     }
 
     impl Default for MxWindow {
@@ -235,6 +250,17 @@ mod imp {
                 },
                 local_unread: crate::local_unread::LocalUnreadStore::new(),
                 user_search_cb: RefCell::new(None),
+                notif_store: gio::ListStore::new::<crate::models::NotificationObject>(),
+                notif_revealer: gtk::Revealer::builder()
+                    .transition_type(gtk::RevealerTransitionType::SlideLeft)
+                    .reveal_child(false)
+                    .visible(false)
+                    .build(),
+                notif_separator: OnceCell::new(),
+                notif_bell_button: OnceCell::new(),
+                notif_unread_count: Cell::new(0),
+                notif_badge: OnceCell::new(),
+                notif_list_box: OnceCell::new(),
             }
         }
     }
@@ -485,7 +511,21 @@ thread_local! {
              .health-dot { border-radius: 50%; } \
              .health-dot.health-none    { background-color: #26a269; } \
              .health-dot.health-watch   { background-color: #e5a50a; } \
-             .health-dot.health-warning { background-color: #e01b24; }"
+             .health-dot.health-warning { background-color: #e01b24; } \
+             .notif-unread { background-color: alpha(@accent_bg_color, 0.12); } \
+             .notif-unread:hover { background-color: alpha(@accent_bg_color, 0.22); } \
+             .notif-badge { \
+               background-color: @destructive_color; \
+               color: white; \
+               border-radius: 99px; \
+               font-size: 8px; \
+               font-weight: bold; \
+               padding: 1px 4px; \
+               min-width: 8px; \
+               margin-top: 2px; \
+               margin-end: 2px; \
+             } \
+             .notif-bell-unread image { color: @accent_color; }"
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -1852,6 +1892,15 @@ impl MxWindow {
                                 &message.body,
                                 is_dm,
                             );
+                            // Also push to the in-session notification log.
+                            window.push_notification(
+                                &room_id,
+                                &message.event_id,
+                                &message.sender,
+                                &room_name,
+                                &message.body,
+                                message.timestamp,
+                            );
                         }
                     }
                     #[cfg(feature = "community-health")]
@@ -2400,6 +2449,33 @@ impl MxWindow {
             .build();
         sidebar_header.pack_end(&menu_button);
 
+        // Bell toggle — shows/hides the notifications right sidebar.
+        let bell_btn = gtk::ToggleButton::builder()
+            .tooltip_text("Notifications")
+            .build();
+        bell_btn.add_css_class("flat");
+
+        // Badge label overlaid on the bell button.
+        let badge_label = gtk::Label::builder()
+            .css_classes(["notif-badge"])
+            .visible(false)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .can_focus(false)
+            .can_target(false)
+            .build();
+
+        let bell_image = gtk::Image::from_icon_name("notification-bell-symbolic");
+        let bell_overlay = gtk::Overlay::builder()
+            .child(&bell_btn)
+            .build();
+        bell_btn.set_child(Some(&bell_image));
+        bell_overlay.add_overlay(&badge_label);
+
+        let _ = imp.notif_bell_button.set(bell_btn.clone());
+        let _ = imp.notif_badge.set(badge_label);
+        sidebar_header.pack_end(&bell_overlay);
+
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
         sidebar_toolbar.set_content(Some(&imp.room_list_view));
@@ -2636,7 +2712,82 @@ impl MxWindow {
         details_wrapper.append(&details_close_btn);
         imp.details_revealer.set_child(Some(&details_wrapper));
 
-        // Content area: message view + optional details sidebar.
+        // Notification sidebar contents.
+        let notif_list_box = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        let _ = imp.notif_list_box.set(notif_list_box.clone());
+
+        let notif_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&notif_list_box)
+            .build();
+
+        let notif_header_lbl = gtk::Label::builder()
+            .label("Notifications")
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .css_classes(["heading"])
+            .margin_start(12)
+            .margin_end(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let notif_clear_btn = gtk::Button::builder()
+            .icon_name("edit-clear-all-symbolic")
+            .tooltip_text("Clear all notifications")
+            .css_classes(["flat", "circular"])
+            .margin_end(4)
+            .build();
+        let notif_header_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(0)
+            .build();
+        notif_header_box.append(&notif_header_lbl);
+        notif_header_box.append(&notif_clear_btn);
+
+        let notif_wrapper = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(280)
+            .build();
+        notif_wrapper.append(&notif_header_box);
+        notif_wrapper.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        notif_wrapper.append(&notif_scroll);
+        imp.notif_revealer.set_child(Some(&notif_wrapper));
+
+        // Clear all notifications.
+        let notif_store_for_clear = imp.notif_store.clone();
+        let notif_list_for_clear = notif_list_box.clone();
+        let notif_badge_for_clear = imp.notif_badge.get().unwrap().clone();
+        let notif_bell_for_clear = imp.notif_bell_button.get().unwrap().clone();
+        let notif_count_ref = self.downgrade();
+        notif_clear_btn.connect_clicked(move |_| {
+            notif_store_for_clear.remove_all();
+            while let Some(row) = notif_list_for_clear.first_child() {
+                notif_list_for_clear.remove(&row);
+            }
+            notif_badge_for_clear.set_visible(false);
+            if let Some(w) = notif_count_ref.upgrade() {
+                w.imp().notif_unread_count.set(0);
+            }
+            notif_bell_for_clear.remove_css_class("notif-bell-unread");
+        });
+
+        // Bell button toggles the notification sidebar.
+        let notif_revealer_for_bell = imp.notif_revealer.clone();
+        let notif_sep_cell = imp.notif_separator.clone();
+        bell_btn.connect_toggled(move |btn| {
+            let visible = btn.is_active();
+            notif_revealer_for_bell.set_visible(visible);
+            notif_revealer_for_bell.set_reveal_child(visible);
+            if let Some(sep) = notif_sep_cell.get() {
+                sep.set_visible(visible);
+            }
+        });
+
+        // Content area: message view + optional notifications sidebar + optional details sidebar.
         let content_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .build();
@@ -2645,10 +2796,17 @@ impl MxWindow {
             .visible(false)
             .build();
         imp.details_separator.set(details_separator.clone()).ok();
+        let notif_separator = gtk::Separator::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        imp.notif_separator.set(notif_separator.clone()).ok();
         content_box.append(&imp.message_view);
+        content_box.append(&notif_separator);
+        content_box.append(&imp.notif_revealer);
         content_box.append(&details_separator);
         content_box.append(&imp.details_revealer);
-        // Make message view expand, sidebar stays fixed width.
+        // Make message view expand, sidebars stay fixed width.
         imp.message_view.set_hexpand(true);
 
         let content_toolbar = adw::ToolbarView::new();
@@ -3137,6 +3295,170 @@ impl MxWindow {
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
         }
+    }
+
+    /// Push a new notification into the session log and update the sidebar.
+    /// Called for @mentions and DMs.  Max 50 notifications kept; oldest dropped.
+    fn push_notification(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        room_name: &str,
+        body: &str,
+        timestamp: u64,
+    ) {
+        let imp = self.imp();
+        let notif = crate::models::NotificationObject::new(
+            room_id, event_id, sender, room_name, body, timestamp,
+        );
+
+        // Cap at 50 — drop the oldest (position 0) if over the limit.
+        if imp.notif_store.n_items() >= 50 {
+            imp.notif_store.remove(0);
+            if let Some(lb) = imp.notif_list_box.get() {
+                if let Some(first) = lb.row_at_index(0) {
+                    lb.remove(&first);
+                }
+            }
+        }
+
+        imp.notif_store.append(&notif);
+        let count = imp.notif_unread_count.get() + 1;
+        imp.notif_unread_count.set(count);
+
+        // Update badge.
+        if let Some(badge) = imp.notif_badge.get() {
+            badge.set_label(&count.to_string());
+            badge.set_visible(true);
+        }
+        if let Some(btn) = imp.notif_bell_button.get() {
+            btn.add_css_class("notif-bell-unread");
+        }
+
+        // Build and prepend a new row to the listbox (newest at top).
+        if let Some(lb) = imp.notif_list_box.get() {
+            let row = self.build_notif_row(&notif);
+            lb.prepend(&row);
+        }
+    }
+
+    /// Build a single ListBoxRow for a NotificationObject.
+    fn build_notif_row(&self, notif: &crate::models::NotificationObject) -> gtk::ListBoxRow {
+        let row_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(8).margin_end(8)
+            .margin_top(6).margin_bottom(6)
+            .spacing(2)
+            .build();
+
+        let header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+
+        let room_lbl = gtk::Label::builder()
+            .label(&notif.room_name())
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption-heading"])
+            .build();
+
+        // Format timestamp as HH:MM or "Today HH:MM".
+        let ts = notif.timestamp();
+        let time_str = {
+            let secs = ts % 86400;
+            format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+        };
+        let time_lbl = gtk::Label::builder()
+            .label(&time_str)
+            .css_classes(["caption", "dim-label"])
+            .build();
+
+        header.append(&room_lbl);
+        header.append(&time_lbl);
+
+        let preview_text = format!("{}: {}", notif.sender(), notif.body());
+        let preview_end = preview_text.char_indices().nth(80).map(|(i, _)| i).unwrap_or(preview_text.len());
+        let preview_lbl = gtk::Label::builder()
+            .label(&preview_text[..preview_end])
+            .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption"])
+            .build();
+
+        row_box.append(&header);
+        row_box.append(&preview_lbl);
+
+        let row = gtk::ListBoxRow::builder()
+            .child(&row_box)
+            .activatable(true)
+            .build();
+
+        // Unread styling: add CSS class, remove when is_read fires.
+        if !notif.is_read() {
+            row.add_css_class("notif-unread");
+        }
+        let row_weak = row.downgrade();
+        notif.connect_notify_local(Some("is-read"), move |n, _| {
+            if n.is_read() {
+                if let Some(r) = row_weak.upgrade() {
+                    r.remove_css_class("notif-unread");
+                }
+            }
+        });
+
+        // Clicking: mark read, navigate to room + event, close sidebar.
+        let notif_clone = notif.clone();
+        let window_weak = self.downgrade();
+        row.connect_activate(move |_row| {
+            let Some(window) = window_weak.upgrade() else { return };
+            let imp = window.imp();
+
+            // Mark as read and update badge count.
+            if !notif_clone.is_read() {
+                notif_clone.set_is_read(true);
+                let cur = imp.notif_unread_count.get().saturating_sub(1);
+                imp.notif_unread_count.set(cur);
+                if let Some(badge) = imp.notif_badge.get() {
+                    if cur == 0 {
+                        badge.set_visible(false);
+                        if let Some(btn) = imp.notif_bell_button.get() {
+                            btn.remove_css_class("notif-bell-unread");
+                        }
+                    } else {
+                        badge.set_label(&cur.to_string());
+                    }
+                }
+            }
+
+            // Store event_id to flash after the room messages load.
+            imp.pending_flash_event_id.replace(Some(notif_clone.event_id()));
+
+            // Navigate to room (same pattern as bookmark navigation).
+            let room_id = notif_clone.room_id();
+            imp.room_list_view.navigate_to_room_context(&room_id);
+            let name = {
+                let reg = imp.room_list_view.imp().room_registry.borrow();
+                reg.get(&room_id).map(|o| o.name()).unwrap_or_else(|| notif_clone.room_name())
+            };
+            if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
+                cb(room_id, name);
+            }
+
+            // Close the notification sidebar.
+            if let Some(btn) = imp.notif_bell_button.get() {
+                btn.set_active(false);
+            }
+            imp.notif_revealer.set_reveal_child(false);
+            imp.notif_revealer.set_visible(false);
+            if let Some(sep) = imp.notif_separator.get() {
+                sep.set_visible(false);
+            }
+        });
+
+        row
     }
 
     fn setup_actions(&self) {
