@@ -10,6 +10,7 @@ output.txt
 output2.txt
 rust_out
 docs/
-.cargo/
+.cargo/config.toml
+.cargo/credentials.toml
 src/bin/
 data/gschemas.compiled

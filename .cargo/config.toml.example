@@ -1,0 +1,39 @@
+# .cargo/config.toml — local build tuneups (copy to .cargo/config.toml)
+#
+# .cargo/ is gitignored so each developer opts in to these settings.
+# They are not required but significantly improve incremental build speed.
+#
+# One-time full recompile is required after switching to this config.
+# After that, incremental rebuilds of a single file take ~6-7s instead of ~10s.
+
+[build]
+# Frame pointers are required for sysprof's call-graph unwinder to work.
+# Without these, the profiler cannot reconstruct the call stack through
+# Rust frames — you get flat profiles with no caller context.
+rustflags = [
+    "-Cforce-frame-pointers=yes",
+    "-Csymbol-mangling-version=v0",
+    # mold cuts link time from ~12s → ~2s.
+    # Install: brew install mold  OR  nix-env -iA nixpkgs.mold
+    "-Clink-arg=-fuse-ld=mold",
+]
+
+# clang front-end + mold linker.
+# clang is usually pre-installed; mold must be installed separately.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+
+# Parallel codegen: split each crate into 4 chunks so rustc uses more cores
+# on large crates (matrix-sdk, gtk4-rs).  Trade-off: slightly larger binary.
+# split-debuginfo=unpacked: keep debug info in separate .dwo files so the
+# linker only processes the stripped binary — significantly faster linking.
+[profile.dev]
+codegen-units = 4
+split-debuginfo = "unpacked"
+
+# Compile all dependencies at opt-level=1 even in debug builds.
+# GTK4, Cairo, and Pango are nearly unusable at opt-level=0 — this makes the
+# app responsive during development without slowing dep compile times much.
+# Your own code (hikyaku) stays at opt-level=0 for fast incremental rebuilds.
+[profile.dev.package."*"]
+opt-level = 1
