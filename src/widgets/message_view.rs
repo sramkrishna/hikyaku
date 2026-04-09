@@ -191,6 +191,10 @@ mod imp {
         pub on_seek_cancelled: RefCell<Option<Box<dyn Fn()>>>,
         /// Inline banner shown when the timeline is in seek (historical context) mode.
         pub seek_banner: gtk::Box,
+        /// Spinner inside seek_banner — spinning while the seek is in flight.
+        pub seek_spinner: gtk::Spinner,
+        /// Label inside seek_banner — text changes between "Finding…" and "Historical context".
+        pub seek_banner_label: gtk::Label,
     }
 
     impl Default for MessageView {
@@ -280,25 +284,18 @@ mod imp {
                 seek_before_token: RefCell::new(None),
                 seek_target_event_id: RefCell::new(None),
                 on_seek_cancelled: RefCell::new(None),
-                seek_banner: {
-                    let banner = gtk::Box::builder()
-                        .orientation(gtk::Orientation::Horizontal)
-                        .spacing(6)
-                        .visible(false)
-                        .css_classes(["osd", "toolbar"])
-                        .build();
-                    let label = gtk::Label::builder()
-                        .label("Viewing historical context")
-                        .hexpand(true)
-                        .xalign(0.0)
-                        .build();
-                    let btn = gtk::Button::builder()
-                        .label("Jump to latest")
-                        .build();
-                    banner.append(&label);
-                    banner.append(&btn);
-                    banner
-                },
+                seek_spinner: gtk::Spinner::builder().visible(false).build(),
+                seek_banner_label: gtk::Label::builder()
+                    .label("Finding message…")
+                    .hexpand(true)
+                    .xalign(0.0)
+                    .build(),
+                seek_banner: gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
+                    .visible(false)
+                    .css_classes(["osd", "toolbar"])
+                    .build(),
             }
         }
     }
@@ -584,16 +581,15 @@ mod imp {
             // by ensure_room_view() on each room's first visit.
             self.room_list_placeholder.append(&self.room_stack);
 
-            // Insert the seek banner above the room_stack.  It is hidden by
-            // default and shown when the timeline is in seek (historical context) mode.
+            // Assemble the seek banner: [spinner] [label] [Jump to latest btn]
+            let seek_btn = gtk::Button::builder().label("Jump to latest").build();
+            self.seek_banner.append(&self.seek_spinner);
+            self.seek_banner.append(&self.seek_banner_label);
+            self.seek_banner.append(&seek_btn);
+
+            // Insert above the room_stack.
             self.room_list_placeholder.prepend(&self.seek_banner);
 
-            // Wire the "Jump to latest" button inside the seek banner.
-            let seek_btn = self.seek_banner
-                .first_child()
-                .and_then(|w| w.next_sibling())
-                .and_downcast::<gtk::Button>()
-                .expect("seek banner button missing");
             let view_weak = self.obj().downgrade();
             seek_btn.connect_clicked(move |_| {
                 let Some(view) = view_weak.upgrade() else { return };
@@ -1881,6 +1877,18 @@ impl MessageView {
         imp.fetching_older.set(false);
     }
 
+    /// Show the seek banner immediately in "Finding…" state while the server
+    /// round-trip is in flight.  Call this when SeekToEvent is dispatched.
+    pub fn start_seek_loading(&self) {
+        let imp = self.imp();
+        imp.seek_banner_label.set_text("Finding message…");
+        imp.seek_spinner.set_spinning(true);
+        imp.seek_spinner.set_visible(true);
+        // Hide "Jump to latest" until we have results.
+        if let Some(btn) = imp.seek_banner.last_child() { btn.set_visible(false); }
+        imp.seek_banner.set_visible(true);
+    }
+
     /// Load a seek (historical context) result: replace the timeline with the
     /// context window around `target_event_id` and show the seek banner.
     pub fn load_seek_result(
@@ -1919,7 +1927,12 @@ impl MessageView {
         imp.prev_batch_token.replace(imp.seek_before_token.borrow().clone());
         imp.fetching_older.set(false);
 
-        // Show seek banner.
+        // Transition seek banner from "Finding…" → "Historical context" state.
+        imp.seek_spinner.set_spinning(false);
+        imp.seek_spinner.set_visible(false);
+        imp.seek_banner_label.set_text("Viewing historical context");
+        // Show "Jump to latest" button (last child).
+        if let Some(btn) = imp.seek_banner.last_child() { btn.set_visible(true); }
         imp.seek_banner.set_visible(true);
 
         // Ensure message view is showing.
@@ -1943,6 +1956,10 @@ impl MessageView {
     /// so the window can reload the live timeline.
     pub fn cancel_seek(&self) {
         let imp = self.imp();
+        imp.seek_spinner.set_spinning(false);
+        imp.seek_spinner.set_visible(false);
+        imp.seek_banner_label.set_text("Viewing historical context");
+        if let Some(btn) = imp.seek_banner.last_child() { btn.set_visible(true); }
         imp.seek_banner.set_visible(false);
         *imp.seek_before_token.borrow_mut() = None;
         *imp.seek_target_event_id.borrow_mut() = None;

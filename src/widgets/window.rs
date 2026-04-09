@@ -1751,7 +1751,9 @@ impl MxWindow {
                                 let mv = message_view.clone();
                                 let found = mv.scroll_to_event(&eid);
                                 if !found {
-                                    // Event not in loaded timeline — fetch context from server.
+                                    // Event not in loaded timeline — show loading banner
+                                    // immediately so the user gets instant feedback.
+                                    mv.start_seek_loading();
                                     let rid = room_id.clone();
                                     let tx = command_tx.clone();
                                     glib::idle_add_local_once(move || {
