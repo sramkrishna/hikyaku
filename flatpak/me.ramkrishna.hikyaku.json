@@ -33,7 +33,8 @@
       "CARGO_HOME": "/run/build/hikyaku/cargo",
       "CARGO_NET_OFFLINE": "true",
       "ORT_STRATEGY": "system",
-      "ORT_LIB_LOCATION": "/app/lib"
+      "ORT_LIB_LOCATION": "/app/lib",
+      "CARGO_BUILD_JOBS": "8"
     }
   },
   "modules": [

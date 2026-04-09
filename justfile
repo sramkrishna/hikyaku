@@ -41,13 +41,23 @@ timings:
 
 # ── flatpak ──────────────────────────────────────────────────────────────────
 
-# Build and install the flatpak locally (user install, for testing)
+# Number of parallel jobs for flatpak-builder.  Default: half the cores so
+# the system stays responsive during a build.  Override: just flatpak-build jobs=12
+jobs := `nproc --ignore=4`
+
+# Build and install the flatpak locally (user install, for testing).
+# Uses the .flatpak-builder cache — only changed modules rebuild.
+# Pass jobs=N to override parallelism (default: nproc - 4).
 flatpak-build:
-    flatpak-builder --user --install --force-clean {{ build_dir }} {{ manifest }}
+    nice -n 10 flatpak-builder --user --install --jobs={{ jobs }} {{ build_dir }} {{ manifest }}
+
+# Full rebuild from scratch (nukes cache — slow, use rarely)
+flatpak-build-clean:
+    nice -n 10 flatpak-builder --user --install --force-clean --jobs={{ jobs }} {{ build_dir }} {{ manifest }}
 
 # Build the flatpak without installing
 flatpak-build-only:
-    flatpak-builder --force-clean {{ build_dir }} {{ manifest }}
+    nice -n 10 flatpak-builder --jobs={{ jobs }} {{ build_dir }} {{ manifest }}
 
 # Run the installed flatpak
 flatpak-run:
