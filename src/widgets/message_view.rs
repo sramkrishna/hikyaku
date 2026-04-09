@@ -189,6 +189,8 @@ mod imp {
         pub seek_target_event_id: RefCell<Option<String>>,
         /// Callback fired when the user clicks "Jump to latest" in seek mode.
         pub on_seek_cancelled: RefCell<Option<Box<dyn Fn()>>>,
+        /// The live event_index saved while seek mode is active (restored on cancel).
+        pub seek_saved_event_index: RefCell<Option<std::collections::HashMap<String, crate::models::MessageObject>>>,
         /// Inline banner shown when the timeline is in seek (historical context) mode.
         pub seek_banner: gtk::Box,
         /// Spinner inside seek_banner — spinning while the seek is in flight.
@@ -284,6 +286,7 @@ mod imp {
                 seek_before_token: RefCell::new(None),
                 seek_target_event_id: RefCell::new(None),
                 on_seek_cancelled: RefCell::new(None),
+                seek_saved_event_index: RefCell::new(None),
                 seek_spinner: gtk::Spinner::builder().visible(false).build(),
                 seek_banner_label: gtk::Label::builder()
                     .label("Finding message…")
@@ -1899,27 +1902,34 @@ impl MessageView {
     ) {
         let imp = self.imp();
 
-        // Replace the current timeline with the context window.
-        // This is a first-load style splice (prev n = current items in store).
-        let n = imp.list_store().n_items();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
 
-        // Detach model, splice, re-attach (same pattern as first-load in set_messages).
-        imp.list_view().set_model(gtk::SelectionModel::NONE);
-        imp.list_store().splice(0, n, &objs);
-        let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
-        imp.list_view().set_model(Some(&no_sel));
+        // Build a temporary seek ListStore — never touch the room's real ListStore.
+        let seek_store = gio::ListStore::new::<MessageObject>();
+        seek_store.splice(0, 0, &objs);
 
-        // Rebuild event_index.
-        let mut idx = imp.event_index.borrow_mut();
-        idx.clear();
+        // Build seek event_index; save the live one for restore on cancel.
+        let mut seek_idx = std::collections::HashMap::new();
         for obj in &objs {
             let eid = obj.event_id();
             if !eid.is_empty() {
-                idx.insert(eid, obj.clone());
+                seek_idx.insert(eid, obj.clone());
             }
         }
-        drop(idx);
+        let live_idx = imp.event_index.borrow().clone();
+        *imp.seek_saved_event_index.borrow_mut() = Some(live_idx);
+        *imp.event_index.borrow_mut() = seek_idx;
+
+        // Swap the ListView's model to the seek store; save cur_list_store ref.
+        let live_store = imp.cur_list_store.borrow().clone();
+        *imp.cur_list_store.borrow_mut() = seek_store.clone();
+        imp.list_view().set_model(gtk::SelectionModel::NONE);
+        let no_sel = gtk::NoSelection::new(Some(seek_store));
+        imp.list_view().set_model(Some(&no_sel));
+        // Stash the live store under the seek_saved key so cancel can restore it.
+        // Re-use seek_saved_event_index being Some() as the "in seek mode" flag;
+        // the live store is retrievable from room_view_cache.
+        drop(live_store); // room_view_cache still owns it
 
         // Store seek state.
         *imp.seek_before_token.borrow_mut() = before_token;
@@ -1952,10 +1962,29 @@ impl MessageView {
         });
     }
 
-    /// Exit seek mode: hide the banner and fire the seek-cancelled callback
-    /// so the window can reload the live timeline.
+    /// Exit seek mode: restore the live timeline and fire the seek-cancelled
+    /// callback so the window reloads the room.
     pub fn cancel_seek(&self) {
         let imp = self.imp();
+
+        // Restore the live ListStore from room_view_cache (never destroyed).
+        let room_id = imp.current_room_id.borrow().clone();
+        let live_store = imp.room_view_cache.borrow()
+            .get(&room_id)
+            .map(|(_, _, ls)| ls.clone());
+        if let Some(ls) = live_store {
+            *imp.cur_list_store.borrow_mut() = ls.clone();
+            imp.list_view().set_model(gtk::SelectionModel::NONE);
+            let no_sel = gtk::NoSelection::new(Some(ls));
+            imp.list_view().set_model(Some(&no_sel));
+        }
+
+        // Restore the live event_index.
+        if let Some(saved) = imp.seek_saved_event_index.borrow_mut().take() {
+            *imp.event_index.borrow_mut() = saved;
+        }
+
+        // Reset seek state and banner.
         imp.seek_spinner.set_spinning(false);
         imp.seek_spinner.set_visible(false);
         imp.seek_banner_label.set_text("Viewing historical context");
@@ -1963,6 +1992,7 @@ impl MessageView {
         imp.seek_banner.set_visible(false);
         *imp.seek_before_token.borrow_mut() = None;
         *imp.seek_target_event_id.borrow_mut() = None;
+
         if let Some(ref cb) = *imp.on_seek_cancelled.borrow() {
             cb();
         }
