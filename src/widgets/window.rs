@@ -3595,6 +3595,29 @@ impl MxWindow {
             .build();
 
         self.add_action_entries([about_action, preferences_action, verify_action, recover_action, import_keys_action, logout_action, join_action, shortcuts_action, prev_room_action, next_room_action]);
+
+        // Register app.open-room on the *application* so desktop notification
+        // clicks (which fire app.* actions, not win.* actions) can navigate to
+        // the source room. Takes a single string variant: the room ID.
+        let window_weak = self.downgrade();
+        let open_room_action = gio::SimpleAction::new("open-room", Some(glib::VariantTy::STRING));
+        open_room_action.connect_activate(move |_, param| {
+            let Some(win) = window_weak.upgrade() else { return };
+            let Some(room_id) = param.and_then(|p| p.get::<String>()) else { return };
+            win.present();
+            let reg = win.imp().room_list_view.imp().room_registry.borrow();
+            if let Some(obj) = reg.get(&room_id) {
+                let name = obj.name();
+                drop(reg);
+                if let Some(ref cb) = *win.imp().room_list_view.imp().on_room_selected.borrow() {
+                    cb(room_id, name);
+                }
+            }
+        });
+        if let Some(app) = gtk::prelude::GtkWindowExt::application(self) {
+            use gio::prelude::ActionMapExt;
+            app.add_action(&open_room_action);
+        }
     }
 
     /// Navigate to a room identified by a Matrix ID or alias.
