@@ -1,26 +1,32 @@
 name: Publish Ollama Extension
 
-# Builds the me.ramkrishna.hikyaku.Ollama flatpak extension and publishes it
-# to the same OSTree repo at hikyaku.ramkrishna.me.
+# Builds the me.ramkrishna.hikyaku.Ollama flatpak extension and attaches it
+# as a release asset to the current Hikyaku GitHub release.
+#
+# The Ollama bundle is ~2 GB — too large for the OSTree/gh-pages repo.
+# GitHub Releases supports assets up to 2 GB, so the bundle lives there.
 #
 # Run this manually whenever you want to update the bundled Ollama version.
-# The extension is ~2 GB so it is not built on every Hikyaku release.
 #
 # Install (after hikyaku itself is already installed):
-#   flatpak install hikyaku me.ramkrishna.hikyaku.Ollama
+#   flatpak install --user hikyaku-ollama.flatpak
 
 on:
   workflow_dispatch:
     inputs:
       flatpak_branch:
-        description: "Flatpak branch to publish extension into (stable or beta)"
+        description: "Flatpak branch to build (stable or beta)"
         required: true
         default: stable
         type: choice
         options: [stable, beta]
+      release_tag:
+        description: "GitHub release tag to attach the bundle to (e.g. v0.1.1)"
+        required: true
+        default: ""
 
 concurrency:
-  group: flatpak-publish
+  group: flatpak-publish-ollama
   cancel-in-progress: false
 
 jobs:
@@ -51,46 +57,27 @@ jobs:
           flatpak remote-add --system --no-gpg-verify hikyaku https://hikyaku.ramkrishna.me
           flatpak install --system -y --no-auto-pin hikyaku me.ramkrishna.hikyaku//stable
 
+      - name: Cache Ollama source download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/flatpak-builder
+          key: ollama-src-v0.20.5
+
       - name: Build Ollama extension
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: hikyaku-ollama.flatpak
           manifest-path: flatpak/me.ramkrishna.hikyaku.Ollama.json
-          cache-key: flatpak-ollama-builder-${{ github.sha }}
+          cache-key: flatpak-ollama-build-v0.20.5
           branch: ${{ github.event.inputs.flatpak_branch }}
 
-      - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: hikyaku-ollama-${{ github.event.inputs.flatpak_branch }}-${{ github.sha }}
-          path: hikyaku-ollama.flatpak
-          retention-days: 14
-
-      - name: Restore existing OSTree repo from gh-pages
+      # Attach the bundle to an existing GitHub release as a release asset.
+      # The release must already exist (created by the main publish workflow).
+      - name: Upload bundle to GitHub Release
         run: |
-          mkdir -p repo
-          git fetch origin gh-pages 2>/dev/null || true
-          if git rev-parse origin/gh-pages >/dev/null 2>&1; then
-            git archive origin/gh-pages | tar -x -C repo/
-          fi
-
-      - name: Import Ollama extension into OSTree repo
-        run: |
-          GPG_KEY=24E5A1F70B12F13615C663B617D97C8A0E887802
-          GNUPGHOME="$HOME/.gnupg"
-          flatpak build-import-bundle --update-appstream \
-            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
-            repo/ hikyaku-ollama.flatpak
-          flatpak build-update-repo \
-            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
-            --generate-static-deltas repo/
-
-      - name: Write CNAME
-        run: echo "hikyaku.ramkrishna.me" > repo/CNAME
-
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./repo
-          force_orphan: true
+          gh release upload "${{ github.event.inputs.release_tag }}" \
+            hikyaku-ollama.flatpak \
+            --clobber \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
