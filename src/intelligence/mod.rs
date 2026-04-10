@@ -161,6 +161,39 @@ pub async fn pull_model(
     }
 }
 
+/// Return the names of all models installed in Ollama (via GET /api/tags).
+pub async fn list_models(endpoint: &str) -> Vec<String> {
+    use soup::prelude::SessionExt;
+    let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+    let session = soup::Session::new();
+    session.set_timeout(10);
+    let Ok(msg) = soup::Message::new("GET", &url) else { return vec![] };
+    let Ok(bytes) = session.send_and_read_future(&msg, glib::Priority::DEFAULT).await else { return vec![] };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return vec![] };
+    json["models"]
+        .as_array()
+        .map(|arr| arr.iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect())
+        .unwrap_or_default()
+}
+
+/// Delete a model from Ollama (via DELETE /api/delete).
+pub async fn delete_model(endpoint: &str, model: &str) -> Result<(), String> {
+    use soup::prelude::SessionExt;
+    let url = format!("{}/api/delete", endpoint.trim_end_matches('/'));
+    let body = serde_json::to_vec(&serde_json::json!({ "name": model }))
+        .map_err(|e| e.to_string())?;
+    let session = soup::Session::new();
+    session.set_timeout(30);
+    let msg = soup::Message::new("DELETE", &url).map_err(|e| e.to_string())?;
+    msg.set_request_body_from_bytes(Some("application/json"), Some(&glib::Bytes::from(&body)));
+    session.send_and_read_future(&msg, glib::Priority::DEFAULT)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Delete failed: {e}"))
+}
+
 /// POST JSON to url, return response body. timeout_secs: 0 = no timeout.
 async fn soup_post_json(url: &str, body: &[u8], timeout_secs: u32) -> Option<glib::Bytes> {
     let session = soup::Session::new();

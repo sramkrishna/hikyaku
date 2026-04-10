@@ -27,10 +27,15 @@ mod imp {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    // Preset homeserver list — shown in ComboRow on both sign-in and register forms.
+    // Index 0 is matrix.org (the default). The final "Other…" entry reveals a free-text row.
+    const PRESET_SERVERS: &[&str] = &["matrix.org", "Other…"];
+
     pub struct LoginPage {
         pub nav_view: adw::NavigationView,
         // Sign-in form fields.
-        pub homeserver_row: adw::EntryRow,
+        pub homeserver_combo: adw::ComboRow,
+        pub homeserver_custom_row: adw::EntryRow,
         pub username_row: adw::EntryRow,
         pub password_row: adw::PasswordEntryRow,
         pub login_button: gtk::Button,
@@ -38,7 +43,8 @@ mod imp {
         pub on_login: Rc<RefCell<Option<Box<dyn Fn(String, String, String)>>>>,
 
         // Register form fields.
-        pub register_hs_row: adw::EntryRow,
+        pub register_hs_combo: adw::ComboRow,
+        pub register_hs_custom_row: adw::EntryRow,
         pub register_username_row: adw::EntryRow,
         pub register_password_row: adw::PasswordEntryRow,
         pub register_confirm_row: adw::PasswordEntryRow,
@@ -108,12 +114,38 @@ mod imp {
                 .description("Select spaces to join on your homeserver")
                 .visible(false)
                 .build();
+            // Build the homeserver combo (shared shape for sign-in and register).
+            let hs_model = gtk::StringList::new(PRESET_SERVERS);
+            let homeserver_combo = adw::ComboRow::builder()
+                .title("Homeserver")
+                .model(&hs_model)
+                .build();
+            // In debug builds default to "Other…" and pre-fill the custom URL.
+            #[cfg(debug_assertions)]
+            homeserver_combo.set_selected(1);
+            let homeserver_custom_row = adw::EntryRow::builder()
+                .title("Custom homeserver URL")
+                .text(DEFAULT_HOMESERVER)
+                .visible(cfg!(debug_assertions))
+                .build();
+
+            let rhs_model = gtk::StringList::new(PRESET_SERVERS);
+            let register_hs_combo = adw::ComboRow::builder()
+                .title("Homeserver")
+                .model(&rhs_model)
+                .build();
+            #[cfg(debug_assertions)]
+            register_hs_combo.set_selected(1);
+            let register_hs_custom_row = adw::EntryRow::builder()
+                .title("Custom homeserver URL")
+                .text(DEFAULT_HOMESERVER)
+                .visible(cfg!(debug_assertions))
+                .build();
+
             Self {
                 nav_view: adw::NavigationView::new(),
-                homeserver_row: adw::EntryRow::builder()
-                    .title("Homeserver")
-                    .text(DEFAULT_HOMESERVER)
-                    .build(),
+                homeserver_combo,
+                homeserver_custom_row,
                 username_row: adw::EntryRow::builder()
                     .title("Username")
                     .build(),
@@ -127,10 +159,8 @@ mod imp {
                 login_spinner: gtk::Spinner::new(),
                 on_login: Rc::new(RefCell::new(None)),
 
-                register_hs_row: adw::EntryRow::builder()
-                    .title("Homeserver")
-                    .text(DEFAULT_HOMESERVER)
-                    .build(),
+                register_hs_combo,
+                register_hs_custom_row,
                 register_username_row: adw::EntryRow::builder()
                     .title("Username")
                     .build(),
@@ -234,7 +264,8 @@ mod imp {
             self.nav_view.add(&recover_key_entry);
 
             // Wire sign-in button callback.
-            let hs = self.homeserver_row.clone();
+            let hs_combo = self.homeserver_combo.clone();
+            let hs_custom = self.homeserver_custom_row.clone();
             let un = self.username_row.clone();
             let pw = self.password_row.clone();
             let spinner = self.login_spinner.clone();
@@ -242,12 +273,14 @@ mod imp {
             self.login_button.connect_clicked(move |_| {
                 if let Some(ref cb) = *on_login.borrow() {
                     spinner.set_spinning(true);
-                    cb(hs.text().to_string(), un.text().to_string(), pw.text().to_string());
+                    let hs = selected_homeserver(&hs_combo, &hs_custom);
+                    cb(hs, un.text().to_string(), pw.text().to_string());
                 }
             });
 
             // Wire register button callback.
-            let hs = self.register_hs_row.clone();
+            let hs = self.register_hs_combo.clone();
+            let hs_custom_reg = self.register_hs_custom_row.clone();
             let un = self.register_username_row.clone();
             let pw = self.register_password_row.clone();
             let confirm = self.register_confirm_row.clone();
@@ -268,7 +301,7 @@ mod imp {
                 if let Some(ref cb) = *on_register.borrow() {
                     spinner.set_spinning(true);
                     cb(
-                        hs.text().to_string(),
+                        selected_homeserver(&hs, &hs_custom_reg),
                         un.text().to_string(),
                         password,
                         dn.text().to_string(),
@@ -286,6 +319,14 @@ mod imp {
                     window.set_default_widget(Some(&btn));
                 }
             });
+        }
+    }
+
+    fn selected_homeserver(combo: &adw::ComboRow, custom: &adw::EntryRow) -> String {
+        if combo.selected() as usize == PRESET_SERVERS.len() - 1 {
+            custom.text().to_string()
+        } else {
+            PRESET_SERVERS[combo.selected() as usize].to_string()
         }
     }
 
@@ -382,10 +423,17 @@ mod imp {
             clamp.set_child(Some(&vbox));
 
             let group = adw::PreferencesGroup::new();
-            group.add(&self.homeserver_row);
+            group.add(&self.homeserver_combo);
+            group.add(&self.homeserver_custom_row);
             group.add(&self.username_row);
             group.add(&self.password_row);
             vbox.append(&group);
+
+            // Show custom URL row only when "Other…" is selected.
+            let custom = self.homeserver_custom_row.clone();
+            self.homeserver_combo.connect_notify_local(Some("selected"), move |combo, _| {
+                custom.set_visible(combo.selected() as usize == PRESET_SERVERS.len() - 1);
+            });
 
             let btn = self.login_button.clone();
             let key_ctrl = gtk::EventControllerKey::new();
@@ -562,8 +610,14 @@ mod imp {
             clamp.set_child(Some(&vbox));
 
             let group = adw::PreferencesGroup::new();
-            group.add(&self.register_hs_row);
+            group.add(&self.register_hs_combo);
+            group.add(&self.register_hs_custom_row);
             group.add(&self.register_username_row);
+
+            let custom = self.register_hs_custom_row.clone();
+            self.register_hs_combo.connect_notify_local(Some("selected"), move |combo, _| {
+                custom.set_visible(combo.selected() as usize == PRESET_SERVERS.len() - 1);
+            });
             group.add(&self.register_password_row);
             group.add(&self.register_confirm_row);
             group.add(&self.register_display_name_row);
@@ -1347,7 +1401,8 @@ impl LoginPage {
 
     pub fn set_sensitive(&self, sensitive: bool) {
         let imp = self.imp();
-        imp.homeserver_row.set_sensitive(sensitive);
+        imp.homeserver_combo.set_sensitive(sensitive);
+        imp.homeserver_custom_row.set_sensitive(sensitive);
         imp.username_row.set_sensitive(sensitive);
         imp.password_row.set_sensitive(sensitive);
         imp.login_button.set_sensitive(sensitive);

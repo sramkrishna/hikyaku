@@ -5177,21 +5177,35 @@ impl MxWindow {
             .title("Endpoint")
             .text(&cfg.ollama.endpoint)
             .build();
-        let model_row = adw::EntryRow::builder()
-            .title("Model  (e.g. qwen2.5:3b)")
-            .text(&cfg.ollama.model)
+
+        // Active model — ComboRow populated from /api/tags on open.
+        let model_list = gtk::StringList::new(&[]);
+        let model_combo = adw::ComboRow::builder()
+            .title("Active Model")
+            .subtitle("Loading…")
+            .model(&model_list)
             .build();
 
-        // Pull button — downloads the configured model via Ollama's /api/pull.
+        // Pull row — downloads a new model by name.
+        let pull_name_row = adw::EntryRow::builder()
+            .title("Pull new model  (e.g. qwen2.5:3b)")
+            .text(&cfg.ollama.model)
+            .build();
         let pull_btn = gtk::Button::builder()
-            .label("Pull Model")
+            .label("Pull")
             .valign(gtk::Align::Center)
             .css_classes(["pill"])
             .build();
-        model_row.add_suffix(&pull_btn);
+        pull_name_row.add_suffix(&pull_btn);
+
+        // Installed models group — one row per model with a Delete button.
+        let installed_group = adw::PreferencesGroup::builder()
+            .title("Installed Models")
+            .build();
 
         ai_group.add(&endpoint_row);
-        ai_group.add(&model_row);
+        ai_group.add(&model_combo);
+        ai_group.add(&pull_name_row);
 
         let extra_row = adw::EntryRow::builder()
             .title("Extra Instructions")
@@ -5203,11 +5217,16 @@ impl MxWindow {
         ));
         ai_group.add(&extra_row);
 
-        // Probe Ollama status asynchronously and update the status row.
+        // Probe Ollama status asynchronously, then load installed models.
         {
             let status_row = status_row.clone();
             let spinner = spinner.clone();
             let endpoint = cfg.ollama.endpoint.clone();
+            let model_combo = model_combo.clone();
+            let model_list = model_list.clone();
+            let installed_group = installed_group.clone();
+            let saved_model = cfg.ollama.model.clone();
+            let endpoint_for_delete = endpoint.clone();
             glib::spawn_future_local(async move {
                 use crate::intelligence::ollama_manager::{detect, OllamaStatus};
                 let st = detect(&endpoint).await;
@@ -5222,6 +5241,74 @@ impl MxWindow {
                 let img = gtk::Image::from_icon_name(icon);
                 img.set_tooltip_text(Some(&subtitle));
                 status_row.add_suffix(&img);
+
+                // Only fetch models when Ollama is actually running.
+                if !matches!(st, OllamaStatus::Running { .. }) {
+                    model_combo.set_subtitle("Ollama not running");
+                    return;
+                }
+
+                let models = crate::intelligence::list_models(&endpoint).await;
+                if models.is_empty() {
+                    model_combo.set_subtitle("No models installed — pull one below");
+                    return;
+                }
+                model_combo.set_subtitle("");
+
+                // Populate combo and select the saved model (or first).
+                let mut selected_idx = 0u32;
+                for (i, name) in models.iter().enumerate() {
+                    model_list.append(name);
+                    if name == &saved_model { selected_idx = i as u32; }
+                }
+                model_combo.set_selected(selected_idx);
+
+                // Build installed-models rows with Delete buttons.
+                for name in &models {
+                    let row = adw::ActionRow::builder()
+                        .title(name)
+                        .build();
+                    let del_btn = gtk::Button::builder()
+                        .icon_name("user-trash-symbolic")
+                        .tooltip_text("Delete this model")
+                        .valign(gtk::Align::Center)
+                        .css_classes(["flat", "circular"])
+                        .build();
+                    let name_clone = name.clone();
+                    let ep_clone = endpoint_for_delete.clone();
+                    let row_weak = row.downgrade();
+                    del_btn.connect_clicked(move |btn| {
+                        let name = name_clone.clone();
+                        let ep = ep_clone.clone();
+                        let btn_weak = btn.downgrade();
+                        let row_weak = row_weak.clone();
+                        glib::spawn_future_local(async move {
+                            if let Some(btn) = btn_weak.upgrade() {
+                                btn.set_sensitive(false);
+                            }
+                            match crate::intelligence::delete_model(&ep, &name).await {
+                                Ok(()) => {
+                                    if let Some(row) = row_weak.upgrade() {
+                                        if let Some(parent) = row.parent()
+                                            .and_then(|p| p.parent())
+                                            .and_then(|p| p.downcast::<adw::PreferencesGroup>().ok())
+                                        {
+                                            parent.remove(&row);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Delete model failed: {e}");
+                                    if let Some(btn) = btn_weak.upgrade() {
+                                        btn.set_sensitive(true);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    row.add_suffix(&del_btn);
+                    installed_group.add(&row);
+                }
             });
         }
 
@@ -5235,15 +5322,21 @@ impl MxWindow {
                 status_row.set_subtitle("Changed — reopen Preferences to check");
             });
         }
-        model_row.connect_changed(move |row: &adw::EntryRow| {
-            let mut new_cfg = config::settings().clone();
-            new_cfg.ollama.model = row.text().to_string();
-            let _ = config::save_settings(&new_cfg);
+
+        // Save active model when selection changes.
+        model_combo.connect_notify_local(Some("selected"), move |combo, _| {
+            if let Some(item) = combo.selected_item()
+                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+            {
+                let mut new_cfg = config::settings().clone();
+                new_cfg.ollama.model = item.string().to_string();
+                let _ = config::save_settings(&new_cfg);
+            }
         });
 
         // Pull model button — uses Ollama's own /api/pull with live progress.
         {
-            let model_row_for_pull = model_row.clone();
+            let model_row_for_pull = pull_name_row.clone();
             let pull_btn_clone = pull_btn.clone();
             pull_btn.connect_clicked(move |_| {
                 let model = model_row_for_pull.text().to_string();
@@ -5298,6 +5391,7 @@ impl MxWindow {
             .title("AI")
             .build();
         ai_page.add(&ai_group);
+        ai_page.add(&installed_group);
 
         (ai_page, extra_row)
         }; // end #[cfg(feature = "ai")]
