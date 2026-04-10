@@ -43,15 +43,10 @@ jobs:
         run: |
           echo "${{ secrets.FLATPAK_GPG_KEY }}" | base64 -d | gpg --batch --import
 
-      # The extension manifest uses me.ramkrishna.hikyaku as its runtime, so
-      # flatpak-builder needs the app installed before it can validate the
-      # extension point. Install from the published repo (no-gpg-verify is
-      # fine here — this is a build-time dependency, not a user install).
-      - name: Install Hikyaku as extension runtime
-        run: |
-          flatpak remote-add --user --no-gpg-verify hikyaku https://hikyaku.ramkrishna.me
-          flatpak install --user -y --no-auto-pin hikyaku me.ramkrishna.hikyaku//stable
-
+      # The extension manifest uses me.ramkrishna.hikyaku as its runtime.
+      # Passing repository-name/url tells the action to add the hikyaku remote
+      # before resolving build dependencies, so it can install hikyaku from
+      # our repo rather than trying (and failing) to find it on flathub.
       - name: Build Ollama extension
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
@@ -59,6 +54,8 @@ jobs:
           manifest-path: flatpak/me.ramkrishna.hikyaku.Ollama.json
           cache-key: flatpak-ollama-builder-${{ github.sha }}
           branch: ${{ github.event.inputs.flatpak_branch }}
+          repository-name: hikyaku
+          repository-url: https://hikyaku.ramkrishna.me
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
