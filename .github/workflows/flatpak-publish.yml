@@ -98,6 +98,10 @@ jobs:
         run: |
           GPG_KEY=24E5A1F70B12F13615C663B617D97C8A0E887802
           GNUPGHOME="$HOME/.gnupg"
+          # Drop any unsigned appstream refs left from pre-GPG builds so
+          # build-update-repo creates fresh signed ones.
+          ostree refs --delete appstream/x86_64  --repo repo/ 2>/dev/null || true
+          ostree refs --delete appstream2/x86_64 --repo repo/ 2>/dev/null || true
           flatpak build-import-bundle --update-appstream \
             --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
             repo/ hikyaku.flatpak
