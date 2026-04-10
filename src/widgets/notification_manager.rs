@@ -81,8 +81,10 @@ impl NotificationManager {
         let window_active = window.as_ref().map(|w| w.is_active()).unwrap_or(false);
         let is_current = imp.current_room_id.borrow().as_deref() == Some(room_id);
 
-        // User is actively reading this room.
-        if window_active && is_current {
+        // Suppress everything for the room the user currently has open —
+        // whether the window is focused or not. No point notifying for a
+        // room you're already in.
+        if is_current {
             return;
         }
 
