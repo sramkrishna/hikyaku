@@ -1,0 +1,34 @@
+{
+  "id": "me.ramkrishna.hikyaku.Ollama",
+  "branch": "stable",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "50",
+  "sdk": "org.gnome.Sdk//50",
+  "build-extension": true,
+  "separate-locales": false,
+  "appstream-compose": false,
+  "build-options": {
+    "prefix": "/app/extensions/Ollama",
+    "strip": false,
+    "no-debuginfo": true
+  },
+  "modules": [
+    {
+      "name": "ollama",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 bin/ollama /app/extensions/Ollama/bin/ollama",
+        "mkdir -p /app/extensions/Ollama/lib/ollama",
+        "cp -r lib/ollama/. /app/extensions/Ollama/lib/ollama/"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/ollama/ollama/releases/download/v0.20.5/ollama-linux-amd64.tar.zst",
+          "sha256": "297fd50c2349b8bc83f5c87eae757381c1532c10fe0a813064e6814cdb9c90bb",
+          "strip-components": 0
+        }
+      ]
+    }
+  ]
+}

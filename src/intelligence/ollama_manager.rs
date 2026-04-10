@@ -1,11 +1,12 @@
 // Ollama lifecycle management.
 //
 // Detection priority:
-//   1. Configured endpoint already responding   → Running
-//   2. System `ollama` on $PATH (non-Flatpak)   → start it
-//   3. Managed binary in $XDG_DATA_HOME/hikyaku  → start it
-//   4. In Flatpak, no binary                     → NeedDownload
-//   5. Otherwise                                  → NotAvailable
+//   1. Configured endpoint already responding        → Running
+//   2. Flatpak extension at /app/extensions/Ollama   → start it
+//   3. Managed binary in $XDG_DATA_HOME/hikyaku      → start it
+//   4. System `ollama` on $PATH (non-Flatpak)        → start it
+//   5. In Flatpak, no binary                         → NeedDownload
+//   6. Otherwise                                     → NotAvailable
 //
 // All async functions run on the GLib main thread and use libsoup for HTTP.
 
@@ -78,10 +79,22 @@ fn which_ollama() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Path to the Ollama binary provided by the flatpak extension.
+pub fn extension_binary_path() -> PathBuf {
+    PathBuf::from("/app/extensions/Ollama/bin/ollama")
+}
+
 /// Detect the current availability of Ollama given the configured endpoint.
 pub async fn detect(endpoint: &str) -> OllamaStatus {
     if is_endpoint_reachable(endpoint).await {
         return OllamaStatus::Running { endpoint: endpoint.to_string() };
+    }
+
+    if in_flatpak() {
+        let ext = extension_binary_path();
+        if ext.exists() {
+            return OllamaStatus::Found { path: ext };
+        }
     }
 
     let managed = managed_binary_path();
@@ -119,8 +132,12 @@ async fn start_binary(binary: &std::path::Path, endpoint: &str) -> Option<String
         .trim_start_matches("http://");
 
     let models_dir = managed_models_path();
-    let home_dir = managed_binary_path()
-        .parent()?.parent()?.to_path_buf();
+    // HOME must be a writable directory; always use the managed data dir
+    // regardless of whether the binary came from the extension or a download.
+    let home_dir = managed_models_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
     tracing::info!("Starting managed Ollama: {}", binary.display());
 

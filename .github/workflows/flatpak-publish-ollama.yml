@@ -1,0 +1,88 @@
+name: Publish Ollama Extension
+
+# Builds the me.ramkrishna.hikyaku.Ollama flatpak extension and publishes it
+# to the same OSTree repo at hikyaku.ramkrishna.me.
+#
+# Run this manually whenever you want to update the bundled Ollama version.
+# The extension is ~2 GB so it is not built on every Hikyaku release.
+#
+# Install (after hikyaku itself is already installed):
+#   flatpak install hikyaku me.ramkrishna.hikyaku.Ollama
+
+on:
+  workflow_dispatch:
+    inputs:
+      flatpak_branch:
+        description: "Flatpak branch to publish extension into (stable or beta)"
+        required: true
+        default: stable
+        type: choice
+        options: [stable, beta]
+
+concurrency:
+  group: flatpak-publish
+  cancel-in-progress: false
+
+jobs:
+  publish-ollama:
+    name: Build and publish Ollama extension
+    runs-on: ubuntu-latest
+    environment: FLATPAK_GPG_KEY
+    permissions:
+      contents: write
+
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Import GPG signing key
+        run: |
+          echo "${{ secrets.FLATPAK_GPG_KEY }}" | base64 -d | gpg --batch --import
+
+      - name: Build Ollama extension
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: hikyaku-ollama.flatpak
+          manifest-path: flatpak/me.ramkrishna.hikyaku.Ollama.json
+          cache-key: flatpak-ollama-builder-${{ github.sha }}
+          branch: ${{ github.event.inputs.flatpak_branch }}
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hikyaku-ollama-${{ github.event.inputs.flatpak_branch }}-${{ github.sha }}
+          path: hikyaku-ollama.flatpak
+          retention-days: 14
+
+      - name: Restore existing OSTree repo from gh-pages
+        run: |
+          mkdir -p repo
+          git fetch origin gh-pages 2>/dev/null || true
+          if git rev-parse origin/gh-pages >/dev/null 2>&1; then
+            git archive origin/gh-pages | tar -x -C repo/
+          fi
+
+      - name: Import Ollama extension into OSTree repo
+        run: |
+          GPG_KEY=24E5A1F70B12F13615C663B617D97C8A0E887802
+          GNUPGHOME="$HOME/.gnupg"
+          flatpak build-import-bundle --update-appstream \
+            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
+            repo/ hikyaku-ollama.flatpak
+          flatpak build-update-repo \
+            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
+            --generate-static-deltas repo/
+
+      - name: Write CNAME
+        run: echo "hikyaku.ramkrishna.me" > repo/CNAME
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          force_orphan: true
