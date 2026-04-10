@@ -2280,6 +2280,33 @@ impl MxWindow {
                     MatrixEvent::LeaveFailed { error } => {
                         toast_error(&toast_overlay, "Failed to leave", &error);
                     }
+                    MatrixEvent::RoomInvited { room_id, room_name, inviter_name } => {
+                        // Desktop notification.
+                        window.imp().notification_manager.push(
+                            &room_id, &room_name, &inviter_name,
+                            &format!("invited you to {room_name}"),
+                            false,
+                        );
+                        // In-app toast with Accept button.
+                        let accept_tx = window.imp().command_tx.get().unwrap().clone();
+                        let accept_room_id = room_id.clone();
+                        let t = adw::Toast::builder()
+                            .title(&format!("{inviter_name} invited you to {room_name}"))
+                            .button_label("Accept")
+                            .timeout(0)
+                            .build();
+                        t.connect_button_clicked(move |toast| {
+                            toast.dismiss();
+                            let tx = accept_tx.clone();
+                            let rid = accept_room_id.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(
+                                    crate::matrix::MatrixCommand::AcceptInvite { room_id: rid }
+                                ).await;
+                            });
+                        });
+                        toast_overlay.add_toast(t);
+                    }
                     MatrixEvent::InviteSuccess { user_id } => {
                         toast(&toast_overlay, &format!("Invited {user_id}"));
                     }
@@ -5190,6 +5217,7 @@ impl MxWindow {
                 };
                 status_row.set_subtitle(&subtitle);
                 let img = gtk::Image::from_icon_name(icon);
+                img.set_tooltip_text(Some(&subtitle));
                 status_row.add_suffix(&img);
             });
         }

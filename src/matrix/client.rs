@@ -302,6 +302,8 @@ pub enum MatrixEvent {
     InviteSuccess { user_id: String },
     /// Failed to invite a user to a room.
     InviteFailed { error: String },
+    /// The local user was invited to a room by someone else.
+    RoomInvited { room_id: String, room_name: String, inviter_name: String },
     /// DM room is ready — navigate to it.
     DmReady { user_id: String, room_id: String, room_name: String },
     /// Results from a user directory search (display_name, user_id).
@@ -437,6 +439,10 @@ pub enum MatrixCommand {
     FetchRoomAvatar { room_id: String, mxc_url: String },
     /// Toggle bookmark (m.favourite tag) on a room.
     SetFavourite { room_id: String, is_favourite: bool },
+    /// Accept a room invitation.
+    AcceptInvite { room_id: String },
+    /// Decline a room invitation.
+    DeclineInvite { room_id: String },
     /// Leave a room.
     LeaveRoom { room_id: String },
     /// Invite a Matrix user to a room.
@@ -1214,6 +1220,12 @@ async fn matrix_task(
                                 }
                             }
                         }
+                    }
+                    Ok(MatrixCommand::AcceptInvite { room_id }) => {
+                        handle_accept_invite(&client, &event_tx, &room_id).await;
+                    }
+                    Ok(MatrixCommand::DeclineInvite { room_id }) => {
+                        handle_decline_invite(&client, &event_tx, &room_id).await;
                     }
                     Ok(MatrixCommand::LeaveRoom { room_id }) => {
                         handle_leave_room(&client, &event_tx, &room_id).await;
@@ -2414,6 +2426,38 @@ async fn start_sync(
                 })
                 .ok();
         }
+    }
+
+    // Detect incoming invites — fire RoomInvited when the local user is invited.
+    {
+        use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
+        use matrix_sdk::ruma::events::room::member::MembershipState;
+        let invite_tx = event_tx.clone();
+        client.add_event_handler(
+            move |event: StrippedRoomMemberEvent,
+                  room: matrix_sdk::room::Room,
+                  client: matrix_sdk::Client| {
+                let tx = invite_tx.clone();
+                async move {
+                    if event.content.membership != MembershipState::Invite {
+                        return;
+                    }
+                    let Some(my_id) = client.user_id() else { return };
+                    if event.state_key.as_str() != my_id.as_str() {
+                        return;
+                    }
+                    let room_name = room.display_name().await
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|_| room.room_id().to_string());
+                    let inviter_name = event.sender.localpart().to_string();
+                    let _ = tx.send(MatrixEvent::RoomInvited {
+                        room_id: room.room_id().to_string(),
+                        room_name,
+                        inviter_name,
+                    }).await;
+                }
+            },
+        );
     }
 
     // Register handlers for new messages (both decrypted and encrypted).
@@ -4714,6 +4758,43 @@ async fn handle_search_users(
     }
 }
 
+async fn handle_accept_invite(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+    let Ok(parsed_id) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&parsed_id) else { return };
+    match room.join().await {
+        Ok(()) => {
+            tracing::info!("Accepted invite to {room_id}");
+            let room_name = room.display_name().await
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| room_id.to_string());
+            let _ = event_tx.send(MatrixEvent::RoomJoined {
+                room_id: room_id.to_string(),
+                room_name,
+            }).await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to accept invite to {room_id}: {e}");
+            let _ = event_tx.send(MatrixEvent::JoinFailed {
+                error: format!("{e}"),
+            }).await;
+        }
+    }
+}
+
+async fn handle_decline_invite(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+    let Ok(parsed_id) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&parsed_id) else { return };
+    match room.leave().await {
+        Ok(()) => {
+            tracing::info!("Declined invite to {room_id}");
+            let _ = event_tx.send(MatrixEvent::RoomLeft {
+                room_id: room_id.to_string(),
+            }).await;
+        }
+        Err(e) => tracing::error!("Failed to decline invite to {room_id}: {e}"),
+    }
+}
+
 async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
     let Ok(room_id) = RoomId::parse(room_id) else {
         let _ = event_tx
@@ -5621,19 +5702,30 @@ async fn ensure_ollama_running_tokio(endpoint: &str) -> bool {
     }
 
     // Try to find and start the binary.
+    // Mirror the detection order from ollama_manager::detect():
+    //   1. Flatpak extension
+    //   2. Managed download path
+    //   3. System PATH (non-Flatpak only)
+    let in_flatpak = std::env::var("FLATPAK_ID").is_ok();
     let binary = {
-        // Check managed path first, then PATH.
-        let managed = {
-            let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            base.join("hikyaku").join("ollama").join("bin").join("ollama")
-        };
-        if managed.exists() {
-            Some(managed)
+        let ext = std::path::PathBuf::from("/app/extensions/Ollama/bin/ollama");
+        if in_flatpak && ext.exists() {
+            Some(ext)
         } else {
-            let path_var = std::env::var("PATH").unwrap_or_default();
-            std::env::split_paths(&path_var)
-                .map(|d| d.join("ollama"))
-                .find(|p| p.is_file())
+            let managed = {
+                let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                base.join("hikyaku").join("ollama").join("bin").join("ollama")
+            };
+            if managed.exists() {
+                Some(managed)
+            } else if !in_flatpak {
+                let path_var = std::env::var("PATH").unwrap_or_default();
+                std::env::split_paths(&path_var)
+                    .map(|d| d.join("ollama"))
+                    .find(|p| p.is_file())
+            } else {
+                None
+            }
         }
     };
 
