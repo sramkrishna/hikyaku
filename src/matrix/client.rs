@@ -5459,14 +5459,17 @@ async fn handle_fetch_room_preview(
             MessageLikeEvent, SyncMessageLikeEvent,
         };
 
-        let (sender, body) = match &ev.kind {
+        let (sender, body, ts_ms) = match &ev.kind {
             TimelineEventKind::Decrypted(d) => {
                 let Ok(any) = d.event.deserialize() else { continue };
                 match any {
                     AnyMessageLikeEvent::RoomMessage(
                         MessageLikeEvent::Original(msg)
                     ) => match msg.content.msgtype {
-                        MessageType::Text(t) => (msg.sender.to_string(), t.body),
+                        MessageType::Text(t) => {
+                            let ts = msg.origin_server_ts.as_secs().into();
+                            (msg.sender.to_string(), t.body, ts)
+                        }
                         _ => continue,
                     },
                     _ => continue,
@@ -5480,7 +5483,10 @@ async fn handle_fetch_room_preview(
                             SyncMessageLikeEvent::Original(msg)
                         )
                     ) => match msg.content.msgtype {
-                        MessageType::Text(t) => (msg.sender.to_string(), t.body),
+                        MessageType::Text(t) => {
+                            let ts = msg.origin_server_ts.as_secs().into();
+                            (msg.sender.to_string(), t.body, ts)
+                        }
                         _ => continue,
                     },
                     _ => continue,
@@ -5495,7 +5501,8 @@ async fn handle_fetch_room_preview(
         // only sees the actual message, not the re-quoted context.
         let clean_body = strip_reply_fallback_simple(&body);
         if clean_body.is_empty() { continue; }
-        lines.push(format!("{sender_short}: {clean_body}"));
+        let ts_str = format_unix_ts(ts_ms);
+        lines.push(format!("[{ts_str}] {sender_short}: {clean_body}"));
     }
 
     // If the caller knows how many messages are unread, trim to that window
@@ -5535,8 +5542,10 @@ async fn handle_fetch_room_preview(
     let unread_note = if is_unread { " (unread messages only)" } else { "" };
     let prompt = format!(
         "You are a helpful assistant. Summarize the following Matrix room conversation{unread_note} \
-         in 2-4 bullet points. Focus on topics, decisions, and key contributors. \
-         Be concise.{extra}\n\nConversation:\n{messages_text}"
+         in 2-4 bullet points. Focus on topics, decisions, and key contributors. Be concise.\n\
+         Each message is prefixed with its exact timestamp in [YYYY-MM-DD HH:MM UTC] format. \
+         Use only those timestamps when referring to timing — do not guess or infer any dates \
+         not present in the conversation.{extra}\n\nConversation:\n{messages_text}"
     );
 
     tracing::info!(
@@ -5922,6 +5931,35 @@ async fn ollama_stream_to_event(
 /// Strip Matrix reply fallback lines from a message body.
 /// Replies include "> <@user:server> quoted text\n\n" at the start —
 /// these are noise for LLM summarization.
+/// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM UTC" without external deps.
+fn format_unix_ts(secs: u64) -> String {
+    // Days since 1970-01-01, accounting for leap years.
+    let s = secs;
+    let days = s / 86400;
+    let time = s % 86400;
+    let hh = time / 3600;
+    let mm = (time % 3600) / 60;
+
+    // Gregorian calendar calculation.
+    let mut y = 1970u32;
+    let mut d = days as u32;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if d < days_in_year { break; }
+        d -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days: [u32; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0u32;
+    for (i, &md) in month_days.iter().enumerate() {
+        if d < md { m = i as u32 + 1; break; }
+        d -= md;
+    }
+    format!("{y}-{m:02}-{:02} {:02}:{mm:02} UTC", d + 1, hh)
+}
+
 fn strip_reply_fallback_simple(body: &str) -> String {
     let mut lines = body.lines().peekable();
     while let Some(line) = lines.peek() {
