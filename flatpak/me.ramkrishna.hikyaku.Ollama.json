@@ -1,8 +1,8 @@
 {
   "id": "me.ramkrishna.hikyaku.Ollama",
   "branch": "stable",
-  "runtime": "org.gnome.Platform",
-  "runtime-version": "50",
+  "runtime": "me.ramkrishna.hikyaku",
+  "runtime-version": "stable",
   "sdk": "org.gnome.Sdk//50",
   "build-extension": true,
   "separate-locales": false,
