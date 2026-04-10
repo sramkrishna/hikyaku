@@ -273,6 +273,9 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            #[cfg(feature = "devel")]
+            self.obj().add_css_class("devel");
+
             // Start with a loading spinner — if we have a saved session the
             // Matrix thread will restore it and jump straight to the main
             // view, so the user never sees the login page.

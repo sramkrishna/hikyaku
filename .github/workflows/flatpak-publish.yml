@@ -61,12 +61,13 @@ jobs:
           fi
           echo "flatpak_branch=$branch" >> $GITHUB_OUTPUT
           [[ "$branch" == "stable" ]] && echo "is_release=true" >> $GITHUB_OUTPUT || echo "is_release=false" >> $GITHUB_OUTPUT
+          [[ "$branch" == "beta" ]] && echo "manifest=flatpak/me.ramkrishna.hikyaku.Devel.json" >> $GITHUB_OUTPUT || echo "manifest=flatpak/me.ramkrishna.hikyaku.json" >> $GITHUB_OUTPUT
 
       - name: Build Flatpak bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: hikyaku.flatpak
-          manifest-path: flatpak/me.ramkrishna.hikyaku.json
+          manifest-path: ${{ steps.meta.outputs.manifest }}
           cache-key: flatpak-builder-${{ github.sha }}
           branch: ${{ steps.meta.outputs.flatpak_branch }}
 

@@ -20,6 +20,9 @@ rolodex = []
 pinning = []
 ## Room topic change tracker — toasts and sidebar icon.
 motd = []
+## Development build indicator: amber app icon + rainbow titlebar stripe.
+## Used by the beta flatpak branch. Never set in the stable build.
+devel = []
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.9", features = ["v4_14", "blueprint"] }
