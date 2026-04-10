@@ -97,8 +97,13 @@ jobs:
       - name: Import bundle into OSTree repo
         run: |
           GPG_KEY=24E5A1F70B12F13615C663B617D97C8A0E887802
-          flatpak build-import-bundle --update-appstream --gpg-sign="$GPG_KEY" repo/ hikyaku.flatpak
-          flatpak build-update-repo --gpg-sign="$GPG_KEY" --generate-static-deltas repo/
+          GNUPGHOME="$HOME/.gnupg"
+          flatpak build-import-bundle --update-appstream \
+            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
+            repo/ hikyaku.flatpak
+          flatpak build-update-repo \
+            --gpg-sign="$GPG_KEY" --gpg-homedir="$GNUPGHOME" \
+            --generate-static-deltas repo/
 
       # Re-write the CNAME (git archive may have extracted an old one; this ensures
       # it is always correct after force_orphan wipes gh-pages history).
