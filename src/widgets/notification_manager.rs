@@ -123,7 +123,10 @@ impl NotificationManager {
                 let notif = gio::Notification::new(&title);
                 notif.set_body(Some(&format!("{sender}: {}", &body[..body_end])));
                 notif.set_priority(gio::NotificationPriority::High);
-                notif.set_default_action("app.activate");
+                notif.set_default_action_and_target_value(
+                    "app.open-room",
+                    Some(&glib::Variant::from(room_id)),
+                );
                 app.send_notification(Some(&format!("msg-{room_id}")), &notif);
                 tracing::debug!("Desktop notification sent: {title}");
             }
