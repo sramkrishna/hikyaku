@@ -3,6 +3,7 @@ Title=Hikyaku (Beta)
 Name=me.ramkrishna.hikyaku
 Branch=beta
 Url=https://hikyaku.ramkrishna.me
+RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
 IsRuntime=false
 Comment=A GNOME Matrix chat client (beta / development builds from main)
 SuggestRemoteName=hikyaku

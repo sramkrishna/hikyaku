@@ -3,6 +3,7 @@ Title=Hikyaku
 Name=me.ramkrishna.hikyaku
 Branch=stable
 Url=https://hikyaku.ramkrishna.me
+RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
 IsRuntime=false
 Comment=A GNOME Matrix chat client (stable release)
 SuggestRemoteName=hikyaku
