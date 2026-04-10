@@ -12,8 +12,15 @@ name: Publish Flatpak Repo
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      flatpak_branch:
+        description: "Flatpak branch to build (stable or beta)"
+        required: true
+        default: beta
+        type: choice
+        options: [stable, beta]
 
 # Only one publish job runs at a time. A new push queues behind the current
 # run rather than racing to write gh-pages simultaneously.
@@ -40,13 +47,15 @@ jobs:
       - name: Determine flatpak branch
         id: meta
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "flatpak_branch=stable" >> $GITHUB_OUTPUT
-            echo "is_release=true"       >> $GITHUB_OUTPUT
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            branch="${{ github.event.inputs.flatpak_branch }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v*-* ]]; then
+            branch=beta
           else
-            echo "flatpak_branch=beta"   >> $GITHUB_OUTPUT
-            echo "is_release=false"      >> $GITHUB_OUTPUT
+            branch=stable
           fi
+          echo "flatpak_branch=$branch" >> $GITHUB_OUTPUT
+          [[ "$branch" == "stable" ]] && echo "is_release=true" >> $GITHUB_OUTPUT || echo "is_release=false" >> $GITHUB_OUTPUT
 
       - name: Build Flatpak bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
