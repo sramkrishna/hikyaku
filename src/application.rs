@@ -144,7 +144,9 @@ mod imp {
                 if let Some(app) = app_weak.upgrade() {
                     app.quit();
                 }
-                glib::Propagation::Proceed
+                // Stop: app.quit() already tears down the window — returning
+                // Proceed would cause a second destroy and crash.
+                glib::Propagation::Stop
             });
             window.present();
         }
