@@ -82,10 +82,10 @@ mod imp {
                 .build();
 
             let msgs_empty = adw::StatusPage::builder()
-                .icon_name("bookmark-new-symbolic")
+                .icon_name("starred-symbolic")
                 .title("No Saved Messages")
                 .description(
-                    "Hover over a message and click the bookmark icon to save it for later.",
+                    "Hover over a message and click the star icon to save it for later.",
                 )
                 .build();
 

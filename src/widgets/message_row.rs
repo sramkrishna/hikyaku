@@ -185,7 +185,7 @@ mod imp {
             dm_button.add_css_class("circular");
 
             let bookmark_button = gtk::Button::builder()
-                .icon_name("bookmark-new-symbolic")
+                .icon_name("non-starred-symbolic")
                 .tooltip_text("Save for later")
                 .build();
             bookmark_button.add_css_class("flat");
@@ -921,10 +921,10 @@ impl MessageRow {
         }
         if let Some(ref btn) = *self.imp().bookmark_button.borrow() {
             if bookmarked {
-                btn.set_icon_name("bookmark-remove-symbolic");
+                btn.set_icon_name("starred-symbolic");
                 btn.set_tooltip_text(Some("Remove bookmark"));
             } else {
-                btn.set_icon_name("bookmark-new-symbolic");
+                btn.set_icon_name("non-starred-symbolic");
                 btn.set_tooltip_text(Some("Save for later"));
             }
         }
