@@ -1018,6 +1018,27 @@ impl MxWindow {
 
         // Wire Ctrl+click → FetchRoomPreview → show AI summary popover.
         {
+            // Cancel in-flight inference whenever the popover is dismissed for any
+            // reason (Escape, Cancel button, new request). hover_room_id being set
+            // means inference is still running — if it's already cleared (content
+            // done) this is a no-op.
+            let cancel_tx_close = command_tx.clone();
+            let window_weak_close = window.downgrade();
+            imp.hover_popover.connect_closed(move |_| {
+                let Some(win) = window_weak_close.upgrade() else { return };
+                // If hover_room_id is still set, inference hasn't finished yet.
+                if win.imp().hover_room_id.borrow().is_some() {
+                    win.imp().hover_room_id.borrow_mut().take();
+                    if let Some(sid) = win.imp().hover_pulse_timer.borrow_mut().take() {
+                        sid.remove();
+                    }
+                    let tx = cancel_tx_close.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(crate::matrix::MatrixCommand::CancelRoomPreview).await;
+                    });
+                }
+            });
+
             let cmd_tx_h = command_tx.clone();
             let window_weak_h = window.downgrade();
             imp.room_list_view.connect_room_preview_requested(move |room_id, y| {
@@ -1072,6 +1093,7 @@ impl MxWindow {
                 {
                     let pop = popover.clone();
                     let win_weak = window.downgrade();
+                    let cancel_tx = cmd_tx_h.clone();
                     cancel_btn.connect_clicked(move |_| {
                         if let Some(win) = win_weak.upgrade() {
                             if let Some(sid) = win.imp().hover_pulse_timer.borrow_mut().take() {
@@ -1079,6 +1101,11 @@ impl MxWindow {
                             }
                             win.imp().hover_room_id.borrow_mut().take();
                         }
+                        // Tell the tokio thread to abort the in-flight Ollama request.
+                        let tx = cancel_tx.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = tx.send(crate::matrix::MatrixCommand::CancelRoomPreview).await;
+                        });
                         pop.popdown();
                     });
                 }

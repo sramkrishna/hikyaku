@@ -479,6 +479,8 @@ pub enum MatrixCommand {
         ollama_model: String,
         extra_instructions: String,
     },
+    /// Abort any in-flight AI room preview request (sent when the user cancels).
+    CancelRoomPreview,
     /// Run Ollama inference for metrics summary on the tokio thread.
     RunOllamaMetrics {
         prompt: String,
@@ -884,6 +886,10 @@ async fn matrix_task(
     // MarkRead is fire-and-forget during normal operation (doesn't block
     // SelectRoom) but must complete before Shutdown drops the runtime.
     let mut pending_mark_read: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Track the in-flight AI room-preview task so we can abort it when
+    // the user cancels or a new request arrives before the old one finishes.
+    let mut pending_preview: Option<tokio::task::JoinHandle<()>> = None;
 
     // Process commands while sync runs in the background.
     let mut shutdown_rx = shutdown_rx;
@@ -1294,9 +1300,15 @@ async fn matrix_task(
                         handle_export_messages(&client, &event_tx, &room_id, &path, &timeline_cache).await;
                     }
                     Ok(MatrixCommand::FetchRoomPreview { room_id, unread_count, ollama_endpoint, ollama_model, extra_instructions }) => {
+                        // Abort any previous preview task before starting a new one.
+                        // This prevents multiple concurrent inference requests from
+                        // queueing up and delivering stale results after a cancel.
+                        if let Some(h) = pending_preview.take() {
+                            h.abort();
+                        }
                         let bg_client = client.clone();
                         let bg_tx = event_tx.clone();
-                        tokio::spawn(async move {
+                        pending_preview = Some(tokio::spawn(async move {
                             // Yield until room load finishes — LLM inference does
                             // SQLite reads for the room's message history.
                             yield_if_room_loading().await;
@@ -1304,7 +1316,13 @@ async fn matrix_task(
                                 &bg_client, &bg_tx, &room_id, unread_count,
                                 &ollama_endpoint, &ollama_model, &extra_instructions,
                             ).await;
-                        });
+                        }));
+                    }
+                    Ok(MatrixCommand::CancelRoomPreview) => {
+                        if let Some(h) = pending_preview.take() {
+                            tracing::info!("CancelRoomPreview: aborting in-flight preview task");
+                            h.abort();
+                        }
                     }
                     Ok(MatrixCommand::RunOllamaMetrics { prompt, endpoint, model }) => {
                         let bg_tx = event_tx.clone();
@@ -5962,6 +5980,12 @@ async fn ollama_stream_to_event(
         "keep_alive": "15m",
     });
 
+    // 120-second hard timeout for the entire request + streaming.
+    // Prevents indefinite hangs when Ollama needs to load a large model.
+    // Tasks are abortable anyway (CancelRoomPreview), but this caps runaway inference.
+    let inference_result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        async {
     let resp = match client.post(&url).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -6024,6 +6048,17 @@ async fn ollama_stream_to_event(
     let _ = event_tx.send(MatrixEvent::OllamaChunk {
         context: context.to_string(), chunk: String::new(), done: true,
     }).await;
+    } // end async block passed to tokio::time::timeout
+    ).await;
+
+    if inference_result.is_err() {
+        tracing::warn!("ollama_stream_to_event: inference timed out after 120s");
+        let _ = event_tx.send(MatrixEvent::OllamaChunk {
+            context: context.to_string(),
+            chunk: "\u{26a0} Inference timed out (model may be loading — try again)".to_string(),
+            done: true,
+        }).await;
+    }
 }
 
 /// Strip Matrix reply fallback lines from a message body.
