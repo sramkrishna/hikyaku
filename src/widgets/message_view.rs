@@ -723,10 +723,10 @@ mod imp {
                     return glib::Propagation::Proceed;
                 }
                 let imp = view_for_enter.imp();
-                // If the nick-complete popover is open, Enter should complete
-                // the nick, not send the message.
+                // If the nick-complete popover is open, block the send entirely.
+                // key_controller handles Enter to confirm the selected nick.
                 if imp.nick_popover.is_visible() {
-                    return glib::Propagation::Proceed; // let nick popover handle it
+                    return glib::Propagation::Stop;
                 }
                 let buf = imp.input_view.buffer();
                 let raw = buf_text(&buf);
@@ -836,24 +836,46 @@ mod imp {
 
                 // Classify key into an action. Using match avoids serial
                 // if-else and gives O(1) dispatch via compiler jump table.
-                enum NickAction { Escape, Navigate(bool), Tab, Other }
+                enum NickAction { Escape, Navigate(bool), Tab, Confirm, Other }
+                let popover_open = imp.nick_popover.is_visible();
                 let action = match key {
                     K::Escape => NickAction::Escape,
                     K::Down => NickAction::Navigate(false),
                     K::Up => NickAction::Navigate(true),
                     K::Tab => NickAction::Tab,
+                    // Enter confirms the selected nick — but only when the popover
+                    // is open. Outside the popover, Enter is handled by send_key_ctrl.
+                    K::Return | K::KP_Enter if popover_open => NickAction::Confirm,
                     _ => NickAction::Other,
                 };
 
                 match action {
-                    NickAction::Escape if imp.nick_popover.is_visible() => {
+                    NickAction::Escape if popover_open => {
                         imp.nick_popover.popdown();
                         imp.nick_completion_state.replace(None);
                         return glib::Propagation::Stop;
                     }
+                    NickAction::Confirm => {
+                        // Enter with popover open: activate the selected row (or
+                        // first row if none highlighted) and close the popover.
+                        // send_key_ctrl already returned Stop so no message is sent.
+                        let row = imp.nick_list.selected_row()
+                            .or_else(|| imp.nick_list.row_at_index(0));
+                        if let Some(row) = row {
+                            imp.nick_list.activate_action(
+                                "list.select-item",
+                                Some(&glib::Variant::from((row.index() as u32, false, false))),
+                            ).ok();
+                            imp.nick_list.emit_by_name::<()>("row-activated", &[&row]);
+                        } else {
+                            imp.nick_popover.popdown();
+                            imp.nick_completion_state.replace(None);
+                        }
+                        return glib::Propagation::Stop;
+                    }
                     NickAction::Other | NickAction::Escape => {
                         // Any non-completion key — close popover if open.
-                        if imp.nick_popover.is_visible()
+                        if popover_open
                             && key != K::Shift_L && key != K::Shift_R
                         {
                             imp.nick_popover.popdown();
