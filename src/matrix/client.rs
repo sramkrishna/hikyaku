@@ -5428,8 +5428,12 @@ async fn handle_fetch_room_preview(
     let Ok(rid) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&rid) else { return };
 
-    // Fetch enough messages to cover the unread window, capped at 50.
-    let fetch_limit = if unread_count > 0 { unread_count.min(50) } else { 20 };
+    // For unread rooms, fetch the unread window plus some prior context so the
+    // LLM can understand references. Context messages are sent in a separate
+    // section of the prompt so the model knows which ones are new.
+    const CONTEXT_SIZE: u32 = 10;
+    let unread_cap = unread_count.min(40);
+    let fetch_limit = if unread_count > 0 { unread_cap + CONTEXT_SIZE } else { 20 };
 
     let mut msg_filter = RoomEventFilter::default();
     msg_filter.types = Some(vec![
@@ -5505,12 +5509,6 @@ async fn handle_fetch_room_preview(
         lines.push(format!("[{ts_str}] {sender_short}: {clean_body}"));
     }
 
-    // If the caller knows how many messages are unread, trim to that window
-    // so Ollama summarises only what the user hasn't seen yet.
-    if unread_count > 0 && lines.len() > unread_count as usize {
-        lines.drain(0..lines.len() - unread_count as usize);
-    }
-
     if ollama_endpoint.is_empty() || ollama_model.is_empty() {
         tracing::debug!("FetchRoomPreview: Ollama not configured, skipping");
         let _ = event_tx.send(MatrixEvent::OllamaChunk {
@@ -5530,27 +5528,55 @@ async fn handle_fetch_room_preview(
         return;
     }
 
-    let messages_text = lines.join("\n");
     let is_unread = unread_count > 0;
 
-    // Build prompt and run Ollama on the tokio thread.
-    let extra = if extra_instructions.is_empty() {
-        String::new()
+    // Split into context (already seen) and new (unread) windows.
+    // For non-unread views all lines are treated as the conversation body.
+    let prompt = if is_unread && lines.len() > unread_cap as usize {
+        let split = lines.len() - unread_cap as usize;
+        let context_text = lines[..split].join("\n");
+        let new_text = lines[split..].join("\n");
+        let extra = if extra_instructions.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nAdditional instructions: {extra_instructions}")
+        };
+        format!(
+            "You are a helpful assistant analyzing a Matrix room conversation.\n\
+             Each message is prefixed with its exact timestamp in [YYYY-MM-DD HH:MM UTC] format. \
+             Use only those timestamps when referring to timing — do not guess or infer any dates \
+             not present in the conversation.\n\
+             \n\
+             === Prior conversation (context — already read) ===\n\
+             {context_text}\n\
+             \n\
+             === New messages (unread) ===\n\
+             {new_text}\n\
+             \n\
+             Provide a concise summary (2-4 bullet points) of the NEW messages above. For each \
+             bullet, include who sent the message and what they said or decided. Use the prior \
+             context only to explain references — do not summarize it separately.{extra}"
+        )
     } else {
-        format!("\n\nAdditional instructions: {extra_instructions}")
+        // No unread split — summarize the full window.
+        let messages_text = lines.join("\n");
+        let extra = if extra_instructions.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nAdditional instructions: {extra_instructions}")
+        };
+        format!(
+            "You are a helpful assistant. Summarize the following Matrix room conversation \
+             in 2-4 bullet points. Focus on topics, decisions, and key contributors. Be concise.\n\
+             Each message is prefixed with its exact timestamp in [YYYY-MM-DD HH:MM UTC] format. \
+             Use only those timestamps when referring to timing — do not guess or infer any dates \
+             not present in the conversation.{extra}\n\nConversation:\n{messages_text}"
+        )
     };
-    let unread_note = if is_unread { " (unread messages only)" } else { "" };
-    let prompt = format!(
-        "You are a helpful assistant. Summarize the following Matrix room conversation{unread_note} \
-         in 2-4 bullet points. Focus on topics, decisions, and key contributors. Be concise.\n\
-         Each message is prefixed with its exact timestamp in [YYYY-MM-DD HH:MM UTC] format. \
-         Use only those timestamps when referring to timing — do not guess or infer any dates \
-         not present in the conversation.{extra}\n\nConversation:\n{messages_text}"
-    );
 
     tracing::info!(
-        "RoomPreview: calling Ollama for {room_id} ({} msgs, {} chars)",
-        lines.len(), messages_text.len()
+        "RoomPreview: calling Ollama for {room_id} ({} msgs, {} prompt chars)",
+        lines.len(), prompt.len()
     );
     ollama_stream_to_event(
         ollama_endpoint, ollama_model, &prompt,
