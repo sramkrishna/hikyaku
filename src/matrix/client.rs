@@ -1842,7 +1842,8 @@ async fn resolve_display_name(
 ) -> String {
     let uid_str = user_id.to_string();
 
-    // Check cache first.
+    // Check cache first — only real display names are cached, not fallbacks,
+    // so a miss here always triggers a fresh member lookup.
     {
         let cache = DISPLAY_NAME_CACHE.lock().await;
         if let Some(name) = cache.get(&uid_str) {
@@ -1850,20 +1851,22 @@ async fn resolve_display_name(
         }
     }
 
-    let name = room.get_member_no_sync(user_id)
+    let resolved = room.get_member_no_sync(user_id)
         .await
         .ok()
         .flatten()
-        .and_then(|m| m.display_name().map(|s| s.to_string()))
-        .unwrap_or_else(|| uid_str.clone());
+        .and_then(|m| m.display_name().map(|s| s.to_string()));
 
-    // Cache it.
-    {
+    if let Some(name) = resolved {
+        // Cache real display names so we don't hit the state store on every message.
         let mut cache = DISPLAY_NAME_CACHE.lock().await;
         cache.insert(uid_str, name.clone());
+        name
+    } else {
+        // Member not yet in local state — return localpart as a readable fallback
+        // but do NOT cache it so the next message retries the lookup.
+        user_id.localpart().to_string()
     }
-
-    name
 }
 
 
