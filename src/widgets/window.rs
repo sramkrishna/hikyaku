@@ -5198,6 +5198,26 @@ impl MxWindow {
             .build();
         pull_name_row.add_suffix(&pull_btn);
 
+        // Detect button — runs GPU detection and fills in the recommended model.
+        let detect_btn = gtk::Button::builder()
+            .icon_name("find-location-symbolic")
+            .tooltip_text("Detect best model for this hardware")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        {
+            let pull_name_row = pull_name_row.clone();
+            detect_btn.connect_clicked(move |btn| {
+                use crate::intelligence::gpu_detect;
+                let gpu = gpu_detect::detect_gpu();
+                let model = gpu_detect::suggested_model(gpu.as_ref());
+                let reason = gpu_detect::suggestion_reason(gpu.as_ref());
+                pull_name_row.set_text(model);
+                btn.set_tooltip_text(Some(&format!("Detected: {reason}")));
+            });
+        }
+        pull_name_row.add_suffix(&detect_btn);
+
         // Installed models group — one row per model with a Delete button.
         let installed_group = adw::PreferencesGroup::builder()
             .title("Installed Models")
