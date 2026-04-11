@@ -997,6 +997,40 @@ impl RoomListView {
         store.splice(splice_pos, n_remove, &additions);
     }
 
+    /// Bump a room's last_activity_ts to `ts_secs` and re-sort the stores so
+    /// the room rises to the top immediately on a new message.
+    /// Called from the NewMessage / MessageSent handlers — avoids waiting up
+    /// to 3 minutes for the next full RoomListUpdated.
+    pub fn bump_room_activity(&self, room_id: &str, ts_secs: u64) {
+        let imp = self.imp();
+        // Update the GObject property so sort comparisons reflect the new ts.
+        {
+            let registry = imp.room_registry.borrow();
+            if let Some(obj) = registry.get(room_id) {
+                if obj.last_activity_ts() < ts_secs {
+                    obj.set_last_activity_ts(ts_secs);
+                }
+            }
+        }
+        // Update the cached_rooms snapshot so rebuild_stores sorts correctly.
+        let mut cached = imp.cached_rooms.borrow().clone();
+        let mut found = false;
+        for r in &mut cached {
+            if r.room_id == room_id {
+                if r.last_activity_ts < ts_secs {
+                    r.last_activity_ts = ts_secs;
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found { return; } // room not yet in list; next RoomListUpdated will place it
+        imp.cached_rooms.replace(cached.clone());
+        // Force rebuild_stores to re-run by clearing the structural signature.
+        imp.last_structural_sig.borrow_mut().clear();
+        self.rebuild_stores(&cached);
+    }
+
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
         let imp = self.imp();
 

@@ -1889,6 +1889,13 @@ impl MxWindow {
                             message_view.patch_echo_event_id(&echo_body, &event_id);
                             message_view.update_history_event_id(&echo_body, &event_id);
                         }
+                        // Bubble the room to the top immediately — don't wait up to
+                        // 3 minutes for the next RoomListUpdated to re-sort.
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        room_list_view.bump_room_activity(&room_id, now_secs);
                     }
                     MatrixEvent::NewMessage { room_id, room_name, sender_id, message, is_mention, is_dm } => {
                         let current = window.imp().current_room_id.borrow().clone();
@@ -1944,7 +1951,11 @@ impl MxWindow {
                         // Skip notifications until the first room list arrives — those
                         // are historical catchup messages the user has already seen.
                         let sync_done = window.imp().initial_sync_done.get();
-                        if !is_self && sync_done && (is_mention || is_dm) {
+                        // Suppress all notifications (banner, desktop, bell log)
+                        // for the room the user is currently viewing.
+                        // notification_manager.push also checks this internally,
+                        // but push_notification (bell log) does not.
+                        if !is_self && sync_done && !is_current_room && (is_mention || is_dm) {
                             window.imp().notification_manager.push(
                                 &room_id,
                                 &room_name,
@@ -1952,7 +1963,7 @@ impl MxWindow {
                                 &message.body,
                                 is_dm,
                             );
-                            // Also push to the in-session notification log.
+                            // In-session notification log (bell icon).
                             window.push_notification(
                                 &room_id,
                                 &message.event_id,
@@ -1961,6 +1972,10 @@ impl MxWindow {
                                 &message.body,
                                 message.timestamp,
                             );
+                        }
+                        // Bubble the room to the top of the list immediately.
+                        if message.timestamp > 0 {
+                            room_list_view.bump_room_activity(&room_id, message.timestamp);
                         }
                     }
                     #[cfg(feature = "community-health")]

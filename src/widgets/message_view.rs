@@ -1203,19 +1203,28 @@ mod imp {
                         lbl.add_css_class("dim-label");
                         vbox.append(&lbl);
                     } else {
+                        // Capture char offsets (plain integers), not TextIter
+                        // structs. TextIter copies become stale after any buffer
+                        // modification; offsets remain valid and we reconstruct
+                        // fresh iters from them at click time.
+                        let char_start = word_start.offset();
+                        let char_end = word_end.offset();
                         for sug in sugs.iter().take(8) {
                             let btn = gtk::Button::with_label(sug);
                             btn.set_has_frame(false);
                             btn.add_css_class("flat");
-                            // Replace the misspelled word with the suggestion.
                             let buf2 = buf.clone();
-                            let mut ws = word_start.clone();
-                            let mut we = word_end.clone();
                             let sug2 = sug.clone();
                             let pop = popover.clone();
                             btn.connect_clicked(move |_| {
-                                buf2.delete(&mut ws.clone(), &mut we.clone());
-                                buf2.insert(&mut ws.clone(), &sug2);
+                                // Reconstruct fresh iters — stale iters cause
+                                // gtk_text_buffer_insert assertion failures.
+                                let mut s = buf2.iter_at_offset(char_start);
+                                let mut e = buf2.iter_at_offset(char_end);
+                                buf2.delete(&mut s, &mut e);
+                                // After delete, `s` is re-initialised to the
+                                // deletion point — use it directly for insert.
+                                buf2.insert(&mut s, &sug2);
                                 pop.popdown();
                             });
                             vbox.append(&btn);
