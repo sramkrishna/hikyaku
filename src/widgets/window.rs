@@ -5848,10 +5848,11 @@ fn show_ai_setup_dialog(window: &MxWindow) {
     // Model choices — displayed as a list of radio-style ActionRows.
     // (name, tag, description)
     let models: &[(&str, &str, &str)] = &[
-        ("Qwen 2.5 3B",      "qwen2.5:3b",       "Recommended · ~2 GB · best balance of speed and quality"),
+        ("Qwen 2.5 7B",      "qwen2.5:7b",       "Best accuracy · ~4.5 GB · recommended for 16 GB+ RAM"),
+        ("Qwen 2.5 3B",      "qwen2.5:3b",       "Good balance · ~2 GB · recommended for 8 GB RAM"),
         ("Qwen 2.5 1.5B",    "qwen2.5:1.5b",     "Lightweight · ~1 GB · faster on low-end hardware"),
-        ("Llama 3.2 3B",     "llama3.2:3b",       "Meta's 3B model · ~2 GB · good general-purpose chat"),
-        ("DeepSeek-R1 7B",   "deepseek-r1:7b",    "Strong reasoning · ~4.5 GB · needs 6 GB+ RAM"),
+        ("Llama 3.2 3B",     "llama3.2:3b",       "Meta 3B · ~2 GB · general-purpose chat"),
+        ("Phi 4 Mini 3.8B",  "phi4-mini:3.8b",    "Microsoft · ~2.5 GB · compact and capable"),
     ];
 
     let model_group = adw::PreferencesGroup::builder()
