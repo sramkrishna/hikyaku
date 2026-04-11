@@ -13,6 +13,7 @@ name: Publish Flatpak Repo
 on:
   push:
     tags: ["v*"]
+    branches: ["beta"]
   workflow_dispatch:
     inputs:
       flatpak_branch:
@@ -54,6 +55,8 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             branch="${{ github.event.inputs.flatpak_branch }}"
+          elif [[ "$GITHUB_REF" == refs/heads/beta ]]; then
+            branch=beta
           elif [[ "$GITHUB_REF" == refs/tags/v*-* ]]; then
             branch=beta
           else
