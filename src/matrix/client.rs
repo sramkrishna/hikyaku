@@ -4266,10 +4266,15 @@ async fn handle_download_media(
     // cache=false ensures encrypted media is freshly decrypted.
     match client.media().get_media_content(&request, false).await {
         Ok(data) => {
-            // Write to temp file with the original filename.
             let tmp_dir = std::env::temp_dir().join("hikyaku-media");
             let _ = std::fs::create_dir_all(&tmp_dir);
-            let path = tmp_dir.join(filename);
+
+            // Sanitize the filename: some clients set body to an mxc:// URL or
+            // a bare name with no extension. Take only the last path component,
+            // replace any remaining non-safe chars, then ensure there is an
+            // extension by sniffing the downloaded bytes if needed.
+            let safe_name = sanitize_media_filename(filename, &data);
+            let path = tmp_dir.join(&safe_name);
             if let Err(e) = std::fs::write(&path, &data) {
                 tracing::error!("Failed to write media file: {e}");
                 return;
@@ -4284,6 +4289,70 @@ async fn handle_download_media(
         Err(e) => {
             tracing::error!("Failed to download media: {e}");
         }
+    }
+}
+
+/// Return a safe local filename for a downloaded media file.
+///
+/// - Strips mxc:// prefixes and any path separators the body field might contain.
+/// - Appends the correct extension derived from magic bytes if the name has none
+///   or if the existing extension is wrong (e.g. a PNG sent with body "image").
+fn sanitize_media_filename(filename: &str, data: &[u8]) -> String {
+    // Take only the last path component and strip control chars / slashes.
+    let base = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(filename);
+    // Replace any remaining characters that are unsafe in a file path.
+    let safe: String = base.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    // Strip leading dots/underscores that could produce hidden or ugly filenames.
+    let safe = safe.trim_start_matches(['.', '_']).to_string();
+    let safe = if safe.is_empty() { "media".to_string() } else { safe };
+
+    // Sniff a more reliable extension from magic bytes.
+    let sniffed_ext = sniff_extension(data);
+
+    // Check whether the current extension (if any) matches the sniffed type.
+    let current_ext = std::path::Path::new(&safe)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+
+    match (current_ext, sniffed_ext) {
+        // Extension present and matches sniffed type — keep as-is.
+        (Some(ce), Some(se)) if ce == se => safe,
+        // No extension — append the sniffed one.
+        (None, Some(se)) => format!("{safe}.{se}"),
+        // Extension present but wrong (e.g. ".jpg" for a PNG) — replace it.
+        (Some(_), Some(se)) => {
+            let stem = std::path::Path::new(&safe)
+                .file_stem().and_then(|s| s.to_str()).unwrap_or(&safe);
+            format!("{stem}.{se}")
+        }
+        // Can't sniff (unknown format) — keep whatever name we have.
+        (_, None) => safe,
+    }
+}
+
+/// Derive a file extension from the first few magic bytes of the content.
+/// Returns `None` for unknown or unrecognised formats.
+fn sniff_extension(data: &[u8]) -> Option<&'static str> {
+    match data {
+        [0x89, b'P', b'N', b'G', ..] => Some("png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("jpg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("webp"),
+        // MP4 / MOV: "ftyp" box at offset 4.
+        d if d.len() >= 12 && &d[4..8] == b"ftyp" => Some("mp4"),
+        // WebM / MKV: EBML magic.
+        [0x1A, 0x45, 0xDF, 0xA3, ..] => Some("webm"),
+        // OGG (covers .ogv video and .oga audio).
+        [b'O', b'g', b'g', b'S', ..] => Some("ogg"),
+        // PDF (keep for completeness — opens via system app).
+        [b'%', b'P', b'D', b'F', ..] => Some("pdf"),
+        _ => None,
     }
 }
 

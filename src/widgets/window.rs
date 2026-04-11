@@ -340,10 +340,23 @@ fn build_metrics_prompt(metrics_text: &str, detect_conflict: bool, detect_coc: b
 
 /// Detect MIME type for a local file path using GIO content-type guessing.
 fn mime_for_path(path: &str) -> String {
-    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(path), &[]);
-    gio::functions::content_type_get_mime_type(&content_type)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "application/octet-stream".to_string())
+    // Ask GIO to detect the content type from the file itself (magic bytes +
+    // extension). standard::content-type causes GIO to read the file header,
+    // so PNG, WebP, MP4, WebM etc. are identified correctly even when the
+    // cached filename has no extension.
+    let file = gio::File::for_path(path);
+    if let Ok(info) = file.query_info(
+        "standard::content-type",
+        gio::FileQueryInfoFlags::NONE,
+        gio::Cancellable::NONE,
+    ) {
+        if let Some(ct) = info.content_type() {
+            if let Some(mime) = gio::functions::content_type_get_mime_type(&ct) {
+                return mime.to_string();
+            }
+        }
+    }
+    "application/octet-stream".to_string()
 }
 
 /// Show a media preview in-app for images/video; launch system default app for everything else.
