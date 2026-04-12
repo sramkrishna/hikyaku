@@ -5967,11 +5967,20 @@ async fn ollama_stream_to_event(
         "keep_alive": "15m",
     });
 
-    // 120-second hard timeout for the entire request + streaming.
-    // Prevents indefinite hangs when Ollama needs to load a large model.
-    // Tasks are abortable anyway (CancelRoomPreview), but this caps runaway inference.
+    // Tell the UI we're waiting for Ollama to load the model — replaces the
+    // spinner so the user sees feedback instead of a silent progress bar.
+    // The GTK side appends subsequent token chunks after this text.
+    let _ = event_tx.send(MatrixEvent::OllamaChunk {
+        context: context.to_string(),
+        chunk: "\u{23f3} Loading model into memory\u{2026}\n\n".to_string(),
+        done: false,
+    }).await;
+
+    // 5-minute hard timeout: covers cold model load (can be 2-3 min for 7B on
+    // first use) plus inference time.  The task is also abortable via
+    // CancelRoomPreview so the user is never truly stuck.
     let inference_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(300),
         async {
     let resp = match client.post(&url).json(&body).send().await {
         Ok(r) => r,
@@ -6039,10 +6048,10 @@ async fn ollama_stream_to_event(
     ).await;
 
     if inference_result.is_err() {
-        tracing::warn!("ollama_stream_to_event: inference timed out after 120s");
+        tracing::warn!("ollama_stream_to_event: inference timed out after 300s");
         let _ = event_tx.send(MatrixEvent::OllamaChunk {
             context: context.to_string(),
-            chunk: "\u{26a0} Inference timed out (model may be loading — try again)".to_string(),
+            chunk: "\u{26a0} Timed out after 5 minutes. Try again — model should now be loaded.".to_string(),
             done: true,
         }).await;
     }
