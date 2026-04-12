@@ -192,6 +192,7 @@ mod perf_tests {
 /// Guards against `my_id` being empty (not yet set before `LoginSuccess`
 /// fires).  An empty `my_id` must never match any `sender_id`, otherwise
 /// messages from other users could be treated as self-echoes and skipped.
+#[cfg(test)]
 pub(crate) fn compute_is_self(my_id: &str, sender_id: &str) -> bool {
     !my_id.is_empty() && sender_id == my_id
 }

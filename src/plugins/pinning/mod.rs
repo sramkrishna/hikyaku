@@ -7,6 +7,8 @@
 // Storage: ~/.local/share/hikyaku/pinned_messages.json
 // Feature: "pinning"
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

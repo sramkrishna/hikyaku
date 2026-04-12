@@ -1192,7 +1192,7 @@ impl RoomListView {
             registry.get(&r.room_id).unwrap().clone()
         };
 
-        let (mut dms, _by_space, mut ungrouped, cleanup) = group_and_sort_rooms(rooms);
+        let (dms, _by_space, ungrouped, cleanup) = group_and_sort_rooms(rooms);
 
         // Bookmarks — computed separately since they cut across all categories.
         let mut favourites: Vec<&RoomInfo> = rooms

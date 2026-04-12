@@ -11,87 +11,6 @@ pub mod ollama_manager;
 pub mod watcher;
 
 use soup::prelude::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize)]
-struct OllamaRequest<'a> {
-    model: &'a str,
-    messages: Vec<OllamaMessage<'a>>,
-    stream: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct OllamaMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponse {
-    message: OllamaResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponseMessage {
-    content: String,
-}
-
-/// Ask the local Ollama instance to summarize metrics data.
-/// Auto-starts a local Ollama binary if the endpoint is not yet reachable.
-/// `detect_conflict` and `detect_coc` add hidden moderation analysis layers
-/// (enabled via gsettings, not shown in UI).
-/// Returns None if Ollama is unavailable or returns an error.
-pub async fn summarize_metrics(
-    endpoint: &str,
-    model: &str,
-    metrics_text: &str,
-    detect_conflict: bool,
-    detect_coc: bool,
-) -> Option<String> {
-    let endpoint = ollama_manager::ensure_running(endpoint).await?;
-    let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
-
-    let mut sections = vec![
-        "1. Interesting conversations: identify threads or exchanges that show \
-         genuine knowledge-sharing, creative problem-solving, or topics of broad \
-         community interest. Note who contributed and what made it notable.".to_string(),
-    ];
-    if detect_conflict {
-        sections.push(
-            "2. Conflict and spam signals: flag any patterns of escalating \
-             disagreement between users, unusually high message frequency from \
-             single users, or repetitive content that may indicate spam. \
-             Be specific about user counts and message volumes.".to_string(),
-        );
-    }
-    if detect_coc {
-        sections.push(
-            "3. Code-of-conduct signals: note ban/kick events, users who have \
-             been actioned more than once, or time windows with unusual \
-             moderation activity. This is for community-health review only.".to_string(),
-        );
-    }
-
-    let task_list = sections.join("\n");
-    let prompt = format!(
-        "You are a community manager assistant analyzing Matrix room activity. \
-         Review the metrics below and provide a concise report (3-5 bullet points \
-         per section) covering:\n{task_list}\n\nBe specific about numbers. \
-         If data is insufficient to draw a conclusion for a section, say so briefly.\n\
-         \nMetrics:\n{metrics_text}"
-    );
-
-    let request = OllamaRequest {
-        model,
-        messages: vec![OllamaMessage { role: "user", content: &prompt }],
-        stream: false,
-    };
-
-    let body = serde_json::to_vec(&request).ok()?;
-    let bytes = soup_post_json(&url, &body, 120).await?;
-    let resp: OllamaResponse = serde_json::from_slice(&bytes).ok()?;
-    Some(resp.message.content)
-}
 
 /// Pull a model via Ollama's /api/pull, reporting progress via callback.
 ///
@@ -194,12 +113,3 @@ pub async fn delete_model(endpoint: &str, model: &str) -> Result<(), String> {
         .map_err(|e| format!("Delete failed: {e}"))
 }
 
-/// POST JSON to url, return response body. timeout_secs: 0 = no timeout.
-async fn soup_post_json(url: &str, body: &[u8], timeout_secs: u32) -> Option<glib::Bytes> {
-    let session = soup::Session::new();
-    if timeout_secs > 0 { session.set_timeout(timeout_secs); }
-    let msg = soup::Message::new("POST", url).ok()?;
-    let bytes = glib::Bytes::from(body);
-    msg.set_request_body_from_bytes(Some("application/json"), Some(&bytes));
-    session.send_and_read_future(&msg, glib::Priority::DEFAULT).await.ok()
-}

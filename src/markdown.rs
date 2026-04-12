@@ -68,7 +68,6 @@ pub fn html_to_segments(html: &str) -> Vec<Segment> {
     let len = chars.len();
 
     let mut in_pre = false;
-    let mut in_pre_code = false;
     let mut pre_lang = String::new();
     let mut pre_content = String::new();
     let mut list_depth: u32 = 0;
@@ -126,7 +125,6 @@ pub fn html_to_segments(html: &str) -> Vec<Segment> {
                 "code" => {
                     if in_pre {
                         if !closing {
-                            in_pre_code = true;
                             if let Some(class) = attrs.iter()
                                 .find(|(k, _)| k == "class")
                                 .map(|(_, v)| v.as_str())
@@ -135,8 +133,6 @@ pub fn html_to_segments(html: &str) -> Vec<Segment> {
                                     .unwrap_or(class)
                                     .to_string();
                             }
-                        } else {
-                            in_pre_code = false;
                         }
                     } else {
                         text_buf.push_str(if closing { "</tt>" } else { "<tt>" });
@@ -152,7 +148,6 @@ pub fn html_to_segments(html: &str) -> Vec<Segment> {
                         pre_content.clear();
                         pre_lang.clear();
                         in_pre = false;
-                        in_pre_code = false;
                     } else {
                         in_pre = true;
                     }

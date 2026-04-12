@@ -409,15 +409,6 @@ fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
     }
 }
 
-/// Auto-dismiss the media preview popover after 15 seconds.
-fn auto_dismiss_preview(win_weak: glib::WeakRef<MxWindow>) {
-    glib::timeout_add_local_once(std::time::Duration::from_secs(15), move || {
-        if let Some(win) = win_weak.upgrade() {
-            win.imp().media_popover.popdown();
-        }
-    });
-}
-
 fn toast(overlay: &adw::ToastOverlay, msg: &str) {
     overlay.add_toast(adw::Toast::new(msg));
 }
@@ -432,7 +423,7 @@ fn toast_or_notify(
     title: &str,
     body: &str,
 ) {
-    use gtk::prelude::{GtkWindowExt, WidgetExt};
+    use gtk::prelude::GtkWindowExt;
     use gio::prelude::ApplicationExt;
     if window.is_active() {
         let t = adw::Toast::builder()
@@ -1474,7 +1465,7 @@ impl MxWindow {
         );
 
         // Focus change handler — clear unseen counter when window regains focus.
-        let window_weak_focus = window.downgrade();
+        let _window_weak_focus = window.downgrade();
         let room_list_focus = imp.room_list_view.clone();
         let msg_view_focus = imp.message_view.clone();
         window.connect_is_active_notify(move |win| {
@@ -3726,10 +3717,6 @@ impl MxWindow {
         self.show_join_bar_with(Some(identifier));
     }
 
-    fn show_join_bar(&self) {
-        self.show_join_bar_with(None);
-    }
-
     fn show_join_bar_with(&self, initial: Option<&str>) {
         let imp = self.imp();
         if imp.inline_bar_active.get() { return; }
@@ -4342,7 +4329,7 @@ impl MxWindow {
         space_join_ctx: Option<(String, Vec<String>)>,
         tx: &async_channel::Sender<MatrixCommand>,
         expanders: &std::cell::RefCell<std::collections::HashMap<String, (gtk::ListBox, Option<(String, Vec<String>)>)>>,
-        join_buttons: &std::cell::RefCell<std::collections::HashMap<String, gtk::Button>>,
+        _join_buttons: &std::cell::RefCell<std::collections::HashMap<String, gtk::Button>>,
     ) {
         let expander = adw::ExpanderRow::builder()
             .title(space_name)
@@ -5213,7 +5200,7 @@ impl MxWindow {
 
         // --- AI group (lives on its own page, shown only when AI plugin is enabled) ---
         #[cfg(feature = "ai")]
-        let (ai_page, extra_row) = {
+        let (ai_page, _extra_row) = {
         let ai_group = adw::PreferencesGroup::builder()
             .title("AI (Ollama)")
             .description("Local LLM for room summaries. No data leaves the machine.")
@@ -5421,6 +5408,7 @@ impl MxWindow {
                 pull_btn_clone.set_sensitive(false);
                 let btn = pull_btn_clone.clone();
                 let provider = gtk::CssProvider::new();
+                #[allow(deprecated)]
                 btn.style_context().add_provider(
                     &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION
                 );
@@ -5432,6 +5420,7 @@ impl MxWindow {
                         move |p| {
                             let pct = (p * 100.0) as u32;
                             btn_prog.set_label(&format!("{pct}%"));
+                            #[allow(deprecated)]
                             prov_prog.load_from_data(&format!(
                                 "button {{ background: linear-gradient(\
                                     to right,\
@@ -5441,6 +5430,7 @@ impl MxWindow {
                             ));
                         }
                     ).await;
+                    #[allow(deprecated)]
                     provider.load_from_data("button {}");
                     match result {
                         Ok(()) => btn.set_label("Done ✓"),
@@ -6492,14 +6482,12 @@ fn build_invite_dialog(
                 return;
             };
             // Match row position back to subtitle (user_id).
-            let mut pos = 0u32;
             let mut child = results_list2.first_child();
             while let Some(w) = child {
                 if let Some(lbr) = w.downcast_ref::<gtk::ListBoxRow>() {
                     if lbr == row { break; }
                 }
                 child = w.next_sibling();
-                pos += 1;
             }
             if let Some(action_row) = row.child().and_downcast::<adw::ActionRow>() {
                 *selected_uid.borrow_mut() = action_row.subtitle().unwrap_or_default().to_string();
@@ -6551,7 +6539,7 @@ fn build_invite_dialog(
             // Register this dialog's result callback in the window.
             let populate2 = populate.clone();
             let local2 = local_results.clone();
-            let q2 = query.clone();
+            let _q2 = query.clone();
             if let Some(win) = win_weak.upgrade() {
                 *win.imp().user_search_cb.borrow_mut() = Some(Box::new(move |dir_results| {
                     // Merge: local results first (deduplicated), then directory results.

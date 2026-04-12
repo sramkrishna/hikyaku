@@ -1341,7 +1341,7 @@ use gtk::subclass::prelude::*;
 
 use crate::models::MessageObject;
 
-/// Result of attempting to place the "New messages" divider at a known event.
+// Result of attempting to place the "New messages" divider at a known event.
 
 glib::wrapper! {
     pub struct MessageView(ObjectSubclass<imp::MessageView>)
@@ -2837,6 +2837,7 @@ pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -
 /// rooms (cache too small to evict safely).
 ///
 /// `order` is the insertion-order queue: oldest entry is at index 0.
+#[cfg(test)]
 pub(crate) fn lru_evict_candidate<'a>(
     order: &'a [&'a str],
     current_room: &str,
@@ -2848,6 +2849,7 @@ pub(crate) fn lru_evict_candidate<'a>(
 /// Pure helper: should a live-appended message be tinted as "new"?
 /// Only tint when the window is not focused AND the message is not from
 /// the current user — own messages never need a "new" highlight.
+#[cfg(test)]
 pub(crate) fn should_mark_as_new(window_focused: bool) -> bool {
     !window_focused
 }
@@ -2865,6 +2867,7 @@ pub(crate) fn divider_should_mark(sender_id: &str, my_id: &str) -> bool {
 ///
 /// Used in the bg_refresh incremental path to suppress the race where a server
 /// confirmation arrives before MessageSent has patched the local echo's event_id.
+#[cfg(test)]
 pub(crate) fn is_echo_duplicate(pending_echo_bodies: &[&str], incoming_body: &str) -> bool {
     pending_echo_bodies.contains(&incoming_body)
 }
@@ -2897,6 +2900,7 @@ pub(crate) fn should_show_refresh_banner(refreshing: bool, messages_loaded: bool
 /// `compute_divider_pos` only answers *where*.  Call `divider_decision` to
 /// also answer *whether* — it gates on `divider_present` and `unread_count`
 /// and returns the banner count alongside the insert position.
+#[cfg(test)]
 pub(crate) fn compute_divider_pos(
     event_ids: &[&str],
     fully_read: Option<&str>,
@@ -2933,6 +2937,7 @@ pub(crate) fn compute_divider_pos(
 /// * `banner_count` is derived from `insert_position`, not from `unread_count`
 ///   directly, so it reflects the actual number of messages after the divider
 ///   in the current window rather than the (possibly stale) server count.
+#[cfg(test)]
 pub(crate) fn divider_decision(
     event_ids: &[&str],
     fully_read: Option<&str>,

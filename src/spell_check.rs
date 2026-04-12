@@ -54,6 +54,7 @@ where
 
 /// Returns `true` if `word` is correctly spelled (or if enchant is unavailable).
 /// GTK main thread only.
+#[allow(dead_code)]
 pub fn is_correct(word: &str) -> bool {
     with_dict(|dict| dict.check(word).unwrap_or(true)).unwrap_or(true)
 }

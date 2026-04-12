@@ -40,6 +40,7 @@ pub fn save(entries: &[RolodexEntry]) {
     }
 }
 
+#[allow(dead_code)]
 pub fn add(entries: &mut Vec<RolodexEntry>, entry: RolodexEntry) {
     // Build a position index for O(1) deduplication — no scan loop.
     let pos_by_id: std::collections::HashMap<&str, usize> = entries
@@ -54,6 +55,7 @@ pub fn add(entries: &mut Vec<RolodexEntry>, entry: RolodexEntry) {
     save(entries);
 }
 
+#[allow(dead_code)]
 pub fn remove(entries: &mut Vec<RolodexEntry>, user_id: &str) {
     entries.retain(|e| e.user_id != user_id);
     save(entries);

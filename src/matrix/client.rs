@@ -2255,9 +2255,7 @@ async fn start_sync(
     timeline_cache: super::room_cache::RoomCache,
     dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::matrix::MessageInfo>>>>,
 ) {
-    use matrix_sdk::ruma::events::room::message::{
-        MessageType, OriginalSyncRoomMessageEvent,
-    };
+    use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
 
     let _ = event_tx.send(MatrixEvent::SyncStarted).await;
 
@@ -3357,7 +3355,6 @@ async fn extract_messages(
                         tracing::debug!("Skipping redacted message event");
                         continue;
                     }
-                    _ => continue,
                 };
                 let event_id = msg_event.event_id.to_string();
 
@@ -4144,11 +4141,10 @@ async fn handle_fetch_older(
 /// Send a text message to a room.
 async fn handle_send_media(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    _event_tx: &Sender<MatrixEvent>,
     room_id: &str,
     file_path: &str,
 ) {
-    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
     use std::path::Path;
 
     let Ok(room_id) = RoomId::parse(room_id) else { return };
@@ -4272,10 +4268,7 @@ async fn handle_download_media(
             }
         }
     } else {
-        let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
-            tracing::error!("Invalid mxc URL: {mxc_url}");
-            return;
-        };
+        let uri = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url).unwrap();
         matrix_sdk::ruma::events::room::MediaSource::Plain(uri.to_owned())
     };
 
@@ -4384,7 +4377,7 @@ async fn handle_send_message(
     body: &str,
     formatted_body: Option<&str>,
     reply_to: Option<&str>,
-    quote_text: Option<&(String, String)>,
+    _quote_text: Option<&(String, String)>,
     is_emote: bool,
     mentioned_user_ids: &[String],
 ) {
@@ -5548,7 +5541,7 @@ async fn handle_fetch_room_preview(
         use matrix_sdk::deserialized_responses::TimelineEventKind;
         use matrix_sdk::ruma::events::room::message::MessageType;
         use matrix_sdk::ruma::events::{
-            AnyMessageLikeEvent, AnyTimelineEvent,
+            AnyMessageLikeEvent,
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             MessageLikeEvent, SyncMessageLikeEvent,
         };
@@ -5706,10 +5699,7 @@ async fn handle_fetch_avatar(
         return;
     }
 
-    let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
-        tracing::warn!("FetchAvatar: invalid mxc URL: {mxc_url}");
-        return;
-    };
+    let uri = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url).unwrap();
 
     use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
     use matrix_sdk::ruma::UInt;
@@ -5765,10 +5755,7 @@ async fn handle_fetch_room_avatar(
         return;
     }
 
-    let Ok(uri) = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url) else {
-        tracing::warn!("FetchRoomAvatar: invalid mxc URL: {mxc_url}");
-        return;
-    };
+    let uri = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_url).unwrap();
 
     use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
     use matrix_sdk::ruma::UInt;

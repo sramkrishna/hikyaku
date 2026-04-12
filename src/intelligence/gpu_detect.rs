@@ -8,6 +8,7 @@ pub enum GpuVendor {
     Nvidia,
     Amd,
     Intel,
+    #[allow(dead_code)]
     Unknown,
 }
 

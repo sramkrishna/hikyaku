@@ -212,6 +212,7 @@ pub fn set_rolodex(entries: &[String]) {
 }
 
 /// Set pinned rooms directly (avoids a full settings round-trip).
+#[allow(dead_code)]
 pub fn set_pinned_rooms(rooms: &HashSet<String>) {
     let gs = gsettings();
     let pinned: Vec<&str> = rooms.iter().map(|s| s.as_str()).collect();

@@ -14,3 +14,4 @@ docs/
 .cargo/credentials.toml
 src/bin/
 data/gschemas.compiled
+hikyaku-ollama.flatpak

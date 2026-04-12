@@ -75,7 +75,7 @@ impl NotificationManager {
         is_dm: bool,
     ) {
         let imp = self.imp();
-        use gtk::prelude::{WidgetExt, GtkWindowExt};
+        use gtk::prelude::GtkWindowExt;
         use gio::prelude::ApplicationExt;
         let window = imp.window.borrow().as_ref().and_then(|w| w.upgrade());
         let window_active = window.as_ref().map(|w| w.is_active()).unwrap_or(false);
