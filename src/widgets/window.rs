@@ -1422,21 +1422,35 @@ impl MxWindow {
             });
         });
 
-        // DM button — open or create DM with a user.
+        // DM button — confirm before opening or creating a DM.
         let cmd_tx_dm = command_tx.clone();
-        let toast_dm = imp.toast_overlay.clone();
+        let window_weak_dm = window.downgrade();
         imp.message_view.connect_dm(move |user_id| {
+            let Some(win) = window_weak_dm.upgrade() else { return };
+            // Show the localpart (@alice:server → "alice") in the heading.
+            let display = user_id
+                .split(':').next().unwrap_or(&user_id)
+                .trim_start_matches('@');
+            let dialog = adw::AlertDialog::builder()
+                .heading(&format!("Start DM with {display}?"))
+                .body("This will open or create a direct message conversation.")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("start", "Start DM");
+            dialog.set_response_appearance("start", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("cancel"));
             let tx = cmd_tx_dm.clone();
             let uid = user_id.clone();
-            let toast = toast_dm.clone();
-            let t = adw::Toast::builder()
-                .title(&format!("Opening DM with {user_id}..."))
-                .timeout(3)
-                .build();
-            toast.add_toast(t);
-            glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
+            dialog.connect_response(None, move |_, response| {
+                if response == "start" {
+                    let tx2 = tx.clone();
+                    let uid2 = uid.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx2.send(MatrixCommand::CreateDm { user_id: uid2 }).await;
+                    });
+                }
             });
+            dialog.present(Some(&win));
         });
 
         // Typing indicator — send typing notice when user types in the input.
