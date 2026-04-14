@@ -162,10 +162,10 @@ pub struct SpaceDirectoryRoom {
     pub topic: String,
     pub member_count: u64,
     pub already_joined: bool,
-    /// The homeserver that returned this room in its public directory.
-    /// Passed as a `via` hint so federation works even when the room_id's
-    /// original server is no longer in the room.
-    pub via_server: Option<String>,
+    /// Recommended via servers from the space hierarchy API response.
+    /// These are authoritative routing hints — use them for joining, especially
+    /// for rooms with no canonical alias where alias resolution is unavailable.
+    pub via_servers: Vec<String>,
 }
 
 /// A single emoji from SAS verification.
@@ -4577,12 +4577,12 @@ async fn handle_browse_public_rooms(
                     } else {
                         raw_id
                     };
-                    // The via hint must be the room's own server, not the directory server.
-                    // The room's server is in the room_id or canonical_alias.  Fall back to
-                    // the directory server only if neither has a server component.
-                    let via_server = room_id.splitn(2, ':').nth(1).map(|s| s.to_string())
+                    // Build via hints: prefer the room's own server, fall back to
+                    // the alias server, then the directory server as a last resort.
+                    let via_servers: Vec<String> = room_id.splitn(2, ':').nth(1).map(|s| s.to_string())
                         .or_else(|| alias.as_ref().and_then(|a| a.splitn(2, ':').nth(1).map(|s| s.to_string())))
-                        .or_else(|| server.map(|s| s.to_string()));
+                        .or_else(|| server.map(|s| s.to_string()))
+                        .into_iter().collect();
                     SpaceDirectoryRoom {
                         already_joined: joined_rooms.contains(&room_id),
                         room_id,
@@ -4592,7 +4592,7 @@ async fn handle_browse_public_rooms(
                         canonical_alias: alias,
                         topic: r.topic.unwrap_or_default(),
                         member_count: r.num_joined_members.into(),
-                        via_server,
+                        via_servers,
                     }
                 })
                 .collect();
@@ -4626,6 +4626,8 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
     let request = get_hierarchy::v1::Request::new(room_id.to_owned());
     match client.send(request).await {
         Ok(response) => {
+            use matrix_sdk::ruma::events::space::child::HierarchySpaceChildEvent;
+
             let joined_rooms: std::collections::HashSet<String> = client
                 .joined_rooms()
                 .iter()
@@ -4635,6 +4637,28 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
             // Fallback server: use the space's own server for rooms that come
             // back with no server component in their room_id (buggy servers).
             let space_server = room_id.server_name().map(|s| s.to_string());
+
+            // Extract per-room via hints from the space root's children_state.
+            // Each m.space.child event (state_key = child room_id) carries a
+            // `via` list of recommended servers for joining that child room.
+            // This is the authoritative source — especially needed for rooms
+            // that have no canonical alias, where alias resolution is unavailable.
+            let via_map: std::collections::HashMap<String, Vec<String>> = response
+                .rooms
+                .iter()
+                .find(|r| r.room_id == room_id) // space root chunk
+                .map(|space_chunk| {
+                    space_chunk.children_state.iter()
+                        .filter_map(|raw| raw.deserialize().ok())
+                        .map(|ev: HierarchySpaceChildEvent| {
+                            let child_id = ev.state_key.to_string();
+                            let via: Vec<String> = ev.content.via
+                                .iter().map(|s| s.to_string()).collect();
+                            (child_id, via)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let rooms: Vec<SpaceDirectoryRoom> = response
                 .rooms
@@ -4651,8 +4675,14 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
                     } else {
                         raw_rid
                     };
-                    let rid_server = room_id_str.splitn(2, ':').nth(1).map(|s| s.to_string())
-                        .or_else(|| alias.as_ref().and_then(|a| a.splitn(2, ':').nth(1).map(|s| s.to_string())));
+                    // Look up via hints from the space's children_state first;
+                    // fall back to the server embedded in the room_id / alias.
+                    let mut via_servers = via_map.get(&room_id_str).cloned().unwrap_or_default();
+                    if via_servers.is_empty() {
+                        if let Some(srv) = room_id_str.splitn(2, ':').nth(1) {
+                            via_servers.push(srv.to_string());
+                        }
+                    }
                     SpaceDirectoryRoom {
                         already_joined: joined_rooms.contains(&room_id_str),
                         room_id: room_id_str,
@@ -4662,7 +4692,7 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
                         canonical_alias: alias,
                         topic: r.topic.unwrap_or_default(),
                         member_count: r.num_joined_members.into(),
-                        via_server: rid_server,
+                        via_servers,
                     }
                 })
                 .collect();

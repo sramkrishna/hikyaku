@@ -4004,8 +4004,7 @@ impl MxWindow {
                 // federation servers, avoiding "no known servers" errors.
                 let room_id_or_alias = room.canonical_alias.clone()
                     .unwrap_or_else(|| room.room_id.clone());
-                let mut room_via: Vec<String> = Vec::new();
-                if let Some(v) = &room.via_server { room_via.push(v.clone()); }
+                let room_via: Vec<String> = room.via_servers.clone();
                 // Capture space context for joined-space-then-room.
                 let space_join: Option<(String, Vec<String>)> = space_context.map(|(sid, svia)| {
                     (sid.to_string(), svia.to_vec())
@@ -4403,7 +4402,7 @@ impl MxWindow {
             // Only add unjoined spaces here — joined ones are shown at open time.
             if space.already_joined { continue; }
 
-            let space_via: Vec<String> = space.via_server.iter().cloned().collect();
+            let space_via: Vec<String> = space.via_servers.clone();
             let space_id_or_alias = space.canonical_alias.clone()
                 .unwrap_or_else(|| space.room_id.clone());
 
