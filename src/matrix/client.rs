@@ -4742,34 +4742,48 @@ async fn handle_join_room(
 
     tracing::warn!("Joining '{}' via {:?}", room_id_or_alias, via);
 
-    match client.join_room_by_id_or_alias(&id, &via).await {
-        Ok(room) => {
-            let room_id = room.room_id().to_string();
-            // display_name() fetches from server if not yet cached — use it
-            // so the toast shows the human-readable name, not the room ID.
-            let room_name = room
-                .display_name()
-                .await
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| {
-                    room.cached_display_name()
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| room_id_or_alias.to_string())
-                });
-            tracing::info!("Joined room: {room_name} ({room_id})");
+    let join_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.join_room_by_id_or_alias(&id, &via),
+    ).await;
+
+    let room = match join_result {
+        Err(_elapsed) => {
+            tracing::error!("Joining {room_id_or_alias} timed out after 30s");
             let _ = event_tx
-                .send(MatrixEvent::RoomJoined { room_id, room_name })
+                .send(MatrixEvent::JoinFailed {
+                    error: "Join timed out — the server did not respond in 30 seconds. \
+                            The room may have a federation issue.".to_string(),
+                })
                 .await;
+            return;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("Failed to join {room_id_or_alias}: {e}");
             let _ = event_tx
                 .send(MatrixEvent::JoinFailed {
                     error: e.to_string(),
                 })
                 .await;
+            return;
         }
-    }
+        Ok(Ok(room)) => room,
+    };
+
+    let room_id = room.room_id().to_string();
+    let room_name = room
+        .display_name()
+        .await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| {
+            room.cached_display_name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| room_id_or_alias.to_string())
+        });
+    tracing::info!("Joined room: {room_name} ({room_id})");
+    let _ = event_tx
+        .send(MatrixEvent::RoomJoined { room_id, room_name })
+        .await;
 }
 
 async fn handle_invite_user(
