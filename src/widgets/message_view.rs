@@ -2099,18 +2099,52 @@ impl MessageView {
 
     /// Prepend older messages at the top (pagination).
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
+        const MAX_STORE_SIZE: u32 = 400;
         let imp = self.imp();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
         imp.list_store().splice(0, 0, &objs);
         // Add new objects to the event_index.
-        let mut idx = imp.event_index.borrow_mut();
-        for obj in &objs {
-            let eid = obj.event_id();
-            if !eid.is_empty() {
-                idx.insert(eid, obj.clone());
+        {
+            let mut idx = imp.event_index.borrow_mut();
+            for obj in &objs {
+                let eid = obj.event_id();
+                if !eid.is_empty() {
+                    idx.insert(eid, obj.clone());
+                }
             }
         }
-        drop(idx);
+        // Cap the store at MAX_STORE_SIZE to keep GTK height-tracking bounded.
+        // Items at the tail (high indices = newest messages) are evicted first
+        // when the user loads deep history via prepend.
+        // IMPORTANT: never evict unconfirmed echoes (empty event_id) — they are
+        // in-flight messages the user sent, and evicting them would cause the message
+        // to vanish and then reappear at a different position when the server confirms it.
+        let store = imp.list_store();
+        let n = store.n_items();
+        if n > MAX_STORE_SIZE {
+            // Scan forward from MAX_STORE_SIZE; stop before the first echo.
+            let mut evict_end = MAX_STORE_SIZE;
+            while evict_end < n {
+                let is_echo = store.item(evict_end)
+                    .and_downcast::<MessageObject>()
+                    .map(|o| o.event_id().is_empty())
+                    .unwrap_or(false);
+                if is_echo { break; }
+                evict_end += 1;
+            }
+            let remove_count = evict_end - MAX_STORE_SIZE;
+            if remove_count > 0 {
+                {
+                    let mut idx = imp.event_index.borrow_mut();
+                    for i in MAX_STORE_SIZE..evict_end {
+                        if let Some(obj) = store.item(i).and_downcast::<MessageObject>() {
+                            idx.remove(&obj.event_id());
+                        }
+                    }
+                }
+                store.splice(MAX_STORE_SIZE, remove_count, &[] as &[MessageObject]);
+            }
+        }
         imp.prev_batch_token.replace(prev_batch);
         imp.fetching_older.set(false);
     }
@@ -2667,6 +2701,11 @@ impl MessageView {
     /// `mark_as_new` tints the row blue and adds it to `new_message_objs` so
     /// `remove_dividers` can clear the tint when the user reads the room.
     pub fn append_message(&self, msg: &crate::matrix::MessageInfo, mark_as_new: bool) {
+        // Dedup: if the event is already displayed (e.g. sync reconnect re-delivers it),
+        // skip silently rather than appending a duplicate row.
+        if !msg.event_id.is_empty() && self.imp().event_index.borrow().contains_key(&msg.event_id) {
+            return;
+        }
         let obj = Self::info_to_obj(msg);
         let eid = obj.event_id();
         if !eid.is_empty() {
@@ -2870,6 +2909,49 @@ pub(crate) fn divider_should_mark(sender_id: &str, my_id: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn is_echo_duplicate(pending_echo_bodies: &[&str], incoming_body: &str) -> bool {
     pending_echo_bodies.contains(&incoming_body)
+}
+
+/// Pure helper: should `append_message` skip adding this event because it is
+/// already displayed?  Mirrors the dedup guard at the top of `append_message`.
+///
+/// Returns `true` (skip) when:
+///   - `event_id` is non-empty (i.e. not a local echo), AND
+///   - the event is already in the timeline's event_index.
+///
+/// Local echoes (empty event_id) always pass through so they can be appended
+/// as optimistic placeholders before the server assigns a real ID.
+#[cfg(test)]
+pub(crate) fn should_skip_append(event_id: &str, in_index: bool) -> bool {
+    !event_id.is_empty() && in_index
+}
+
+/// Pure helper: given a slice of event_ids (ordered oldest→newest, matching
+/// list_store indices) and a `max_size` cap, return the exclusive upper bound
+/// of the range that should be evicted: [max_size, boundary).
+///
+/// Items at index ≥ max_size are candidates for eviction, but we stop before
+/// the first item whose event_id is empty — that is an unconfirmed echo that
+/// must not be removed from the timeline.
+///
+/// Returns `max_size` (evict nothing) when:
+///   - n ≤ max_size (no overflow), or
+///   - the first overflow item is already an echo.
+///
+/// Returns `n` when no echo exists in the overflow range (evict all overflow).
+#[cfg(test)]
+pub(crate) fn compute_eviction_boundary(event_ids: &[&str], max_size: usize) -> usize {
+    let n = event_ids.len();
+    if n <= max_size {
+        return max_size; // nothing to evict
+    }
+    let mut boundary = max_size;
+    while boundary < n {
+        if event_ids[boundary].is_empty() {
+            break; // stop before echo
+        }
+        boundary += 1;
+    }
+    boundary
 }
 
 /// Pure helper: should the "Updating messages" banner be shown?
@@ -3560,6 +3642,80 @@ mod tests {
         // Multiple echoes in flight — only the matching one is a dupe.
         assert!(is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg2"));
         assert!(!is_echo_duplicate(&["msg1", "msg2", "msg3"], "msg4"));
+    }
+
+    // ── should_skip_append ──────────────────────────────────────────────────
+    // Guards the dedup check in append_message: a confirmed event that is
+    // already in the timeline must not produce a duplicate row.
+
+    use super::{compute_eviction_boundary, should_skip_append};
+
+    #[test]
+    fn skip_append_confirmed_already_in_index() {
+        // A confirmed server event (non-empty eid) that is already displayed
+        // must be skipped to avoid a double-post.
+        assert!(should_skip_append("$ev1", true));
+    }
+
+    #[test]
+    fn no_skip_confirmed_not_in_index() {
+        // A new confirmed event not yet displayed should be added.
+        assert!(!should_skip_append("$ev1", false));
+    }
+
+    #[test]
+    fn no_skip_local_echo() {
+        // Local echoes have an empty event_id — must never be skipped so the
+        // optimistic placeholder appears immediately after the user sends.
+        assert!(!should_skip_append("", true));
+        assert!(!should_skip_append("", false));
+    }
+
+    // ── compute_eviction_boundary ───────────────────────────────────────────
+    // Guards the tail-eviction logic in prepend_messages: in-flight echoes
+    // (empty event_id) must survive the cap so they are never silently removed
+    // and then re-inserted at a different sorted position.
+
+    #[test]
+    fn eviction_boundary_no_overflow() {
+        // Store has fewer items than the cap — nothing to evict.
+        let ids = ["$a", "$b", "$c"];
+        assert_eq!(compute_eviction_boundary(&ids, 10), 10);
+    }
+
+    #[test]
+    fn eviction_boundary_no_echo_evict_all_overflow() {
+        // 5 items, cap=3, none are echoes — evict indices 3 and 4.
+        let ids = ["$a", "$b", "$c", "$d", "$e"];
+        assert_eq!(compute_eviction_boundary(&ids, 3), 5);
+    }
+
+    #[test]
+    fn eviction_boundary_echo_at_cap_evict_nothing() {
+        // Echo sits exactly at the cap boundary — evict nothing.
+        let ids = ["$a", "$b", "$c", "", "$e"];
+        assert_eq!(compute_eviction_boundary(&ids, 3), 3);
+    }
+
+    #[test]
+    fn eviction_boundary_echo_past_cap_partial_evict() {
+        // Echo at index 5, cap=3 — evict only indices 3 and 4.
+        let ids = ["$a", "$b", "$c", "$d", "$e", "", "$g"];
+        assert_eq!(compute_eviction_boundary(&ids, 3), 5);
+    }
+
+    #[test]
+    fn eviction_boundary_multiple_echoes_stops_at_first() {
+        // Two echoes: one at index 4, one at index 6.  Stop at the first.
+        let ids = ["$a", "$b", "$c", "$d", "", "$f", ""];
+        assert_eq!(compute_eviction_boundary(&ids, 3), 4);
+    }
+
+    #[test]
+    fn eviction_boundary_exact_cap_size_no_overflow() {
+        // Store exactly at the cap — no overflow, nothing to evict.
+        let ids = ["$a", "$b", "$c"];
+        assert_eq!(compute_eviction_boundary(&ids, 3), 3);
     }
 
     // ── sorted_insert_pos_in ────────────────────────────────────────────────
