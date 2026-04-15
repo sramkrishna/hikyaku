@@ -1649,10 +1649,40 @@ impl MxWindow {
 
         let window_weak = window.downgrade();
         glib::spawn_future_local(async move {
+            // Count events processed since the last explicit GLib yield.
+            // When the channel has a backlog (e.g. dozens of sync events queued
+            // while the window was unfocused), recv().await returns immediately
+            // each time, so this loop runs in a tight async spin without ever
+            // letting GLib flush pending GDK input events.  yield_now() every
+            // N events re-queues this future so GLib can service input (pointer,
+            // keyboard, focus events) before we process the next batch — which
+            // eliminates the "app feels frozen for a moment after alt-tab" symptom.
+            let mut n_since_yield: u32 = 0;
             while let Ok(event) = event_rx.recv().await {
                 let Some(window) = window_weak.upgrade() else {
                     break;
                 };
+                n_since_yield += 1;
+                if n_since_yield >= 8 {
+                    n_since_yield = 0;
+                    // Return Pending once so GLib can flush pending input before
+                    // the next batch.  Waking immediately re-queues this future
+                    // as an idle, giving other GLib sources one main-loop turn.
+                    let mut yielded = false;
+                    futures_util::future::poll_fn(|cx| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    // Re-check window after yield — it could have been destroyed
+                    // while GLib was running other callbacks.
+                    if window_weak.upgrade().is_none() { break; }
+                }
                 match event {
                     MatrixEvent::LoginRequired => {
                         if crate::config::gsettings().boolean("first-start") {
