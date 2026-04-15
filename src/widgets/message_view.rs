@@ -346,7 +346,7 @@ mod imp {
         /// keep in memory.  When exceeded the oldest room is evicted — its GTK widgets
         /// are removed from room_stack and dropped, freeing the ~20 pool-slot MessageRow
         /// widgets (each backed by a heavy selectable GtkLabel / GtkTextView).
-        const MAX_CACHED_ROOMS: usize = 25;
+        const MAX_CACHED_ROOMS: usize = 50;
 
         /// Get or create the per-room (scrolled_window, list_view, list_store) triple.
         /// On first call for a given room_id, creates a new ListView with the shared
@@ -361,6 +361,15 @@ mod imp {
             obj: &super::MessageView,
         ) -> (gtk::ScrolledWindow, gtk::ListView, gio::ListStore) {
             if let Some(entry) = self.room_view_cache.borrow().get(room_id) {
+                // Update LRU access order: move this room to the back so it
+                // is the LAST to be evicted.  Without this, the order is
+                // insertion-only and frequently-visited rooms can be evicted
+                // as early as rooms never revisited.
+                {
+                    let mut order = self.room_view_order.borrow_mut();
+                    order.retain(|rid| rid != room_id);
+                    order.push_back(room_id.to_string());
+                }
                 return entry.clone();
             }
 

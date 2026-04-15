@@ -5,7 +5,7 @@
 // sent to the Matrix server.
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct BookmarkEntry {
@@ -20,6 +20,9 @@ pub struct BookmarkEntry {
 
 pub struct BookmarkStore {
     path: PathBuf,
+    /// In-memory cache — avoids synchronous file reads on the GTK thread.
+    /// None until first load; afterwards always reflects disk state.
+    cache: RwLock<Option<Vec<BookmarkEntry>>>,
 }
 
 impl BookmarkStore {
@@ -28,17 +31,36 @@ impl BookmarkStore {
         path.push("hikyaku");
         let _ = std::fs::create_dir_all(&path);
         path.push("bookmarks.json");
-        Self { path }
+        Self { path, cache: RwLock::new(None) }
     }
 
+    /// Load all bookmarks.  First call reads from disk; subsequent calls return
+    /// the in-memory cache (O(1) — no file I/O on the GTK thread).
     pub fn load(&self) -> Vec<BookmarkEntry> {
-        let Ok(data) = std::fs::read(&self.path) else { return Vec::new() };
-        serde_json::from_slice(&data).unwrap_or_default()
+        // Fast path: cache populated.
+        if let Ok(guard) = self.cache.read() {
+            if let Some(ref entries) = *guard {
+                return entries.clone();
+            }
+        }
+        // Slow path: read from disk and populate the cache.
+        let entries: Vec<BookmarkEntry> = std::fs::read(&self.path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default();
+        if let Ok(mut guard) = self.cache.write() {
+            *guard = Some(entries.clone());
+        }
+        entries
     }
 
     fn persist(&self, entries: &[BookmarkEntry]) {
         if let Ok(data) = serde_json::to_vec_pretty(entries) {
             let _ = std::fs::write(&self.path, data);
+        }
+        // Update in-memory cache to match.
+        if let Ok(mut guard) = self.cache.write() {
+            *guard = Some(entries.to_vec());
         }
     }
 
