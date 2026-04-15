@@ -1827,12 +1827,12 @@ impl MxWindow {
                                 // while the window is unfocused, only the last batch fires
                                 // set_messages() — not all 10 (which would each take 300-
                                 // 1000 ms, causing a multi-second freeze on return).
-                                let had_pending = {
-                                    let mut slot = window.imp().pending_bg_refresh.borrow_mut();
-                                    let had = slot.contains_key(&room_id);
-                                    slot.insert(room_id.clone(), (messages, prev_batch_token));
-                                    had
-                                };
+                                let had_pending = bg_refresh_insert(
+                                    &mut window.imp().pending_bg_refresh.borrow_mut(),
+                                    &room_id,
+                                    messages,
+                                    prev_batch_token,
+                                );
                                 if !had_pending {
                                     let mv = message_view.clone();
                                     let weak_win = window.downgrade();
@@ -6800,6 +6800,30 @@ fn parse_matrix_link_or_id(text: &str) -> Option<String> {
     None
 }
 
+// ── bg_refresh coalescing helpers ────────────────────────────────────────────
+
+/// Insert or replace the pending batch for `room_id`.
+///
+/// Returns `true` if this is the FIRST entry for the room (the caller should
+/// schedule exactly one `idle_add_local_once`).  Returns `false` when an entry
+/// already existed — the idle is already in flight and will consume the updated
+/// batch when it fires, so no second idle is needed.
+///
+/// This is the core of the freeze fix: when 10 bg_refresh events arrive while
+/// the window is unfocused, only the first call schedules an idle and all 10
+/// calls update the slot with the latest data.  The idle fires once and calls
+/// `set_messages()` exactly once with the most recent batch.
+fn bg_refresh_insert(
+    map: &mut std::collections::HashMap<String, (Vec<crate::matrix::MessageInfo>, Option<String>)>,
+    room_id: &str,
+    messages: Vec<crate::matrix::MessageInfo>,
+    token: Option<String>,
+) -> bool {
+    let had = map.contains_key(room_id);
+    map.insert(room_id.to_owned(), (messages, token));
+    had
+}
+
 /// Minimal percent-decode for %21 and %23 (common in matrix.to links).
 fn percent_decode_simple(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -6820,4 +6844,147 @@ fn percent_decode_simple(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bg_refresh_insert;
+    use crate::matrix::MessageInfo;
+    use std::collections::HashMap;
+
+    fn make_msg(event_id: &str) -> MessageInfo {
+        MessageInfo {
+            sender: "Alice".into(),
+            sender_id: "@alice:example.com".into(),
+            body: "hi".into(),
+            formatted_body: None,
+            timestamp: 1_000,
+            event_id: event_id.into(),
+            reply_to: None,
+            reply_to_sender: None,
+            thread_root: None,
+            reactions: vec![],
+            media: None,
+            is_highlight: false,
+            is_system_event: false,
+        }
+    }
+
+    fn batch(ids: &[&str]) -> Vec<MessageInfo> {
+        ids.iter().map(|id| make_msg(id)).collect()
+    }
+
+    // ── Core scheduling invariant ─────────────────────────────────────────────
+
+    #[test]
+    fn first_insert_returns_false_meaning_schedule_idle() {
+        // had = false → !had_pending → idle is scheduled
+        let mut map = HashMap::new();
+        let had = bg_refresh_insert(&mut map, "!room:example.com", batch(&["$ev1"]), None);
+        assert!(!had, "first insert should signal that idle must be scheduled");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn second_insert_returns_true_meaning_no_new_idle() {
+        // had = true → idle already in flight, caller must NOT schedule another
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!room:example.com", batch(&["$ev1"]), None);
+        let had = bg_refresh_insert(&mut map, "!room:example.com", batch(&["$ev2"]), None);
+        assert!(had, "second insert should signal idle already scheduled");
+    }
+
+    // ── Latest-data-wins ─────────────────────────────────────────────────────
+
+    #[test]
+    fn latest_batch_replaces_earlier_one() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!room:example.com", batch(&["$ev1"]), None);
+        bg_refresh_insert(
+            &mut map,
+            "!room:example.com",
+            batch(&["$ev1", "$ev2", "$ev3"]),
+            Some("tok_abc".into()),
+        );
+        let (msgs, token) = map.remove("!room:example.com").unwrap();
+        assert_eq!(msgs.len(), 3, "map must hold the latest (largest) batch");
+        assert_eq!(token.as_deref(), Some("tok_abc"));
+    }
+
+    #[test]
+    fn token_updated_on_second_insert() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!r:s", batch(&["$a"]), Some("old_tok".into()));
+        bg_refresh_insert(&mut map, "!r:s", batch(&["$b"]), Some("new_tok".into()));
+        let (_, token) = map.remove("!r:s").unwrap();
+        assert_eq!(token.as_deref(), Some("new_tok"));
+    }
+
+    // ── Room isolation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn different_rooms_tracked_independently() {
+        let mut map = HashMap::new();
+        // First events for two distinct rooms — both should say "schedule idle".
+        let had_a = bg_refresh_insert(&mut map, "!room_a:example.com", batch(&["$a1"]), None);
+        let had_b = bg_refresh_insert(&mut map, "!room_b:example.com", batch(&["$b1"]), None);
+        assert!(!had_a, "room_a first insert should schedule idle");
+        assert!(!had_b, "room_b first insert should schedule idle (independent)");
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn room_a_second_insert_does_not_affect_room_b_schedule() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!room_a:s", batch(&["$a1"]), None);
+        bg_refresh_insert(&mut map, "!room_b:s", batch(&["$b1"]), None);
+        // Second event for room_a — should return true (idle already pending for a).
+        let had_a2 = bg_refresh_insert(&mut map, "!room_a:s", batch(&["$a2"]), None);
+        // Second event for room_b — should also return true independently.
+        let had_b2 = bg_refresh_insert(&mut map, "!room_b:s", batch(&["$b2"]), None);
+        assert!(had_a2);
+        assert!(had_b2);
+        // Latest batches are correct for each room.
+        assert_eq!(map["!room_a:s"].0[0].event_id, "$a2");
+        assert_eq!(map["!room_b:s"].0[0].event_id, "$b2");
+    }
+
+    // ── After idle fires (remove), next insert re-schedules ──────────────────
+
+    #[test]
+    fn after_remove_next_insert_schedules_idle_again() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!r:s", batch(&["$ev1"]), None);
+        // Simulate idle firing: it removes the entry.
+        map.remove("!r:s");
+        // New bg_refresh event arrives — must schedule a fresh idle.
+        let had = bg_refresh_insert(&mut map, "!r:s", batch(&["$ev2"]), None);
+        assert!(!had, "after idle consumed the entry, next insert must schedule a new idle");
+    }
+
+    // ── retain on room switch ────────────────────────────────────────────────
+
+    #[test]
+    fn retain_clears_other_rooms_keeps_current() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!current:s", batch(&["$c1"]), None);
+        bg_refresh_insert(&mut map, "!other_a:s", batch(&["$a1"]), None);
+        bg_refresh_insert(&mut map, "!other_b:s", batch(&["$b1"]), None);
+        // Simulate the room-switch retain call.
+        map.retain(|rid, _| rid == "!current:s");
+        assert!(map.contains_key("!current:s"), "current room entry must survive retain");
+        assert!(!map.contains_key("!other_a:s"), "stale room_a entry must be dropped");
+        assert!(!map.contains_key("!other_b:s"), "stale room_b entry must be dropped");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn retain_clears_all_when_no_room_matches() {
+        let mut map = HashMap::new();
+        bg_refresh_insert(&mut map, "!a:s", batch(&["$1"]), None);
+        bg_refresh_insert(&mut map, "!b:s", batch(&["$2"]), None);
+        // Switch to a room for which no bg_refresh is pending.
+        map.retain(|rid, _| rid == "!new_room:s");
+        assert!(map.is_empty());
+    }
 }
