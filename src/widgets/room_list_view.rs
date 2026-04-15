@@ -166,6 +166,9 @@ mod imp {
         /// change this signature stays the same and we skip the expensive
         /// group_and_sort_rooms + ListStore rebuilds entirely.
         pub last_structural_sig: RefCell<Vec<(String, u64, bool, bool, bool)>>,
+        /// True while a debounced rebuild_stores is already queued via idle_add.
+        /// Prevents N messages arriving in a burst from triggering N rebuilds.
+        pub bump_rebuild_pending: std::cell::Cell<bool>,
         /// Search bar — toggled by the header magnifier button.
         pub search_bar: gtk::SearchBar,
         pub search_entry: gtk::SearchEntry,
@@ -358,6 +361,7 @@ mod imp {
                 last_space_order: RefCell::new(Vec::new()),
                 last_structural_sig: RefCell::new(Vec::new()),
                 prev_server_counts: RefCell::new(std::collections::HashMap::new()),
+                bump_rebuild_pending: std::cell::Cell::new(false),
                 search_bar,
                 search_entry,
                 search_store,
@@ -1025,10 +1029,25 @@ impl RoomListView {
             }
         }
         if !found { return; } // room not yet in list; next RoomListUpdated will place it
-        imp.cached_rooms.replace(cached.clone());
+        imp.cached_rooms.replace(cached);
         // Force rebuild_stores to re-run by clearing the structural signature.
         imp.last_structural_sig.borrow_mut().clear();
-        self.rebuild_stores(&cached);
+
+        // Debounce: if a rebuild is already scheduled for this frame, skip.
+        // A burst of N NewMessage events (e.g. after reconnect from idle) would
+        // otherwise call rebuild_stores N times synchronously on the GTK thread.
+        if imp.bump_rebuild_pending.get() {
+            return;
+        }
+        imp.bump_rebuild_pending.set(true);
+        let view_weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            let Some(view) = view_weak.upgrade() else { return };
+            let imp = view.imp();
+            imp.bump_rebuild_pending.set(false);
+            let cached = imp.cached_rooms.borrow().clone();
+            view.rebuild_stores(&cached);
+        });
     }
 
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
