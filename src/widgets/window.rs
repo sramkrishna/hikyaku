@@ -2344,12 +2344,39 @@ impl MxWindow {
                         toast_error(&toast_overlay, "Failed to leave", &error);
                     }
                     MatrixEvent::RoomInvited { room_id, room_name, inviter_name } => {
-                        // Desktop notification.
-                        window.imp().notification_manager.push(
-                            &room_id, &room_name, &inviter_name,
-                            &format!("invited you to {room_name}"),
-                            false,
+                        // Desktop notification only when window is unfocused —
+                        // bypass notification_manager.push() to avoid the "Jump" banner.
+                        {
+                            use gtk::prelude::GtkWindowExt;
+                            use gio::prelude::ApplicationExt;
+                            let win_ref: Option<gtk::Window> = window.clone().upcast_ref::<gtk::Window>().downgrade().upgrade();
+                            let is_active = win_ref.as_ref().map(|w| w.is_active()).unwrap_or(false);
+                            if !is_active {
+                                let app: Option<gtk::Application> = win_ref.as_ref().and_then(|w| GtkWindowExt::application(w));
+                                if let Some(app) = app {
+                                    let notif = gio::Notification::new(&format!("Invite from {inviter_name}"));
+                                    notif.set_body(Some(&format!("{inviter_name} invited you to {room_name}")));
+                                    notif.set_priority(gio::NotificationPriority::High);
+                                    notif.set_default_action_and_target_value(
+                                        "app.open-room",
+                                        Some(&glib::Variant::from(room_id.as_str())),
+                                    );
+                                    app.send_notification(Some(&format!("invite-{room_id}")), &notif);
+                                }
+                            }
+                        }
+
+                        // Store in bell log so the user can act on it later.
+                        let invite_event_id = format!("__invite__{room_id}");
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        window.push_notification(
+                            &room_id, &invite_event_id, &inviter_name,
+                            &room_name, &format!("invited you to {room_name}"), ts,
                         );
+
                         // In-app toast with Accept button.
                         let accept_tx = window.imp().command_tx.get().unwrap().clone();
                         let accept_room_id = room_id.clone();
@@ -3443,6 +3470,8 @@ impl MxWindow {
 
     /// Build a single ListBoxRow for a NotificationObject.
     fn build_notif_row(&self, notif: &crate::models::NotificationObject) -> gtk::ListBoxRow {
+        let is_invite = notif.event_id().starts_with("__invite__");
+
         let row_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .margin_start(8).margin_end(8)
@@ -3489,9 +3518,82 @@ impl MxWindow {
         row_box.append(&header);
         row_box.append(&preview_lbl);
 
+        // Invite rows get Accept / Decline buttons; other rows navigate on click.
+        if is_invite {
+            let btn_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .halign(gtk::Align::Start)
+                .spacing(6)
+                .margin_top(4)
+                .build();
+
+            let accept_btn = gtk::Button::builder()
+                .label("Accept")
+                .css_classes(["suggested-action", "pill"])
+                .build();
+            let decline_btn = gtk::Button::builder()
+                .label("Decline")
+                .css_classes(["destructive-action", "pill"])
+                .build();
+
+            btn_box.append(&accept_btn);
+            btn_box.append(&decline_btn);
+            row_box.append(&btn_box);
+
+            // Accept
+            let room_id = notif.room_id();
+            let tx_accept = self.imp().command_tx.get().unwrap().clone();
+            let notif_accept = notif.clone();
+            let window_weak_accept = self.downgrade();
+            accept_btn.connect_clicked(move |_| {
+                let rid = room_id.clone();
+                let tx = tx_accept.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(crate::matrix::MatrixCommand::AcceptInvite { room_id: rid }).await;
+                });
+                notif_accept.set_is_read(true);
+                if let Some(w) = window_weak_accept.upgrade() {
+                    let imp = w.imp();
+                    let cur = imp.notif_unread_count.get().saturating_sub(1);
+                    imp.notif_unread_count.set(cur);
+                    if let Some(badge) = imp.notif_badge.get() {
+                        if cur == 0 { badge.set_visible(false); } else { badge.set_label(&cur.to_string()); }
+                    }
+                    if let Some(btn) = imp.notif_bell_button.get() {
+                        if imp.notif_unread_count.get() == 0 { btn.remove_css_class("notif-bell-unread"); }
+                    }
+                }
+            });
+
+            // Decline
+            let room_id2 = notif.room_id();
+            let tx_decline = self.imp().command_tx.get().unwrap().clone();
+            let notif_decline = notif.clone();
+            let window_weak_decline = self.downgrade();
+            decline_btn.connect_clicked(move |_| {
+                let rid = room_id2.clone();
+                let tx = tx_decline.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(crate::matrix::MatrixCommand::DeclineInvite { room_id: rid }).await;
+                });
+                notif_decline.set_is_read(true);
+                if let Some(w) = window_weak_decline.upgrade() {
+                    let imp = w.imp();
+                    let cur = imp.notif_unread_count.get().saturating_sub(1);
+                    imp.notif_unread_count.set(cur);
+                    if let Some(badge) = imp.notif_badge.get() {
+                        if cur == 0 { badge.set_visible(false); } else { badge.set_label(&cur.to_string()); }
+                    }
+                    if let Some(btn) = imp.notif_bell_button.get() {
+                        if imp.notif_unread_count.get() == 0 { btn.remove_css_class("notif-bell-unread"); }
+                    }
+                }
+            });
+        }
+
         let row = gtk::ListBoxRow::builder()
             .child(&row_box)
-            .activatable(true)
+            .activatable(!is_invite)
             .build();
 
         // Unread styling: add CSS class, remove when is_read fires.
@@ -3507,51 +3609,53 @@ impl MxWindow {
             }
         });
 
-        // Clicking: mark read, navigate to room + event, close sidebar.
-        let notif_clone = notif.clone();
-        let window_weak = self.downgrade();
-        row.connect_activate(move |_row| {
-            let Some(window) = window_weak.upgrade() else { return };
-            let imp = window.imp();
+        if !is_invite {
+            // Clicking: mark read, navigate to room + event, close sidebar.
+            let notif_clone = notif.clone();
+            let window_weak = self.downgrade();
+            row.connect_activate(move |_row| {
+                let Some(window) = window_weak.upgrade() else { return };
+                let imp = window.imp();
 
-            // Mark as read and update badge count.
-            if !notif_clone.is_read() {
-                notif_clone.set_is_read(true);
-                let cur = imp.notif_unread_count.get().saturating_sub(1);
-                imp.notif_unread_count.set(cur);
-                if let Some(badge) = imp.notif_badge.get() {
-                    if cur == 0 {
-                        badge.set_visible(false);
-                        if let Some(btn) = imp.notif_bell_button.get() {
-                            btn.remove_css_class("notif-bell-unread");
+                // Mark as read and update badge count.
+                if !notif_clone.is_read() {
+                    notif_clone.set_is_read(true);
+                    let cur = imp.notif_unread_count.get().saturating_sub(1);
+                    imp.notif_unread_count.set(cur);
+                    if let Some(badge) = imp.notif_badge.get() {
+                        if cur == 0 {
+                            badge.set_visible(false);
+                            if let Some(btn) = imp.notif_bell_button.get() {
+                                btn.remove_css_class("notif-bell-unread");
+                            }
+                        } else {
+                            badge.set_label(&cur.to_string());
                         }
-                    } else {
-                        badge.set_label(&cur.to_string());
                     }
                 }
-            }
 
-            // Store event_id to flash after the room messages load.
-            imp.pending_flash_event_id.replace(Some(notif_clone.event_id()));
+                // Store event_id to flash after the room messages load.
+                imp.pending_flash_event_id.replace(Some(notif_clone.event_id()));
 
-            // Navigate to room (same pattern as bookmark navigation).
-            let room_id = notif_clone.room_id();
-            imp.room_list_view.navigate_to_room_context(&room_id);
-            let name = {
-                let reg = imp.room_list_view.imp().room_registry.borrow();
-                reg.get(&room_id).map(|o| o.name()).unwrap_or_else(|| notif_clone.room_name())
-            };
-            if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
-                cb(room_id, name);
-            }
+                // Navigate to room (same pattern as bookmark navigation).
+                let room_id = notif_clone.room_id();
+                imp.room_list_view.navigate_to_room_context(&room_id);
+                let name = {
+                    let reg = imp.room_list_view.imp().room_registry.borrow();
+                    reg.get(&room_id).map(|o| o.name()).unwrap_or_else(|| notif_clone.room_name())
+                };
+                if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
+                    cb(room_id, name);
+                }
 
-            // Close the notification sidebar.
-            if let Some(btn) = imp.notif_bell_button.get() {
-                btn.set_active(false);
-            }
-            imp.notif_revealer.set_reveal_child(false);
-            imp.notif_revealer.set_visible(false);
-        });
+                // Close the notification sidebar.
+                if let Some(btn) = imp.notif_bell_button.get() {
+                    btn.set_active(false);
+                }
+                imp.notif_revealer.set_reveal_child(false);
+                imp.notif_revealer.set_visible(false);
+            });
+        }
 
         row
     }
