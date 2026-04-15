@@ -3964,15 +3964,18 @@ impl MxWindow {
         }
         join_buttons.retain(|k, _| rooms.iter().any(|r| &r.room_id == k));
 
-        // If space not yet joined, show a dim banner at top.
-        if space_context.is_some() {
-            let banner_row = adw::ActionRow::builder()
-                .title("Joining a room will also join this space")
-                .css_classes(["dim-label"])
-                .activatable(false)
-                .build();
-            list_box.append(&banner_row);
-        }
+        // Always show a header clarifying these are rooms inside the space.
+        let header_text = if space_context.is_some() {
+            "These are individual rooms inside the space. Joining a room will also join the space."
+        } else {
+            "Individual rooms inside this space — join each one separately."
+        };
+        let banner_row = adw::ActionRow::builder()
+            .title(header_text)
+            .css_classes(["dim-label"])
+            .activatable(false)
+            .build();
+        list_box.append(&banner_row);
 
         for room in rooms {
             let safe_name = glib::markup_escape_text(&room.name);
@@ -4346,8 +4349,36 @@ impl MxWindow {
     ) {
         let expander = adw::ExpanderRow::builder()
             .title(space_name)
-            .subtitle(if space_joined { "Joined" } else { "Not joined" })
+            .subtitle(if space_joined { "Joined" } else { "Expand to browse rooms" })
             .build();
+
+        // For unjoined spaces: add a "Join Space" button on the expander row itself
+        // so the user can join the space independently (needed for restricted rooms).
+        if !space_joined {
+            if let Some((space_id_or_alias, space_via)) = space_join_ctx.clone() {
+                let join_space_btn = gtk::Button::builder()
+                    .label("Join Space")
+                    .css_classes(["suggested-action"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Join this space (required for member-only rooms)")
+                    .build();
+                let tx_js = tx.clone();
+                join_space_btn.connect_clicked(move |btn| {
+                    btn.set_sensitive(false);
+                    btn.set_label("Joining…");
+                    let tx2 = tx_js.clone();
+                    let roa = space_id_or_alias.clone();
+                    let via = space_via.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx2.send(MatrixCommand::JoinRoom {
+                            room_id_or_alias: roa,
+                            via_servers: via,
+                        }).await;
+                    });
+                });
+                expander.add_action(&join_space_btn);
+            }
+        }
 
         let inner_lb = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)

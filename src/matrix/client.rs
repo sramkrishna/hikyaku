@@ -4677,10 +4677,17 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
                     };
                     // Look up via hints from the space's children_state first;
                     // fall back to the server embedded in the room_id / alias.
+                    // Always include the space's own server as an additional hint —
+                    // for restricted rooms, the space server can vouch for membership.
                     let mut via_servers = via_map.get(&room_id_str).cloned().unwrap_or_default();
-                    if via_servers.is_empty() {
-                        if let Some(srv) = room_id_str.splitn(2, ':').nth(1) {
+                    if let Some(srv) = room_id_str.splitn(2, ':').nth(1) {
+                        if !via_servers.contains(&srv.to_string()) {
                             via_servers.push(srv.to_string());
+                        }
+                    }
+                    if let Some(ref srv) = space_server {
+                        if !via_servers.contains(srv) {
+                            via_servers.push(srv.clone());
                         }
                     }
                     SpaceDirectoryRoom {
