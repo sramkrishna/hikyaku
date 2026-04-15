@@ -13,6 +13,32 @@ template $MxMessageRow : Gtk.Box {
     spacing: 2;
     hexpand: true;
 
+    // Pre-allocated "New messages" divider bar shown above the first unread
+    // message.  Toggled by the is_first_unread property — no list-store
+    // insertion needed so GTK never fires items_changed for the divider.
+    Gtk.Box unread_divider_box {
+      orientation: horizontal;
+      spacing: 8;
+      visible: false;
+      margin-bottom: 4;
+      styles ["dim-label"]
+
+      Gtk.Separator {
+        hexpand: true;
+        valign: center;
+      }
+
+      Gtk.Label {
+        label: _("New messages");
+        styles ["caption"]
+      }
+
+      Gtk.Separator {
+        hexpand: true;
+        valign: center;
+      }
+    }
+
     // Reply indicator — shown when this message is a reply.
     Gtk.Box reply_box {
       orientation: horizontal;

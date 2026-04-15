@@ -135,6 +135,10 @@ mod imp {
         /// MessageObjects currently marked as new — cleared by remove_dividers.
         /// Kept separate so removal is O(unread_count) not O(total messages).
         pub new_message_objs: RefCell<Vec<MessageObject>>,
+        /// The MessageObject whose is_first_unread = true (the property-based divider).
+        /// Only set by insert_divider_by_count / insert_divider_after_event.
+        /// None when the live-message sentinel is used instead (insert_divider).
+        pub divider_obj: RefCell<Option<MessageObject>>,
         /// Bookmarked event IDs for the current room — drives row highlight + button icon.
         pub bookmarked_ids: RefCell<std::collections::HashSet<String>>,
         /// Callback for typing notice: (typing: bool).
@@ -259,6 +263,7 @@ mod imp {
                 on_get_rolodex_notes: RefCell::new(None),
                 on_save_rolodex_notes: RefCell::new(None),
                 new_message_objs: RefCell::new(Vec::new()),
+                divider_obj: RefCell::new(None),
                 bookmarked_ids: RefCell::new(std::collections::HashSet::new()),
                 on_typing: RefCell::new(None),
                 typing_debounce: RefCell::new(None),
@@ -2007,6 +2012,9 @@ impl MessageView {
         tracing::info!("set_messages: info_to_obj(n={})={:?} splice(prev={n},first_load={first_load})={:?} binds={bc} bind_total={}µs",
             objs.len(), _t2-_t1, _t3-_t2, bt);
         // Rebuild event_index from scratch for the new room.
+        // Also clear divider_obj — the splice removed the old room's messages,
+        // so any is_first_unread property on them is now stale.
+        *imp.divider_obj.borrow_mut() = None;
         let mut idx = imp.event_index.borrow_mut();
         idx.clear();
         for obj in &objs {
@@ -2570,10 +2578,18 @@ impl MessageView {
         for obj in imp.new_message_objs.borrow_mut().drain(..) {
             obj.set_is_new_message(false);
         }
-        // O(1) lookup — at most one divider exists at a time.
-        if let Some(divider) = imp.event_index.borrow_mut().remove("__unread_divider__") {
-            if let Some(i) = imp.list_store().find(&divider) {
-                imp.list_store().remove(i);
+        // Property-based divider (insert_divider_by_count / insert_divider_after_event):
+        // clear is_first_unread on the tracked object — no list-store removal, O(1).
+        if let Some(obj) = imp.divider_obj.borrow_mut().take() {
+            obj.set_is_first_unread(false);
+            imp.event_index.borrow_mut().remove("__unread_divider__");
+        } else {
+            // Sentinel divider (insert_divider for live messages at end of list):
+            // must be removed from the list store.
+            if let Some(divider) = imp.event_index.borrow_mut().remove("__unread_divider__") {
+                if let Some(i) = imp.list_store().find(&divider) {
+                    imp.list_store().remove(i);
+                }
             }
         }
         imp.unread_banner.set_revealed(false);
@@ -2598,9 +2614,10 @@ impl MessageView {
     }
 
     /// Insert a "New messages" divider by counting `unread_count` items back
-    /// from the end of the list.  Simpler and more reliable than event-id-based
-    /// placement — works regardless of whether `fully_read_event_id` is in the
-    /// current window.  Auto-dismisses the banner after 10 seconds.
+    /// from the end of the list.  Uses is_first_unread property on the target
+    /// MessageObject instead of inserting a sentinel item into the list store —
+    /// this avoids triggering items_changed which would invalidate GTK's height
+    /// cache for all subsequent rows (causing slow scrolling for large unread counts).
     fn insert_divider_by_count(&self, unread_count: u32) {
         let imp = self.imp();
         let my_id = imp.user_id.borrow().clone();
@@ -2624,10 +2641,17 @@ impl MessageView {
             }
         }
         drop(new_objs);
-        let divider = Self::make_divider_obj();
-        imp.list_store().insert(pos, &divider);
-        imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
-        // Actual new count = messages from pos to end (before insert, n - pos).
+        // Set is_first_unread on the message at pos — it renders the divider
+        // bar above itself.  No list-store insert → no items_changed → no GTK
+        // height-cache invalidation for the following rows.
+        if let Some(first_obj) = gio::prelude::ListModelExt::item(&imp.list_store(), pos)
+            .and_downcast::<MessageObject>()
+        {
+            first_obj.set_is_first_unread(true);
+            *imp.divider_obj.borrow_mut() = Some(first_obj.clone());
+            imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), first_obj);
+        }
+        // Actual new count = messages from pos to end.
         let actual_new = n - pos;
         self.show_unread_banner(actual_new);
     }
@@ -2635,8 +2659,11 @@ impl MessageView {
     /// Insert a "New messages" divider after the given event_id.
     ///
     /// Returns `true` if the event was found in the list and the divider was
-    /// inserted.  Returns `false` (case B/C) so the caller can fall back to
+    /// placed.  Returns `false` (case B/C) so the caller can fall back to
     /// `insert_divider_by_count`.
+    ///
+    /// Uses is_first_unread property on the message at insert_pos — no list-store
+    /// insert, no items_changed, no GTK height-cache invalidation.
     fn insert_divider_after_event(&self, event_id: &str) -> bool {
         let imp = self.imp();
         let my_id = imp.user_id.borrow().clone();
@@ -2652,8 +2679,6 @@ impl MessageView {
             return false; // Event is the last item — unread messages not yet loaded (case B).
         }
         // Mark messages after the divider position as new.
-        // Never mark own messages as new — the user doesn't need to be notified
-        // about messages they sent themselves.
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in insert_pos..n {
@@ -2668,10 +2693,15 @@ impl MessageView {
             }
         }
         drop(new_objs);
+        // Mark the first unread message — it renders the divider bar above itself.
+        if let Some(first_obj) = gio::prelude::ListModelExt::item(&imp.list_store(), insert_pos)
+            .and_downcast::<MessageObject>()
+        {
+            first_obj.set_is_first_unread(true);
+            *imp.divider_obj.borrow_mut() = Some(first_obj.clone());
+            imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), first_obj);
+        }
         let new_count = n - insert_pos;
-        let divider = Self::make_divider_obj();
-        imp.list_store().insert(insert_pos, &divider);
-        imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), divider);
         self.show_unread_banner(new_count);
         true
     }

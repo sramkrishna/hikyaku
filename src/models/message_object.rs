@@ -65,6 +65,13 @@ mod imp {
         /// compact inline text rather than full message bubbles.
         #[property(get, set)]
         is_system_event: Cell<bool>,
+
+        /// True on the first unread message — causes the row to render a
+        /// "New messages" divider bar above its content.  Avoids inserting a
+        /// sentinel item into the list store (which would trigger expensive
+        /// GTK items_changed position-tracking for all subsequent rows).
+        #[property(get, set)]
+        is_first_unread: Cell<bool>,
     }
 
     #[glib::object_subclass]

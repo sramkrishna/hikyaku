@@ -86,6 +86,8 @@ mod imp {
         pub dm_button: std::cell::RefCell<Option<gtk::Button>>,
         pub bookmark_button: std::cell::RefCell<Option<gtk::Button>>,
         #[template_child]
+        pub unread_divider_box: TemplateChild<gtk::Box>,
+        #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
@@ -125,6 +127,8 @@ mod imp {
         /// accumulating as rows are recycled by the ListView factory.
         pub flash_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
         pub new_message_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        /// Handler for notify::is-first-unread — shows/hides the divider bar above the row.
+        pub unread_divider_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
     }
 
     #[glib::object_subclass]
@@ -1183,6 +1187,24 @@ impl MessageRow {
         });
         *self.imp().new_message_handler.borrow_mut() = Some((msg.clone().upcast(), nm_id));
 
+        // Show/hide the pre-allocated "New messages" divider bar above this row.
+        // Avoids inserting a sentinel list-store item for the divider, which would
+        // fire items_changed and invalidate GTK's height cache for all following rows.
+        if let Some((obj, id)) = self.imp().unread_divider_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        self.imp().unread_divider_box.set_visible(msg.is_first_unread());
+        let div_id = msg.connect_notify_local(Some("is-first-unread"), {
+            let row_weak = self.downgrade();
+            move |obj, _| {
+                use crate::models::MessageObject;
+                if let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>()) {
+                    row.imp().unread_divider_box.set_visible(msg.is_first_unread());
+                }
+            }
+        });
+        *self.imp().unread_divider_handler.borrow_mut() = Some((msg.clone().upcast(), div_id));
+
         // Connect reactive flash handler to this MessageObject.
         let row_weak = self.downgrade();
         let id = msg.connect_notify_local(Some("is-flashing"), move |obj, _| {
@@ -1204,6 +1226,9 @@ impl MessageRow {
             obj.disconnect(id);
         }
         if let Some((obj, id)) = self.imp().new_message_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        if let Some((obj, id)) = self.imp().unread_divider_handler.borrow_mut().take() {
             obj.disconnect(id);
         }
     }
