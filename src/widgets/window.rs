@@ -93,6 +93,12 @@ mod imp {
         /// by the 50 ms ticker.  Always holds the most recent state; older
         /// snapshots are silently discarded.
         pub pending_rooms: RefCell<Option<Vec<crate::matrix::RoomInfo>>>,
+        /// Coalesced bg_refresh message batches — maps room_id → (messages,
+        /// prev_batch_token).  When multiple RoomMessages { is_background: true }
+        /// events arrive before the idle fires (e.g. 10 sync cycles while the
+        /// window was unfocused), only one set_messages() call fires using the
+        /// latest batch.  Without this, N events × 300–1000 ms = multi-second freeze.
+        pub pending_bg_refresh: RefCell<std::collections::HashMap<String, (Vec<crate::matrix::MessageInfo>, Option<String>)>>,
         /// True while an idle callback for update_rooms() is already queued.
         /// The ticker checks this before scheduling a new idle so that at most
         /// one update is in-flight per timeslice — prevents stacking.
@@ -223,6 +229,7 @@ mod imp {
                 requested_room_avatars: RefCell::new(std::collections::HashSet::new()),
                 hover_pulse_timer: RefCell::new(None),
                 pending_rooms: RefCell::new(None),
+                pending_bg_refresh: RefCell::new(std::collections::HashMap::new()),
                 rooms_idle_pending: Cell::new(false),
                 initial_sync_done: Cell::new(false),
                 bookmarks_overview: BookmarksOverview::new(),
@@ -842,6 +849,9 @@ impl MxWindow {
             let _t_phase1 = std::time::Instant::now();
             if let Some(window) = window_weak.upgrade() {
                 window.imp().current_room_id.replace(Some(room_id.clone()));
+                // Drop any pending bg_refresh batches for rooms we're leaving —
+                // stale data for the old room must not fire set_messages() later.
+                window.imp().pending_bg_refresh.borrow_mut().retain(|rid, _| rid == &room_id);
                 window.imp().notification_manager.set_current_room(Some(&room_id));
                 room_list.set_active_room(&room_id);
                 if let Some(page) = window.imp().content_page.get() {
@@ -1812,32 +1822,48 @@ impl MxWindow {
                             let pending_flash = window.imp().pending_flash_event_id.take();
 
                             if is_background {
-                                let mv = message_view.clone();
-                                let weak_win = window.downgrade();
-                                let guard_rid = room_id.clone();
-                                let tx_seek = command_tx.clone();
-                                glib::idle_add_local_once(move || {
-                                    let still_here = weak_win.upgrade()
-                                        .map(|w| w.imp().current_room_id.borrow()
-                                            .as_deref() == Some(&guard_rid))
-                                        .unwrap_or(false);
-                                    if still_here {
-                                        mv.set_messages(&messages, prev_batch_token);
-                                    }
-                                    // Scroll after set_messages so event_index is populated.
-                                    if let Some(eid) = pending_flash {
-                                        let found = mv.scroll_to_event(&eid);
-                                        if !found {
-                                            mv.start_seek_loading();
-                                            glib::spawn_future_local(async move {
-                                                let _ = tx_seek.send(MatrixCommand::SeekToEvent {
-                                                    room_id: guard_rid,
-                                                    event_id: eid,
-                                                }).await;
-                                            });
+                                // Coalesce: store the LATEST batch for this room, schedule
+                                // at most one idle per room.  If 10 bg_refresh events arrive
+                                // while the window is unfocused, only the last batch fires
+                                // set_messages() — not all 10 (which would each take 300-
+                                // 1000 ms, causing a multi-second freeze on return).
+                                let had_pending = {
+                                    let mut slot = window.imp().pending_bg_refresh.borrow_mut();
+                                    let had = slot.contains_key(&room_id);
+                                    slot.insert(room_id.clone(), (messages, prev_batch_token));
+                                    had
+                                };
+                                if !had_pending {
+                                    let mv = message_view.clone();
+                                    let weak_win = window.downgrade();
+                                    let guard_rid = room_id.clone();
+                                    let tx_seek = command_tx.clone();
+                                    glib::idle_add_local_once(move || {
+                                        let Some(win) = weak_win.upgrade() else { return };
+                                        let Some((msgs, token)) = win.imp()
+                                            .pending_bg_refresh.borrow_mut()
+                                            .remove(&guard_rid)
+                                        else { return };
+                                        let still_here = win.imp().current_room_id.borrow()
+                                            .as_deref() == Some(&guard_rid);
+                                        if still_here {
+                                            mv.set_messages(&msgs, token);
                                         }
-                                    }
-                                });
+                                        // Scroll after set_messages so event_index is populated.
+                                        if let Some(eid) = pending_flash {
+                                            let found = mv.scroll_to_event(&eid);
+                                            if !found {
+                                                mv.start_seek_loading();
+                                                glib::spawn_future_local(async move {
+                                                    let _ = tx_seek.send(MatrixCommand::SeekToEvent {
+                                                        room_id: guard_rid,
+                                                        event_id: eid,
+                                                    }).await;
+                                                });
+                                            }
+                                        }
+                                    });
+                                }
                             } else {
                                 message_view.set_messages(&messages, prev_batch_token);
                                 // For fresh loads set_messages ran synchronously above,
