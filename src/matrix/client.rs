@@ -2479,6 +2479,34 @@ async fn start_sync(
         );
     }
 
+    // Scan for invites that were already pending before this session started.
+    // The StrippedRoomMemberEvent handler above only fires for NEW invite events
+    // delivered during sync — it does not re-fire for rooms already in the invite
+    // state in the local SQLite store.  Without this scan, any invite the user
+    // received before restarting the app is silently absent from the bell log.
+    {
+        let startup_invite_tx = event_tx.clone();
+        let startup_client = client.clone();
+        tokio::spawn(async move {
+            for room in startup_client.invited_rooms() {
+                let room_name = room.display_name().await
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| room.room_id().to_string());
+                let inviter_name = room.invite_details().await
+                    .ok()
+                    .and_then(|d| d.inviter)
+                    .map(|m| m.user_id().localpart().to_string())
+                    .unwrap_or_else(|| "Someone".to_string());
+                tracing::info!("Startup invite scan: pending invite to {room_name} from {inviter_name}");
+                let _ = startup_invite_tx.send(MatrixEvent::RoomInvited {
+                    room_id: room.room_id().to_string(),
+                    room_name,
+                    inviter_name,
+                }).await;
+            }
+        });
+    }
+
     // Register handlers for new messages (both decrypted and encrypted).
     // The SDK auto-decrypts when keys are available and fires the
     // RoomMessage handler. When decryption fails, the RoomEncrypted
