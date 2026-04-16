@@ -208,6 +208,11 @@ mod imp {
         pub seek_spinner: gtk::Spinner,
         /// Label inside seek_banner — text changes between "Finding…" and "Historical context".
         pub seek_banner_label: gtk::Label,
+        /// True while a scroll_to_bottom idle is already queued.
+        /// Deduplicates the flood of idles that arrive when many messages come in
+        /// while the user is near the bottom — prevents repeated vadj.set_value()
+        /// calls from breaking GTK's kinetic scroll gesture state machine.
+        pub scroll_to_bottom_pending: Cell<bool>,
     }
 
     impl Default for MessageView {
@@ -314,6 +319,7 @@ mod imp {
                     .visible(false)
                     .css_classes(["osd", "toolbar"])
                     .build(),
+                scroll_to_bottom_pending: Cell::new(false),
             }
         }
     }
@@ -2425,6 +2431,9 @@ impl MessageView {
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
         imp.fully_read_event_id.replace(None);
+        // Clear any pending scroll idle from the old room so new-room scroll
+        // isn't blocked if the old idle fires after the switch.
+        imp.scroll_to_bottom_pending.set(false);
 
         // Clear info banners.
         imp.unread_banner.set_revealed(false);
@@ -2748,6 +2757,15 @@ impl MessageView {
             tracing::debug!("append_message: dedup skip event_id={} body={:?}", msg.event_id, &msg.body[..msg.body.len().min(40)]);
             return;
         }
+        // Echo dedup: if there is an unpatched local echo with the same body, patch
+        // its event_id instead of appending a duplicate row.  This is the fallback
+        // path for the race where is_self detection failed (e.g. user_id not yet set)
+        // and the NewMessage handler took the non-self branch, bypassing the normal
+        // patch_echo_event_id call.
+        if !msg.event_id.is_empty() && self.patch_echo_event_id(&msg.body, &msg.event_id) {
+            tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, &msg.body[..msg.body.len().min(40)]);
+            return;
+        }
         tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, &msg.body[..msg.body.len().min(40)]);
         let obj = Self::info_to_obj(msg);
         let eid = obj.event_id();
@@ -2840,8 +2858,22 @@ impl MessageView {
         // after the layout has updated vadj.upper for the new row.  We fire a
         // second idle inside the first to catch any second layout pass (e.g.
         // variable-height rows that get remeasured after realisation).
+        //
+        // Deduplication: when many messages arrive rapidly while near the bottom
+        // (busy room), each one calls scroll_to_bottom().  Without dedup that
+        // queues N outer idles + N inner idles — a flood of vadj.set_value()
+        // calls that corrupts GTK's kinetic scroll gesture state, breaking
+        // touchpad scrolling until the room is switched.  The pending flag
+        // ensures at most one outer idle is in the GLib queue at a time; the
+        // single inner idle (per outer) handles the second layout pass.
+        if imp.scroll_to_bottom_pending.get() { return; }
+        imp.scroll_to_bottom_pending.set(true);
         let sw = imp.scrolled_window().clone();
+        let view_weak = self.downgrade();
         glib::idle_add_local_once(move || {
+            if let Some(view) = view_weak.upgrade() {
+                view.imp().scroll_to_bottom_pending.set(false);
+            }
             let vadj = sw.vadjustment();
             vadj.set_value(vadj.upper() - vadj.page_size());
             let sw2 = sw.clone();

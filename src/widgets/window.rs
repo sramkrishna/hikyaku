@@ -1968,6 +1968,14 @@ impl MxWindow {
                         tracing::debug!(
                             "UI NewMessage room={room_id} is_dm={is_dm} is_self={is_self} is_current={is_current_room}"
                         );
+                        // Diagnostic: log self-message detection for current room so we can
+                        // tell from INFO logs whether is_self is correct when echoes appear.
+                        if is_current_room && !message.is_system_event {
+                            tracing::info!(
+                                "NewMessage current: sender={sender_id} is_self={is_self} my_id_known={} event_id={}",
+                                !my_id.is_empty(), message.event_id
+                            );
+                        }
 
                         // System events (join/leave/kick/ban) are shown inline
                         // but never count as unread messages or trigger the divider.
