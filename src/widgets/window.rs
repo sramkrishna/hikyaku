@@ -1653,28 +1653,42 @@ impl MxWindow {
             // When the channel has a backlog (e.g. dozens of sync events queued
             // while the window was unfocused), recv().await returns immediately
             // each time, so this loop runs in a tight async spin without ever
-            // letting GLib flush pending GDK input events.  yield_now() every
-            // N events re-queues this future so GLib can service input (pointer,
-            // keyboard, focus events) before we process the next batch — which
-            // eliminates the "app feels frozen for a moment after alt-tab" symptom.
+            // letting GLib flush pending GDK input events.
+            //
+            // yield_now() every N events gives GLib a chance to service input
+            // (pointer, keyboard, focus events) before we process the next batch.
+            //
+            // IMPORTANT: we schedule the waker via glib::idle_add_local_once
+            // (DEFAULT_IDLE priority = 200) rather than wake_by_ref() (DEFAULT
+            // priority = 0).  glib::spawn_future_local runs at DEFAULT (0),
+            // the same priority as GDK's Wayland event source.  If we wake the
+            // future immediately via wake_by_ref(), GLib picks between us and GDK
+            // at the same priority — and the future often wins, so pointer events
+            // are never processed during the drain.
+            //
+            // By waking at DEFAULT_IDLE we ensure all DEFAULT-priority sources
+            // (GDK pointer/keyboard events, timers) run before we resume, making
+            // the app fully responsive to hover/click during a backlog drain.
             let mut n_since_yield: u32 = 0;
             while let Ok(event) = event_rx.recv().await {
                 let Some(window) = window_weak.upgrade() else {
                     break;
                 };
                 n_since_yield += 1;
-                if n_since_yield >= 8 {
+                if n_since_yield >= 4 {
                     n_since_yield = 0;
-                    // Return Pending once so GLib can flush pending input before
-                    // the next batch.  Waking immediately re-queues this future
-                    // as an idle, giving other GLib sources one main-loop turn.
+                    // Yield to GLib at DEFAULT_IDLE priority so GDK events
+                    // (pointer, keyboard, focus) run before the next batch.
                     let mut yielded = false;
                     futures_util::future::poll_fn(|cx| {
                         if yielded {
                             std::task::Poll::Ready(())
                         } else {
                             yielded = true;
-                            cx.waker().wake_by_ref();
+                            let waker = cx.waker().clone();
+                            glib::idle_add_local_once(move || {
+                                waker.wake();
+                            });
                             std::task::Poll::Pending
                         }
                     })
