@@ -237,6 +237,164 @@ mod message_dispatch_tests {
     }
 }
 
+/// Lint test: no new synchronous file I/O on the GTK main thread.
+///
+/// All GTK-thread source files (src/ minus src/matrix/) are scanned for
+/// synchronous I/O calls.  Violations in this list have been audited and
+/// approved; any NEW violation causes the test to fail so it can be reviewed
+/// before merging.
+///
+/// To add an approved exception: append a `(relative_path_fragment, line_content_fragment)`
+/// entry to SYNC_IO_ALLOWLIST with a short justification comment.
+#[cfg(test)]
+mod sync_io_lint {
+    /// Patterns that must not appear in GTK-thread source files.
+    const FORBIDDEN: &[&str] = &[
+        "std::fs::read(",
+        "std::fs::read_to_string(",
+        "std::fs::write(",
+        "std::fs::create_dir(",
+        "std::fs::create_dir_all(",
+        "std::fs::remove_file(",
+        "File::open(",
+        "File::create(",
+    ];
+
+    /// Known, audited violations.  Matched by (path fragment, line content fragment).
+    /// Do NOT add entries without a review — file an issue or justify in the comment.
+    const ALLOWLIST: &[(&str, &str)] = &[
+        // bookmarks.rs — new(): mkdir at startup, before GTK loop.
+        ("bookmarks.rs", "std::fs::create_dir_all(&path)"),
+        // bookmarks.rs — load() slow path: single disk read on first call; cache is warm thereafter.
+        ("bookmarks.rs", "std::fs::read(&self.path)"),
+        // bookmarks.rs — persist(): user-triggered add/remove, not a hot path.
+        ("bookmarks.rs", "std::fs::write(&self.path, data)"),
+        // room_context.rs — ensure_loaded(): has in-memory cache; reads from disk at most once per session.
+        ("room_context.rs", "std::fs::read_to_string(context_path())"),
+        // room_context.rs — save_override(): triggered by an explicit settings change (not per-message).
+        ("room_context.rs", "std::fs::create_dir_all(parent)"),
+        ("room_context.rs", "std::fs::write(&path, json)"),
+        // message_view.rs — export_messages_jsonl(): explicit user export action.
+        ("message_view.rs", "File::create(path)"),
+        // local_unread.rs — open_conn(): one-time create_dir_all before opening SQLite; fast.
+        ("local_unread.rs", "std::fs::create_dir_all(parent)"),
+        // plugins/rolodex — load(): called once at startup from window::new.
+        ("rolodex/mod.rs", "std::fs::read_to_string(&path)"),
+        // plugins/rolodex — save(): user-triggered contact book update; create_dir_all is fast.
+        ("rolodex/mod.rs", "std::fs::create_dir_all(parent)"),
+        ("rolodex/mod.rs", "std::fs::write(&path, data)"),
+        // plugins/pinning — dead code (allow(dead_code)); user-triggered when eventually wired up.
+        ("pinning/mod.rs", "std::fs::read_to_string(&path)"),
+        ("pinning/mod.rs", "std::fs::create_dir_all(parent)"),
+        ("pinning/mod.rs", "std::fs::write(&path, data)"),
+        // plugins/motd — load(): called in idle_add_local_once; acceptable in idle context.
+        ("motd/mod.rs", "std::fs::read_to_string(&path)"),
+        // plugins/motd — check_and_update → save(): create_dir_all is fast; write is already allowlisted.
+        ("motd/mod.rs", "std::fs::create_dir_all(parent)"),
+        ("motd/mod.rs", "std::fs::write(&path, data)"),
+        // intelligence/gpu_detect.rs — reads /proc/meminfo and /sys/class/drm/*; these are kernel
+        // virtual filesystems (always in RAM, never touch disk); latency is < 0.1ms.
+        ("gpu_detect.rs", r#"std::fs::read_to_string("/proc/meminfo")"#),
+        ("gpu_detect.rs", "std::fs::read_to_string(&vendor_path)"),
+        ("gpu_detect.rs", "std::fs::read_to_string(&vram_path)"),
+        // intelligence/ollama_manager.rs — download_ollama_binary(): one-time, user-initiated action.
+        // create_dir_all is fast; write flushes the downloaded binary to disk after async download.
+        // TODO: convert the write to gio::File::replace_async to avoid blocking the GTK thread.
+        ("ollama_manager.rs", "std::fs::create_dir_all(parent)"),
+        ("ollama_manager.rs", "std::fs::write(&dest, &data)"),
+    ];
+
+    fn src_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Return all .rs files under `src/` that run on the GTK main thread.
+    /// Excludes src/matrix/ (tokio thread) and src/bin/ (separate binaries).
+    fn gtk_thread_files(src: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    // Exclude tokio-thread and auxiliary binary directories.
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    if name == "matrix" || name == "bin" { continue; }
+                    walk(&p, out);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+        walk(src, &mut out);
+        out
+    }
+
+    /// True if `line` looks like it is inside a `#[cfg(test)]` block.
+    /// Used to skip I/O that only ever runs during unit tests, not at runtime.
+    fn looks_like_test_line(line: &str) -> bool {
+        // Heuristic: look for `#[test]`, `#[cfg(test)]`, or being inside a
+        // `mod tests {` / `mod sync_io_lint {` block.  We check for a comment
+        // marker that callers can add: `// lint: test-only`
+        line.contains("// lint: test-only") || line.contains("// sync-io-ok:")
+    }
+
+    #[test]
+    fn no_new_sync_io_on_gtk_thread() {
+        let src = src_dir();
+        let mut failures: Vec<String> = Vec::new();
+
+        for path in gtk_thread_files(&src) {
+            let rel = path.strip_prefix(&src).unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = std::fs::read_to_string(&path) // lint: test-only
+                .unwrap_or_default();
+            let mut in_cfg_test: u32 = 0;
+            let mut brace_depth: i32 = 0;
+            let mut cfg_test_pending = false;
+
+            for (i, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                // Track #[cfg(test)] regions so we don't flag test-only I/O.
+                if trimmed == "#[cfg(test)]" { cfg_test_pending = true; }
+                if cfg_test_pending && (trimmed.starts_with("mod ") || trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")) {
+                    in_cfg_test = in_cfg_test.saturating_add(1);
+                    cfg_test_pending = false;
+                }
+                if in_cfg_test > 0 {
+                    brace_depth += line.chars().filter(|&c| c == '{').count() as i32;
+                    brace_depth -= line.chars().filter(|&c| c == '}').count() as i32;
+                    if brace_depth <= 0 { in_cfg_test = in_cfg_test.saturating_sub(1); brace_depth = 0; }
+                    continue; // skip test-only code
+                }
+                // Skip comment lines and lines with explicit override markers.
+                if trimmed.starts_with("//") || looks_like_test_line(line) { continue; }
+
+                for &pat in FORBIDDEN {
+                    if !line.contains(pat) { continue; }
+                    let allowed = ALLOWLIST.iter().any(|(af, al)| {
+                        rel.contains(af) && line.contains(al)
+                    });
+                    if !allowed {
+                        failures.push(format!("  {}:{}: {}", rel, i + 1, trimmed));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "\nSynchronous file I/O found on GTK main thread — not in allowlist:\n{}\n\n\
+            Options:\n\
+            1. Move I/O to a background thread or glib::idle_add_local_once.\n\
+            2. Add a `// sync-io-ok: <reason>` comment on the offending line.\n\
+            3. Add an entry to SYNC_IO_ALLOWLIST in src/main.rs with justification.\n",
+            failures.join("\n")
+        );
+    }
+}
+
 fn main() {
     // Point GSettings to the compiled schema next to the binary when running
     // without a system install (cargo run / dev builds).

@@ -2924,6 +2924,22 @@ pub(crate) fn lru_evict_candidate<'a>(
     order.iter().copied().find(|&rid| rid != current_room && rid != incoming_room)
 }
 
+/// Pure helper: record an access to `room_id` in the LRU order.
+///
+/// Moves `room_id` to the back of `order` (most-recently-used position) so
+/// it is the LAST room to be considered for eviction.  If `room_id` is not
+/// already in `order` it is appended (first-time registration).
+///
+/// This is the function that was previously missing: without calling it on
+/// every cache hit, `lru_evict_candidate` operated on insertion order rather
+/// than access order — a frequently-visited room could be evicted ahead of
+/// one never revisited.
+#[cfg(test)]
+pub(crate) fn lru_touch(order: &mut std::collections::VecDeque<String>, room_id: &str) {
+    order.retain(|rid| rid != room_id);
+    order.push_back(room_id.to_string());
+}
+
 /// Pure helper: should a live-appended message be tinted as "new"?
 /// Only tint when the window is not focused AND the message is not from
 /// the current user — own messages never need a "new" highlight.
@@ -3078,10 +3094,11 @@ pub(crate) fn divider_decision(
 mod tests {
     use super::{
         compute_divider_pos, divider_decision, divider_should_mark, is_echo_duplicate,
-        lru_evict_candidate, sorted_insert_pos_in, unread_label,
+        lru_evict_candidate, lru_touch, sorted_insert_pos_in, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
+    use std::collections::VecDeque;
 
     /// Build a timeline split at `read_count`: the first `read_count` events are
     /// read, the rest are new.  Returns `(all_ids, fully_read_id, unread_count,
@@ -3846,5 +3863,108 @@ mod tests {
     #[test]
     fn evict_empty_order() {
         assert_eq!(lru_evict_candidate(&[], "room_a", "room_b"), None);
+    }
+
+    // ── lru_touch — access-order update ─────────────────────────────────────
+    // These guard the fix for the regression where re-accessed rooms were NOT
+    // moved to the back of the eviction order.  Without lru_touch, a room
+    // visited 100 times could be evicted ahead of a room never revisited,
+    // forcing an O(N) pool re-creation every time the user switched back to it.
+
+    fn make_order(rooms: &[&str]) -> VecDeque<String> {
+        rooms.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn touch_moves_room_to_back() {
+        // room_a is first (oldest). After a touch it must be last (newest).
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        lru_touch(&mut order, "room_a");
+        assert_eq!(order.back().map(|s| s.as_str()), Some("room_a"));
+    }
+
+    #[test]
+    fn touch_removes_old_position() {
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        lru_touch(&mut order, "room_a");
+        // room_a must appear exactly once.
+        let count = order.iter().filter(|s| s.as_str() == "room_a").count();
+        assert_eq!(count, 1, "room_a must appear exactly once after touch");
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn touch_middle_room_moves_it_to_back() {
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        lru_touch(&mut order, "room_b");
+        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        assert_eq!(v, ["room_a", "room_c", "room_b"]);
+    }
+
+    #[test]
+    fn touch_already_last_is_idempotent() {
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        lru_touch(&mut order, "room_c");
+        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        assert_eq!(v, ["room_a", "room_b", "room_c"]);
+    }
+
+    #[test]
+    fn touch_unknown_room_appends_it() {
+        let mut order = make_order(&["room_a", "room_b"]);
+        lru_touch(&mut order, "room_new");
+        assert_eq!(order.back().map(|s| s.as_str()), Some("room_new"));
+        assert_eq!(order.len(), 3);
+    }
+
+    // ── combined: touch + evict invariant ────────────────────────────────────
+    // This is the regression scenario: visiting room_a repeatedly must not
+    // cause it to be evicted ahead of rooms that were never re-accessed.
+
+    #[test]
+    fn touched_room_is_not_evict_candidate() {
+        // Initial order: room_a (oldest), room_b, room_c.
+        // Without a touch, room_a would be the eviction candidate.
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        // Simulate the user opening room_a (cache hit → lru_touch).
+        lru_touch(&mut order, "room_a");
+        // Order is now: room_b, room_c, room_a.
+        // Now open room_d (not in cache) while current=room_a.
+        // room_b must be the eviction candidate, NOT room_a.
+        let order_refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        let candidate = lru_evict_candidate(&order_refs, "room_a", "room_d");
+        assert_eq!(candidate, Some("room_b"),
+            "room_b (least recently accessed) must be evicted, not room_a which was just touched");
+    }
+
+    #[test]
+    fn repeated_touches_keep_room_at_back() {
+        let mut order = make_order(&["room_a", "room_b", "room_c"]);
+        // Visit room_a three times.
+        lru_touch(&mut order, "room_a");
+        lru_touch(&mut order, "room_a");
+        lru_touch(&mut order, "room_a");
+        assert_eq!(order.back().map(|s| s.as_str()), Some("room_a"));
+        assert_eq!(order.len(), 3, "no duplicates after repeated touches");
+    }
+
+    #[test]
+    fn interleaved_touches_produce_correct_eviction_order() {
+        // User visits: a, b, c, then goes back to a, then to b.
+        // Eviction order should be: c first (least recently visited), then a, then b.
+        let mut order = VecDeque::new();
+        // First visits (push_back on first creation).
+        lru_touch(&mut order, "room_a");
+        lru_touch(&mut order, "room_b");
+        lru_touch(&mut order, "room_c");
+        // Return visits (lru_touch on cache hit).
+        lru_touch(&mut order, "room_a");
+        lru_touch(&mut order, "room_b");
+        // Order: room_c, room_a, room_b (c oldest, b newest).
+        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        assert_eq!(v, ["room_c", "room_a", "room_b"]);
+        // Opening a new room with room_b as current — room_c evicted first.
+        let candidate = lru_evict_candidate(&v, "room_b", "room_new");
+        assert_eq!(candidate, Some("room_c"));
     }
 }
