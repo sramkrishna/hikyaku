@@ -3107,6 +3107,14 @@ impl MxWindow {
                 if sheet.is_open() {
                     let h = win.height();
                     if h > 0 { overview.set_height_request(h); }
+                } else {
+                    // Always reset when the sheet is closed.  Without this, if
+                    // the user closes the sheet via Escape or clicking outside
+                    // (bypassing the action handlers), height_request stays at
+                    // the old window height.  AdwBottomSheet positions the hidden
+                    // sheet below the content by that natural height, locking the
+                    // window minimum and preventing the user from shrinking it.
+                    overview.set_height_request(-1);
                 }
             }
         };
@@ -3114,6 +3122,18 @@ impl MxWindow {
             let f = sync_sheet_height.clone();
             move |win, _| f(win)
         });
+        // Ensure height_request is reset immediately whenever the sheet closes,
+        // regardless of how it was closed (action handler, Escape, outside click).
+        // The default-height handler above also resets on the next resize, but
+        // this catches the case where the window size doesn't change after close.
+        {
+            let overview = imp.bookmarks_overview.clone();
+            bookmarks_sheet.connect_notify_local(Some("open"), move |sheet, _| {
+                if !sheet.is_open() {
+                    overview.set_height_request(-1);
+                }
+            });
+        }
         // Fullscreen/maximise: allocation updates asynchronously — defer one
         // frame so win.height() returns the new value.
         for prop in ["fullscreened", "maximized"] {
