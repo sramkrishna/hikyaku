@@ -1964,10 +1964,10 @@ impl MessageView {
                         }
                     }
                 }
-                // Only scroll to bottom if at least one message was added at the end
-                // (i.e. new arrivals, not gap-fill).  Avoid disrupting the user's
-                // reading position when old gap messages are inserted in the middle.
-                if any_at_end {
+                // Only scroll to bottom when new messages arrived at the end AND
+                // the user is already near the bottom.  If they are scrolled up
+                // reading history, append silently without disturbing their position.
+                if any_at_end && self.is_near_bottom() {
                     let view_weak = self.downgrade();
                     glib::idle_add_local_once(move || {
                         let Some(view) = view_weak.upgrade() else { return };
@@ -2759,7 +2759,11 @@ impl MessageView {
             self.imp().new_message_objs.borrow_mut().push(obj.clone());
         }
         self.imp().list_store().append(&obj);
-        self.scroll_to_bottom();
+        // Only drag the viewport to the bottom when the user is already there.
+        // If they are scrolled up reading history, new messages append silently.
+        if self.is_near_bottom() {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Patch the event_id on a local echo message once the server confirms it.
@@ -2810,6 +2814,18 @@ impl MessageView {
         if event_id.is_empty() { return false; }
         // O(1) lookup via event_index.
         self.imp().event_index.borrow().contains_key(event_id)
+    }
+
+    /// True when the scroll position is within `threshold` pixels of the bottom.
+    /// Used to decide whether incoming messages should auto-scroll the view.
+    fn is_near_bottom(&self) -> bool {
+        let sw = self.imp().scrolled_window();
+        let vadj = sw.vadjustment();
+        // At the very bottom: value == upper - page_size.
+        // We use a 150 px slack so that a message arriving while the last row
+        // is only partially visible still triggers auto-scroll.
+        let slack = 150.0_f64;
+        vadj.upper() - vadj.page_size() - vadj.value() < slack
     }
 
     fn scroll_to_bottom(&self) {
