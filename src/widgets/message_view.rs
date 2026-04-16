@@ -11,6 +11,15 @@ pub(crate) static BIND_COUNT: std::sync::atomic::AtomicU32 =
 pub(crate) static BIND_TOTAL_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Return a prefix of `s` containing at most `n` Unicode scalar values.
+/// Safe for log statements — never panics on multi-byte characters.
+fn body_preview(s: &str) -> &str {
+    match s.char_indices().nth(40) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 mod imp {
     use adw::prelude::*;
     use gtk::glib;
@@ -1948,7 +1957,7 @@ impl MessageView {
                         // the echo being appended and MessageSent patching its event_id.
                         // Drop the index borrow first — patch_echo_event_id borrows it.
                         drop(idx);
-                        tracing::debug!("set_messages incremental: new msg event_id={} sender={} body={:?}", m.event_id, m.sender_id, &m.body[..m.body.len().min(40)]);
+                        tracing::debug!("set_messages incremental: new msg event_id={} sender={} body={:?}", m.event_id, m.sender_id, body_preview(&m.body));
                         if self.patch_echo_event_id(&m.body, &m.event_id) {
                             idx = imp.event_index.borrow_mut();
                             any_at_end = true; // patched echo is at the end
@@ -2754,7 +2763,7 @@ impl MessageView {
         // Dedup: if the event is already displayed (e.g. sync reconnect re-delivers it),
         // skip silently rather than appending a duplicate row.
         if !msg.event_id.is_empty() && self.imp().event_index.borrow().contains_key(&msg.event_id) {
-            tracing::debug!("append_message: dedup skip event_id={} body={:?}", msg.event_id, &msg.body[..msg.body.len().min(40)]);
+            tracing::debug!("append_message: dedup skip event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
             return;
         }
         // Echo dedup: if there is an unpatched local echo with the same body, patch
@@ -2763,10 +2772,10 @@ impl MessageView {
         // and the NewMessage handler took the non-self branch, bypassing the normal
         // patch_echo_event_id call.
         if !msg.event_id.is_empty() && self.patch_echo_event_id(&msg.body, &msg.event_id) {
-            tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, &msg.body[..msg.body.len().min(40)]);
+            tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
             return;
         }
-        tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, &msg.body[..msg.body.len().min(40)]);
+        tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, body_preview(&msg.body));
         let obj = Self::info_to_obj(msg);
         let eid = obj.event_id();
         if !eid.is_empty() {
@@ -2790,7 +2799,7 @@ impl MessageView {
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let imp = self.imp();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
-        tracing::debug!("patch_echo_event_id: searching n={} for body={:?} event_id={}", n, &echo_body[..echo_body.len().min(40)], event_id);
+        tracing::debug!("patch_echo_event_id: searching n={} for body={:?} event_id={}", n, body_preview(echo_body), event_id);
         // Local echo search — echos have empty event_id and are near the end.
         // This is a backwards scan over items to process (finding the echo),
         // not a lookup of a known key — acceptable per the no-loops policy.
@@ -2798,7 +2807,7 @@ impl MessageView {
             let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i) else { continue };
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id().is_empty() && msg.body() == echo_body {
-                tracing::info!("patch_echo_event_id: patched echo at pos={} body={:?} → {}", i, &echo_body[..echo_body.len().min(40)], event_id);
+                tracing::info!("patch_echo_event_id: patched echo at pos={} body={:?} → {}", i, body_preview(echo_body), event_id);
                 msg.set_event_id(event_id.to_string());
                 // Add to event_index now that it has a real ID.
                 imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
@@ -2820,10 +2829,10 @@ impl MessageView {
                 }
                 return true;
             } else if msg.event_id().is_empty() {
-                tracing::debug!("patch_echo_event_id: found echo at pos={} with DIFFERENT body={:?} (wanted {:?})", i, &msg.body()[..msg.body().len().min(40)], &echo_body[..echo_body.len().min(40)]);
+                tracing::debug!("patch_echo_event_id: found echo at pos={} with DIFFERENT body={:?} (wanted {:?})", i, body_preview(&msg.body()), body_preview(echo_body));
             }
         }
-        tracing::warn!("patch_echo_event_id: NO echo found for body={:?} event_id={}", &echo_body[..echo_body.len().min(40)], event_id);
+        tracing::warn!("patch_echo_event_id: NO echo found for body={:?} event_id={}", body_preview(echo_body), event_id);
         false
     }
 

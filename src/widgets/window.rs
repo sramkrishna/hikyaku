@@ -2003,7 +2003,7 @@ impl MxWindow {
                             // Sync arrived before MessageSent — patch the local echo
                             // if one exists (prevents duplicates). Only append if no
                             // unpatched echo is found (e.g. echo was already spliced out).
-                            tracing::info!("NewMessage self-message: body={:?} event_id={} — attempting patch", &message.body[..message.body.len().min(40)], message.event_id);
+                            tracing::info!("NewMessage self-message: body={:?} event_id={} — attempting patch", message.body.char_indices().nth(40).map(|(i,_)|&message.body[..i]).unwrap_or(&message.body), message.event_id);
                             if !message_view.patch_echo_event_id(&message.body, &message.event_id) {
                                 tracing::warn!("NewMessage self-message: patch failed, appending as new — possible duplicate!");
                                 message_view.append_message(&message, false);
