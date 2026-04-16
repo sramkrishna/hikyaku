@@ -2793,6 +2793,24 @@ impl MessageView {
             tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
             return;
         }
+        // Cap: prevent unbounded list growth that degrades GTK ListView scroll
+        // performance with variable-height rows (observed 600–800+ items).
+        // When the user is scrolled back reading history and the list is at
+        // capacity, skip the append for this live message.  We intentionally
+        // do NOT insert into event_index here either — the message will appear
+        // absent from the index and will be included the next time the
+        // incremental bg_refresh path runs, so no messages are permanently lost.
+        const MAX_STORE_SIZE: u32 = 400;
+        if !msg.event_id.is_empty()
+            && gio::prelude::ListModelExt::n_items(&self.imp().list_store()) >= MAX_STORE_SIZE
+            && !self.is_near_bottom()
+        {
+            tracing::debug!(
+                "append_message: list at cap ({}), not near bottom — deferring to bg_refresh",
+                MAX_STORE_SIZE
+            );
+            return;
+        }
         tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, body_preview(&msg.body));
         let obj = Self::info_to_obj(msg);
         let eid = obj.event_id();

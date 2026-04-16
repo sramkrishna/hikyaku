@@ -39,6 +39,28 @@ test-verbose:
 timings:
     cargo build --timings
 
+# ── profiling (sysprof) ──────────────────────────────────────────────────────
+
+# Capture a sysprof profile.  Run the app, reproduce the slow path, then Ctrl-C.
+# Writes hikyaku.syscap in the project root.
+# Requires: sysprof-cli  (dnf install sysprof  OR  apt install sysprof)
+profile:
+    cargo build
+    sysprof-cli --gtk --speedtrack hikyaku.syscap -- ./target/debug/hikyaku
+
+# Convert the last captured profile to a human-readable call-graph text file.
+# Search the output for your function names to find hot call chains.
+profile-analyze:
+    sysprof-cat hikyaku.syscap > hikyaku-profile.txt
+    @echo "Written to hikyaku-profile.txt — grep for your function names."
+
+# Capture and immediately analyze in one step.
+profile-full:
+    cargo build
+    sysprof-cli --gtk --speedtrack hikyaku.syscap -- ./target/debug/hikyaku
+    sysprof-cat hikyaku.syscap > hikyaku-profile.txt
+    @echo "Written to hikyaku-profile.txt"
+
 # ── flatpak ──────────────────────────────────────────────────────────────────
 
 # Number of parallel jobs for flatpak-builder.  Default: half the cores so
