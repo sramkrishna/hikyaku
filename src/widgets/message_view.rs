@@ -1956,6 +1956,8 @@ impl MessageView {
             if !new_msgs.is_empty() {
                 let list_store = imp.list_store();
                 let mut any_at_end = false;
+                // Compute once — used inside the loop to gate the O(n) echo scan.
+                let my_id = imp.user_id.borrow().clone();
                 {
                     let mut idx = imp.event_index.borrow_mut();
                     for m in &new_msgs {
@@ -1963,10 +1965,17 @@ impl MessageView {
                         // same body), patch it instead of appending a duplicate.
                         // This handles the race where bg_refresh arrives between
                         // the echo being appended and MessageSent patching its event_id.
+                        // Guard: local echoes are always from the current user — never
+                        // scan for other senders' messages.  Without this guard every
+                        // incoming message (including other people's) triggers an O(n)
+                        // backwards scan and a spurious WARN.
                         // Drop the index borrow first — patch_echo_event_id borrows it.
                         drop(idx);
                         tracing::debug!("set_messages incremental: new msg event_id={} sender={} body={:?}", m.event_id, m.sender_id, body_preview(&m.body));
-                        if self.patch_echo_event_id(&m.body, &m.event_id) {
+                        let is_own = !m.event_id.is_empty()
+                            && !my_id.is_empty()
+                            && m.sender_id == my_id;
+                        if is_own && self.patch_echo_event_id(&m.body, &m.event_id) {
                             idx = imp.event_index.borrow_mut();
                             any_at_end = true; // patched echo is at the end
                             continue;
