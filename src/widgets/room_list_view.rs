@@ -1016,26 +1016,29 @@ impl RoomListView {
                 }
             }
         }
-        // Update the cached_rooms snapshot so rebuild_stores sorts correctly.
-        let mut cached = imp.cached_rooms.borrow().clone();
-        let mut found = false;
-        for r in &mut cached {
-            if r.room_id == room_id {
-                if r.last_activity_ts < ts_secs {
-                    r.last_activity_ts = ts_secs;
+        // Update cached_rooms in-place — no clone, no allocation.
+        // Previously this called borrow().clone() + replace() before the debounce
+        // check, so a burst of N NewMessage events (e.g. 20+ on focus return) would
+        // clone the full room list N times on the GTK thread, causing 2–3 s freezes.
+        let found = {
+            let mut cached = imp.cached_rooms.borrow_mut();
+            let mut found = false;
+            for r in cached.iter_mut() {
+                if r.room_id == room_id {
+                    if r.last_activity_ts < ts_secs {
+                        r.last_activity_ts = ts_secs;
+                    }
+                    found = true;
+                    break;
                 }
-                found = true;
-                break;
             }
-        }
+            found
+        };
         if !found { return; } // room not yet in list; next RoomListUpdated will place it
-        imp.cached_rooms.replace(cached);
         // Force rebuild_stores to re-run by clearing the structural signature.
         imp.last_structural_sig.borrow_mut().clear();
 
         // Debounce: if a rebuild is already scheduled for this frame, skip.
-        // A burst of N NewMessage events (e.g. after reconnect from idle) would
-        // otherwise call rebuild_stores N times synchronously on the GTK thread.
         if imp.bump_rebuild_pending.get() {
             return;
         }

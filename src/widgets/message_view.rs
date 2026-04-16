@@ -1921,6 +1921,14 @@ impl MessageView {
             //     (The server fetch window may return fewer events than the disk cache holds —
             //      treating that difference as redactions was the original false-positive source.)
 
+            // Restore the pagination token if it was cleared by a room switch (clear()
+            // resets it to None).  We accept the server's latest-window token only when
+            // ours is None — if the user has already scrolled back via prepend_messages,
+            // their deeper token is kept so pagination can continue from where they are.
+            if imp.prev_batch_token.borrow().is_none() {
+                imp.prev_batch_token.replace(prev_batch);
+            }
+
             // Collect new messages (not yet in the displayed list).
             let new_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
                 .filter(|m| !m.event_id.is_empty()
@@ -2771,7 +2779,17 @@ impl MessageView {
         // path for the race where is_self detection failed (e.g. user_id not yet set)
         // and the NewMessage handler took the non-self branch, bypassing the normal
         // patch_echo_event_id call.
-        if !msg.event_id.is_empty() && self.patch_echo_event_id(&msg.body, &msg.event_id) {
+        //
+        // Guard: only attempt the O(n) scan for own messages — local echoes are
+        // always from ourselves, so scanning for other senders is pure wasted work.
+        // Without this guard, every message arriving on focus-return (potentially
+        // dozens) triggers an O(list_store) backwards scan on the GTK thread.
+        let my_id = self.imp().user_id.borrow().clone();
+        if !msg.event_id.is_empty()
+            && !my_id.is_empty()
+            && msg.sender_id == my_id
+            && self.patch_echo_event_id(&msg.body, &msg.event_id)
+        {
             tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
             return;
         }
@@ -3156,11 +3174,29 @@ pub(crate) fn divider_decision(
     Some((insert_pos, banner_count.max(1)))
 }
 
+/// Pure helper: decide the resulting prev_batch_token after a set_messages
+/// incremental call.
+///
+/// Rule: accept the server token only when ours was cleared by a room switch
+/// (None).  If the user has already paginated back via prepend_messages their
+/// deeper token is preserved so pagination can continue from where they are.
+#[cfg(test)]
+pub(crate) fn incremental_prev_batch(
+    current: Option<&str>,
+    incoming: Option<&str>,
+) -> Option<String> {
+    if current.is_none() {
+        incoming.map(str::to_string)
+    } else {
+        current.map(str::to_string)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_divider_pos, divider_decision, divider_should_mark, is_echo_duplicate,
-        lru_evict_candidate, lru_touch, sorted_insert_pos_in, unread_label,
+        compute_divider_pos, divider_decision, divider_should_mark, incremental_prev_batch,
+        is_echo_duplicate, lru_evict_candidate, lru_touch, sorted_insert_pos_in, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
@@ -4032,5 +4068,47 @@ mod tests {
         // Opening a new room with room_b as current — room_c evicted first.
         let candidate = lru_evict_candidate(&v, "room_b", "room_new");
         assert_eq!(candidate, Some("room_c"));
+    }
+
+    // ── incremental_prev_batch (pagination token restoration) ────────────────
+    //
+    // Regression: the incremental set_messages path (taken on all return visits)
+    // previously discarded the server's prev_batch_token because clear() resets
+    // it to None.  Without restoration the scroll-to-top handler's is_some()
+    // check always fails, making history pagination impossible after a room switch.
+
+    #[test]
+    fn prev_batch_restored_after_room_switch() {
+        // After a room switch, clear() sets our token to None.
+        // The next incremental set_messages must restore it from the server.
+        let result = incremental_prev_batch(None, Some("server_token_abc"));
+        assert_eq!(result.as_deref(), Some("server_token_abc"),
+            "token cleared by room switch must be restored from server response");
+    }
+
+    #[test]
+    fn prev_batch_preserved_after_user_pagination() {
+        // User has already scrolled back via prepend_messages; their deeper token
+        // must not be overwritten by a bg_refresh carrying the latest-window token.
+        let result = incremental_prev_batch(Some("deep_token_xyz"), Some("latest_token_abc"));
+        assert_eq!(result.as_deref(), Some("deep_token_xyz"),
+            "user's pagination token must be preserved when bg_refresh arrives");
+    }
+
+    #[test]
+    fn prev_batch_none_when_server_has_no_history() {
+        // Room switch clears token; server says no older history → stays None.
+        let result = incremental_prev_batch(None, None);
+        assert_eq!(result, None,
+            "no-history signal from server must be respected");
+    }
+
+    #[test]
+    fn prev_batch_not_cleared_when_server_sends_none_mid_pagination() {
+        // User is mid-pagination (token present); server bg_refresh sends None.
+        // Must keep the existing token (server refresh batch ≠ historical fetch).
+        let result = incremental_prev_batch(Some("deep_token"), None);
+        assert_eq!(result.as_deref(), Some("deep_token"),
+            "existing pagination token must survive a None in bg_refresh");
     }
 }
