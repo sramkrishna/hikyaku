@@ -1020,20 +1020,7 @@ impl RoomListView {
         // Previously this called borrow().clone() + replace() before the debounce
         // check, so a burst of N NewMessage events (e.g. 20+ on focus return) would
         // clone the full room list N times on the GTK thread, causing 2–3 s freezes.
-        let found = {
-            let mut cached = imp.cached_rooms.borrow_mut();
-            let mut found = false;
-            for r in cached.iter_mut() {
-                if r.room_id == room_id {
-                    if r.last_activity_ts < ts_secs {
-                        r.last_activity_ts = ts_secs;
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
+        let found = update_room_activity_ts(&mut imp.cached_rooms.borrow_mut(), room_id, ts_secs);
         if !found { return; } // room not yet in list; next RoomListUpdated will place it
         // Force rebuild_stores to re-run by clearing the structural signature.
         imp.last_structural_sig.borrow_mut().clear();
@@ -1345,10 +1332,7 @@ impl RoomListView {
         // Structural signature: fields that affect which tab a room lands in and
         // its sort position.  Unread counts are excluded — they are already
         // patched on the shared GObjects above.
-        let sig: Vec<(String, u64, bool, bool, bool)> = rooms
-            .iter()
-            .map(|r| (r.room_id.clone(), r.last_activity_ts, r.is_favourite, r.is_pinned, r.is_tombstoned))
-            .collect();
+        let sig = compute_structural_sig(rooms);
         if *imp.last_structural_sig.borrow() == sig {
             return;
         }
@@ -1523,6 +1507,43 @@ impl RoomListView {
         obj
     }
 
+}
+
+/// Update the last_activity_ts for a single room in a cached rooms list.
+///
+/// Scans linearly for `room_id`, updates its timestamp only when `ts` is
+/// strictly greater than the current value (monotonic bump), and returns
+/// `true` if the room was found.  Returns `false` when the room is absent —
+/// callers should skip the subsequent rebuild in that case.
+///
+/// This is the inner mutation from `bump_room_activity`, extracted so it can
+/// be exercised without a GTK context.
+pub(crate) fn update_room_activity_ts(rooms: &mut [RoomInfo], room_id: &str, ts: u64) -> bool {
+    for r in rooms.iter_mut() {
+        if r.room_id == room_id {
+            if r.last_activity_ts < ts {
+                r.last_activity_ts = ts;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Compute the structural signature used by `rebuild_stores` to decide whether
+/// the ListStore layouts need updating.
+///
+/// Only fields that affect sort order or tab placement are included:
+/// `last_activity_ts`, `is_favourite`, `is_pinned`, `is_tombstoned`.
+/// Fields handled reactively (name, unread counts) are intentionally excluded
+/// — changes to those fire GObject notify signals without requiring a splice.
+pub(crate) fn compute_structural_sig(
+    rooms: &[RoomInfo],
+) -> Vec<(String, u64, bool, bool, bool)> {
+    rooms
+        .iter()
+        .map(|r| (r.room_id.clone(), r.last_activity_ts, r.is_favourite, r.is_pinned, r.is_tombstoned))
+        .collect()
 }
 
 /// Group rooms into sections and sort within each section.
@@ -1965,5 +1986,214 @@ mod tests {
         assert_eq!(counts["!b:m.org"], 5, "room B new count should be shown");
         assert!(locally_read.contains_key("!a:m.org"));
         assert!(!locally_read.contains_key("!b:m.org"));
+    }
+
+    // ── update_room_activity_ts ──────────────────────────────────────────────
+
+    fn room(id: &str, ts: u64) -> RoomInfo {
+        let mut r = make_room(id, RoomKind::Room, None, false, ts);
+        r.room_id = format!("!{}:m.org", id);
+        r
+    }
+
+    #[test]
+    fn update_ts_found_newer_updates() {
+        let mut rooms = vec![room("general", 100)];
+        let found = update_room_activity_ts(&mut rooms, "!general:m.org", 200);
+        assert!(found);
+        assert_eq!(rooms[0].last_activity_ts, 200, "newer ts must be applied");
+    }
+
+    #[test]
+    fn update_ts_found_older_no_change() {
+        let mut rooms = vec![room("general", 100)];
+        let found = update_room_activity_ts(&mut rooms, "!general:m.org", 50);
+        assert!(found);
+        assert_eq!(rooms[0].last_activity_ts, 100, "older ts must not overwrite");
+    }
+
+    #[test]
+    fn update_ts_found_equal_no_change() {
+        let mut rooms = vec![room("general", 100)];
+        update_room_activity_ts(&mut rooms, "!general:m.org", 100);
+        assert_eq!(rooms[0].last_activity_ts, 100);
+    }
+
+    #[test]
+    fn update_ts_not_found_returns_false() {
+        let mut rooms = vec![room("general", 100)];
+        let found = update_room_activity_ts(&mut rooms, "!other:m.org", 200);
+        assert!(!found, "absent room must return false");
+        assert_eq!(rooms[0].last_activity_ts, 100, "unrelated room must be untouched");
+    }
+
+    #[test]
+    fn update_ts_empty_list_returns_false() {
+        let found = update_room_activity_ts(&mut [], "!r:m.org", 100);
+        assert!(!found);
+    }
+
+    #[test]
+    fn update_ts_finds_room_at_end_of_large_list() {
+        // The scan is O(n); verify it reaches the last element correctly.
+        let mut rooms: Vec<RoomInfo> = (0..50)
+            .map(|i| room(&format!("room{i}"), i as u64))
+            .collect();
+        let last_id = "!room49:m.org".to_string();
+        rooms[49].room_id = last_id.clone();
+        let found = update_room_activity_ts(&mut rooms, &last_id, 999);
+        assert!(found);
+        assert_eq!(rooms[49].last_activity_ts, 999);
+        // Earlier rooms must be untouched.
+        assert_eq!(rooms[0].last_activity_ts, 0);
+    }
+
+    #[test]
+    fn update_ts_burst_only_max_wins() {
+        // Simulate N NewMessage events for the same room arriving out of order.
+        // The monotonic update ensures only the highest timestamp survives.
+        let mut rooms = vec![room("alice", 0)];
+        rooms[0].room_id = "!alice:m.org".to_string();
+        for ts in [100u64, 300, 200, 150, 400, 250] {
+            update_room_activity_ts(&mut rooms, "!alice:m.org", ts);
+        }
+        assert_eq!(rooms[0].last_activity_ts, 400, "max ts in burst must win");
+    }
+
+    #[test]
+    fn update_ts_burst_across_multiple_rooms() {
+        // 30 events across 5 rooms — each room ends up with its own max ts.
+        let ids = ["!dm0:m.org", "!dm1:m.org", "!dm2:m.org", "!dm3:m.org", "!dm4:m.org"];
+        let mut rooms: Vec<RoomInfo> = ids.iter().map(|id| {
+            let mut r = make_room("dm", RoomKind::DirectMessage, None, false, 0);
+            r.room_id = id.to_string();
+            r
+        }).collect();
+
+        let events: &[(&str, u64)] = &[
+            ("!dm0:m.org", 100), ("!dm1:m.org", 200), ("!dm2:m.org", 150),
+            ("!dm3:m.org", 300), ("!dm4:m.org",  50),
+            ("!dm0:m.org", 400), ("!dm1:m.org", 100), ("!dm2:m.org", 350),
+            ("!dm3:m.org", 200), ("!dm4:m.org", 500),
+            ("!dm0:m.org", 300), ("!dm1:m.org", 600), ("!dm2:m.org", 100),
+            ("!dm3:m.org", 400), ("!dm4:m.org", 300),
+            ("!dm0:m.org", 200), ("!dm1:m.org", 500), ("!dm2:m.org", 250),
+            ("!dm3:m.org", 350), ("!dm4:m.org", 600),
+            ("!dm0:m.org", 500), ("!dm1:m.org", 300), ("!dm2:m.org", 400),
+            ("!dm3:m.org", 450), ("!dm4:m.org", 200),
+            ("!dm0:m.org", 350), ("!dm1:m.org", 700), ("!dm2:m.org", 300),
+            ("!dm3:m.org", 500), ("!dm4:m.org", 400),
+        ];
+
+        for &(id, ts) in events {
+            update_room_activity_ts(&mut rooms, id, ts);
+        }
+
+        // Independently compute expected max per room.
+        let mut expected: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for &(id, ts) in events {
+            let e = expected.entry(id).or_insert(0);
+            if ts > *e { *e = ts; }
+        }
+        for r in &rooms {
+            assert_eq!(
+                r.last_activity_ts,
+                expected[r.room_id.as_str()],
+                "room {} has wrong max ts", r.room_id
+            );
+        }
+    }
+
+    // ── compute_structural_sig ───────────────────────────────────────────────
+
+    #[test]
+    fn sig_identical_for_same_rooms() {
+        let rooms = vec![make_room("General", RoomKind::Room, None, false, 100)];
+        assert_eq!(compute_structural_sig(&rooms), compute_structural_sig(&rooms));
+    }
+
+    #[test]
+    fn sig_differs_when_ts_changes() {
+        let rooms1 = vec![make_room("General", RoomKind::Room, None, false, 100)];
+        let mut rooms2 = rooms1.clone();
+        rooms2[0].last_activity_ts = 200;
+        assert_ne!(
+            compute_structural_sig(&rooms1),
+            compute_structural_sig(&rooms2),
+            "changed ts must produce a different sig to trigger rebuild_stores",
+        );
+    }
+
+    #[test]
+    fn sig_differs_when_favourite_changes() {
+        let rooms1 = vec![make_room("General", RoomKind::Room, None, false, 100)];
+        let mut rooms2 = rooms1.clone();
+        rooms2[0].is_favourite = true;
+        assert_ne!(compute_structural_sig(&rooms1), compute_structural_sig(&rooms2));
+    }
+
+    #[test]
+    fn sig_differs_when_pinned_changes() {
+        let rooms1 = vec![make_room("General", RoomKind::Room, None, false, 100)];
+        let mut rooms2 = rooms1.clone();
+        rooms2[0].is_pinned = true;
+        assert_ne!(compute_structural_sig(&rooms1), compute_structural_sig(&rooms2));
+    }
+
+    #[test]
+    fn sig_differs_when_order_changes() {
+        // Rooms reordered (e.g. after bump_room_activity moves one to the top).
+        let r1 = make_room("Alpha", RoomKind::Room, None, false, 200);
+        let r2 = make_room("Beta",  RoomKind::Room, None, false, 100);
+        let sig_ab = compute_structural_sig(&[r1.clone(), r2.clone()]);
+        let sig_ba = compute_structural_sig(&[r2, r1]);
+        assert_ne!(sig_ab, sig_ba, "reordered rooms must produce a different sig");
+    }
+
+    #[test]
+    fn sig_unchanged_for_name_change() {
+        // Name is NOT in the structural sig — handled by GObject notify.
+        // A name change alone must NOT trigger a full rebuild_stores.
+        let rooms1 = vec![make_room("Alice", RoomKind::DirectMessage, None, false, 100)];
+        let mut rooms2 = rooms1.clone();
+        rooms2[0].name = "Alice (away)".to_string();
+        assert_eq!(
+            compute_structural_sig(&rooms1),
+            compute_structural_sig(&rooms2),
+            "name change must not invalidate the structural sig",
+        );
+    }
+
+    #[test]
+    fn sig_unchanged_for_unread_count_change() {
+        // Unread count is NOT in the sig — updated reactively via GObject property.
+        // Verifies that arriving messages don't cause spurious store rebuilds.
+        let rooms1 = vec![make_room_with_unread("Alice", RoomKind::DirectMessage, 100, 0, 0)];
+        let mut rooms2 = rooms1.clone();
+        rooms2[0].unread_count = 5;
+        assert_eq!(
+            compute_structural_sig(&rooms1),
+            compute_structural_sig(&rooms2),
+            "unread change must not invalidate the structural sig",
+        );
+    }
+
+    #[test]
+    fn sig_after_bump_differs_from_before() {
+        // End-to-end: apply update_room_activity_ts then verify the sig changes,
+        // confirming that a single bump correctly invalidates rebuild_stores' guard.
+        let mut rooms = vec![
+            make_room("Beta",  RoomKind::Room, None, false, 100),
+            make_room("Alpha", RoomKind::Room, None, false, 200),
+        ];
+        rooms[0].room_id = "!beta:m.org".to_string();
+        rooms[1].room_id = "!alpha:m.org".to_string();
+        let sig_before = compute_structural_sig(&rooms);
+
+        update_room_activity_ts(&mut rooms, "!beta:m.org", 300); // beta now has ts=300 > alpha's 200
+
+        let sig_after = compute_structural_sig(&rooms);
+        assert_ne!(sig_before, sig_after,
+            "bump must change sig so rebuild_stores re-evaluates sort order");
     }
 }
