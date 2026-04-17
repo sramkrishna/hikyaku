@@ -987,16 +987,13 @@ impl MxWindow {
                             "Bookmark this room"
                         }));
                     }
-                    // Defer set_messages to the next idle so the room header and
-                    // loading spinner render before the GTK thread is frozen by
-                    // the splice.  The handler returns quickly and the user sees
-                    // the new room's header immediately.
-                    let mv = msg_view.clone();
-                    let rid_bm = room_id.clone();
-                    glib::idle_add_local_once(move || {
-                        mv.set_messages(&msgs, prev_batch);
-                        mv.load_bookmarks(&rid_bm);
-                    });
+                    // Call set_messages synchronously.  clear() already swapped
+                    // the model; the splice is into an empty store with model
+                    // detached (O(N) memory, no GTK layout until re-attach).
+                    // Deferring to idle caused vsync starvation on Lunar Lake
+                    // (see clear() comment for details).
+                    msg_view.set_messages(&msgs, prev_batch);
+                    msg_view.load_bookmarks(&room_id);
                 }
             } else {
                 // Cold cache — show loading state and wait for Tokio.

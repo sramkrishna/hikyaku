@@ -223,10 +223,6 @@ mod imp {
         /// while the user is near the bottom — prevents repeated vadj.set_value()
         /// calls from breaking GTK's kinetic scroll gesture state machine.
         pub scroll_to_bottom_pending: Cell<bool>,
-        /// True when clear() has scheduled a deferred set_model idle that has
-        /// not fired yet.  When set_messages() calls set_model itself (first_load
-        /// path), it clears this flag so the idle skips the redundant swap.
-        pub model_swap_pending: Cell<bool>,
     }
 
     impl Default for MessageView {
@@ -332,7 +328,6 @@ mod imp {
                     .css_classes(["osd", "toolbar"])
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
-                model_swap_pending: Cell::new(false),
             }
         }
     }
@@ -2015,9 +2010,6 @@ impl MessageView {
         // unlike set_model(None) on a non-empty list which is O(N_content).
         if first_load {
             // Detach model so GTK reads all N items in one shot on re-attach.
-            // Also disarm the deferred idle from clear() — we're doing the
-            // model setup here instead.
-            imp.model_swap_pending.set(false);
             imp.list_view().set_model(gtk::SelectionModel::NONE);
         }
         imp.list_store().splice(0, n, &objs);
@@ -2095,13 +2087,12 @@ impl MessageView {
             false
         };
 
-        // Re-attach the model after the first-load splice or if the deferred
-        // idle from clear() hasn't fired yet (model_swap_pending=true means
-        // the ListView still shows the previous room's data).
-        if first_load || imp.model_swap_pending.get() {
+        // Re-attach the model after the first-load splice.  clear() already
+        // attached the store synchronously, but set_model(None) above detached
+        // it for the splice; re-attach so GTK reads all items in one shot.
+        if first_load {
             let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
             imp.list_view().set_model(Some(&no_sel));
-            imp.model_swap_pending.set(false);
         }
         imp.view_stack.set_visible_child_name("messages");
 
@@ -2455,53 +2446,41 @@ impl MessageView {
         imp.reply_preview.set_visible(false);
         imp.typing_label.set_visible(false);
 
-        // ── Defer the model swap to an idle ──────────────────────────────────
-        // set_model() triggers a GTK layout pass which requires a Wayland frame
-        // callback.  After the app has been idle, the compositor may take 1-5s
-        // to deliver the first callback.  By showing the loading spinner NOW
-        // (a simple visibility toggle — no layout needed) and deferring
-        // set_model to an idle, the sidebar highlight and spinner appear on
-        // the very next frame, giving instant click feedback.  The idle fires
-        // once the frame clock is running, so set_model is fast.
-        imp.view_stack.set_visible_child_name("loading");
+        // ── Swap the model synchronously ─────────────────────────────────────
+        // Deferring to add_tick_callback (the previous approach) caused a
+        // vsync-starvation bug on Lunar Lake: the GtkSpinner shown during
+        // loading calls begin_updating() at 60Hz (priority 120), which
+        // prevented the priority-200 idle_add_local_once(set_messages) from
+        // ever running — causing 1-1.5s delays on every room switch.
+        //
+        // set_model on an empty store is O(1).  On a pre-populated store the
+        // bind callbacks for visible rows are O(~15 rows) and are deferred to
+        // the next GTK layout pass — the handler returns in <5ms either way.
+        let no_sel = gtk::NoSelection::new(Some(list_store));
+        imp.list_view().set_model(Some(&no_sel));
 
-        let saved_frac = if is_return_visit && was_loaded {
-            imp.saved_scroll_frac.borrow_mut().remove(room_id)
-        } else {
-            None
-        };
-        imp.model_swap_pending.set(true);
-        let view_weak = self.downgrade();
-        let room_id_owned = room_id.to_string();
-        // add_tick_callback calls begin_updating() on the frame clock, which
-        // explicitly requests a vsync frame from the compositor.  Unlike
-        // idle_add_local_once, this is guaranteed to fire within ~16ms even
-        // after the app has been idle for minutes (the compositor restarts frame
-        // callbacks on begin_updating regardless of how long it was paused).
-        imp.scrolled_window().add_tick_callback(move |_sw, _clock| {
-            let Some(view) = view_weak.upgrade() else { return glib::ControlFlow::Break; };
-            let imp = view.imp();
-            // Guard: room changed while tick was pending (rapid switching).
-            if *imp.current_room_id.borrow() != room_id_owned {
-                return glib::ControlFlow::Break;
-            }
-            // Guard: set_messages() already attached the model (first_load path).
-            if !imp.model_swap_pending.get() { return glib::ControlFlow::Break; }
-            imp.model_swap_pending.set(false);
-            let store = imp.ensure_room_store(&room_id_owned);
-            let no_sel = gtk::NoSelection::new(Some(store));
-            imp.list_view().set_model(Some(&no_sel));
-            if is_return_visit && was_loaded {
-                imp.view_stack.set_visible_child_name("messages");
-                if let Some(frac) = saved_frac {
+        if is_return_visit && was_loaded {
+            // Return visit: show existing messages immediately (no loading flash).
+            imp.view_stack.set_visible_child_name("messages");
+            // Scroll restore is deferred one idle so GTK has computed heights
+            // in the layout pass.  Idle fires at priority 200, after the frame
+            // (priority 120) has measured rows — adj.upper() is then correct.
+            if let Some(frac) = imp.saved_scroll_frac.borrow_mut().remove(room_id) {
+                let view_weak = self.downgrade();
+                let room_id_owned = room_id.to_string();
+                glib::idle_add_local_once(move || {
+                    let Some(view) = view_weak.upgrade() else { return };
+                    let imp = view.imp();
+                    if *imp.current_room_id.borrow() != room_id_owned { return; }
                     let adj = imp.scrolled_window().vadjustment();
                     let max = (adj.upper() - adj.page_size()).max(0.0);
                     adj.set_value(frac * max);
-                }
+                });
             }
-            // else: leave on "loading"; set_messages() will handle it.
-            glib::ControlFlow::Break
-        });
+        } else {
+            // First visit: show loading spinner; set_messages() will switch to messages.
+            imp.view_stack.set_visible_child_name("loading");
+        }
 
         tracing::info!(
             "clear: room={room_id} return={is_return_visit} was_loaded={was_loaded}"
