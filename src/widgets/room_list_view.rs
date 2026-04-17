@@ -1217,15 +1217,106 @@ impl RoomListView {
         cross_reads
     }
 
+    /// Single O(N) pass: update tab dot badges and aggregate space unread counts
+    /// onto space GObjects.  Called on every sync regardless of structural changes.
+    /// Uses the GObject registry for unread counts (always current) rather than the
+    /// RoomInfo slice (which reflects only server counts, not local increments).
+    fn update_tab_dots(
+        rooms: &[RoomInfo],
+        imp: &imp::RoomListView,
+        registry: &std::collections::HashMap<String, RoomObject>,
+    ) {
+        let mut dm_unread = false;
+        let mut dm_hl    = false;
+        let mut room_unread = false;
+        let mut room_hl    = false;
+        let mut fav_unread = false;
+        let mut fav_hl    = false;
+        let mut total_space_unread: u32 = 0;
+        let mut space_has_hl = false;
+
+        let index  = imp.space_children_index.borrow();
+
+        for r in rooms {
+            let Some(obj) = registry.get(&r.room_id) else { continue };
+            let unread = obj.unread_count() > 0;
+            let hl     = obj.highlight_count() > 0;
+
+            // Bookmarks tab: any favourite contributes regardless of kind.
+            if r.is_favourite {
+                if unread { fav_unread = true; }
+                if hl     { fav_hl    = true; }
+            }
+
+            match r.kind {
+                RoomKind::DirectMessage => {
+                    if unread { dm_unread = true; }
+                    if hl     { dm_hl    = true; }
+                }
+                RoomKind::Room if r.parent_space.is_none() => {
+                    // Ungrouped rooms (same set as the Rooms tab).
+                    if unread { room_unread = true; }
+                    if hl     { room_hl    = true; }
+                }
+                RoomKind::Space if r.parent_space.is_none() => {
+                    // Aggregate child room unread onto the space's own GObject
+                    // so the badge on the space row in the Spaces tab is current.
+                    let mut child_unread: u32 = 0;
+                    let mut child_hl: u32 = 0;
+                    if let Some(indices) = index.get(&r.name) {
+                        for &i in indices {
+                            if let Some(child) = rooms.get(i) {
+                                if let Some(child_obj) = registry.get(&child.room_id) {
+                                    child_unread += child_obj.unread_count();
+                                    child_hl     += child_obj.highlight_count();
+                                }
+                            }
+                        }
+                    }
+                    // Guard setters to suppress spurious notify storms.
+                    if obj.unread_count()   != child_unread { obj.set_unread_count(child_unread); }
+                    if obj.highlight_count() != child_hl    { obj.set_highlight_count(child_hl); }
+                    total_space_unread += child_unread;
+                    if child_hl > 0 { space_has_hl = true; }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(page) = imp.dm_page.get()    { page.set_needs_attention(dm_unread    || dm_hl);    }
+        if let Some(page) = imp.room_page.get()  { page.set_needs_attention(room_unread  || room_hl);  }
+        if let Some(page) = imp.fav_page.get()   { page.set_needs_attention(fav_unread   || fav_hl);   }
+        if let Some(page) = imp.space_page.get() { page.set_needs_attention(total_space_unread > 0 || space_has_hl); }
+    }
+
     /// Rebuild all ListStores from the registry, using shared GObject clones.
-    /// Tab dot updates always run — unread counts change without structural changes.
-    /// ListStore rebuilds are skipped when the sorted room_id sequence hasn't
-    /// changed (the most common sync case), saving 3-8 ms of GObject work.
+    ///
+    /// Fast path (structural sig unchanged — the common case on every sync):
+    ///   One O(N) pass for tab dots + space aggregation.  No sort, no splice.
+    ///
+    /// Slow path (room moved tab or sort position changed):
+    ///   Full O(N log N) sort + diff-patch of the affected ListStores.
     fn rebuild_stores(&self, rooms: &[RoomInfo]) {
         let _t0 = std::time::Instant::now();
         let imp = self.imp();
 
         let registry = imp.room_registry.borrow();
+
+        // ── Structural sig check FIRST — before the expensive sort ────────────
+        // On the most common path (only unread counts changed), the sig is
+        // identical and we can return after a single O(N) tab-dot pass.
+        // Previously this check lived AFTER group_and_sort_rooms, wasting
+        // O(N log N) + multiple O(N) passes on every no-change sync cycle.
+        let sig = compute_structural_sig(rooms);
+        if *imp.last_structural_sig.borrow() == sig {
+            Self::update_tab_dots(rooms, imp, &registry);
+            return;
+        }
+        imp.last_structural_sig.replace(sig);
+
+        // ── Slow path: structural change ─────────────────────────────────────
+        // A room moved tabs or its sort position changed.  Re-sort everything
+        // and patch the affected ListStores.
 
         let lookup = |r: &RoomInfo| -> RoomObject {
             registry.get(&r.room_id).unwrap().clone()
@@ -1263,101 +1354,11 @@ impl RoomListView {
             b_ts.cmp(&a_ts)
         });
 
-        // --- Tab dot updates (always, even when ListStore layout is unchanged) ---
-
-        // DMs tab — dot when any DM has unread.
-        {
-            let mut has_unread = false;
-            let mut has_hl = false;
-            for r in &dms {
-                if let Some(obj) = registry.get(&r.room_id) {
-                    if obj.unread_count() > 0 { has_unread = true; }
-                    if obj.highlight_count() > 0 { has_hl = true; }
-                }
-            }
-            if let Some(page) = imp.dm_page.get() {
-                page.set_needs_attention(has_unread || has_hl);
-            }
-        }
-
-        // Rooms tab — dot when any ungrouped room has unread.
-        {
-            let mut has_unread = false;
-            let mut has_hl = false;
-            for r in &ungrouped {
-                if let Some(obj) = registry.get(&r.room_id) {
-                    if obj.unread_count() > 0 { has_unread = true; }
-                    if obj.highlight_count() > 0 { has_hl = true; }
-                }
-            }
-            if let Some(page) = imp.room_page.get() {
-                page.set_needs_attention(has_unread || has_hl);
-            }
-        }
-
-        // Bookmarks tab — dot when any favourite has unread.
-        {
-            let mut has_unread = false;
-            let mut has_hl = false;
-            for r in &favourites {
-                if let Some(obj) = registry.get(&r.room_id) {
-                    if obj.unread_count() > 0 { has_unread = true; }
-                    if obj.highlight_count() > 0 { has_hl = true; }
-                }
-            }
-            if let Some(page) = imp.fav_page.get() {
-                page.set_needs_attention(has_unread || has_hl);
-            }
-        }
-
-        // Spaces tab: aggregate child room unread onto each space's RoomObject
-        // and compute total for the tab badge + per-space tooltip.
-        {
-            let index = imp.space_children_index.borrow();
-            let cached = imp.cached_rooms.borrow();
-            let mut total_space_unread: u32 = 0;
-            let mut space_has_hl = false;
-            for r in &spaces {
-                let mut child_unread: u32 = 0;
-                let mut child_hl: u32 = 0;
-                if let Some(indices) = index.get(&r.name) {
-                    for &i in indices {
-                        if let Some(child) = cached.get(i) {
-                            if let Some(obj) = registry.get(&child.room_id) {
-                                child_unread += obj.unread_count();
-                                child_hl += obj.highlight_count();
-                            }
-                        }
-                    }
-                }
-                // Set aggregated unread on the space's own RoomObject so the
-                // badge renders on the space row in the Spaces tab.
-                // Only set if changed to avoid unnecessary notify storms.
-                if let Some(obj) = registry.get(&r.room_id) {
-                    if obj.unread_count() != child_unread {
-                        obj.set_unread_count(child_unread);
-                    }
-                    if obj.highlight_count() != child_hl {
-                        obj.set_highlight_count(child_hl);
-                    }
-                }
-                total_space_unread += child_unread;
-                if child_hl > 0 { space_has_hl = true; }
-            }
-            if let Some(page) = imp.space_page.get() {
-                page.set_needs_attention(total_space_unread > 0 || space_has_hl);
-            }
-        }
-
-        // --- ListStore rebuilds (skipped when structural layout is unchanged) ---
-        // Structural signature: fields that affect which tab a room lands in and
-        // its sort position.  Unread counts are excluded — they are already
-        // patched on the shared GObjects above.
-        let sig = compute_structural_sig(rooms);
-        if *imp.last_structural_sig.borrow() == sig {
-            return;
-        }
-        imp.last_structural_sig.replace(sig);
+        // Tab dots + space GObject aggregation (full version using sorted groups).
+        // Re-uses the same logic as update_tab_dots but iterates the already-
+        // computed sorted slices so the space aggregation stays consistent with
+        // the store rebuild that follows.
+        Self::update_tab_dots(rooms, imp, &registry);
 
         // DMs tab — synchronous, always.  This is the default visible tab; the
         // user is waiting for DMs to appear, so we render them first.
