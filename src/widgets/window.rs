@@ -1599,6 +1599,10 @@ impl MxWindow {
                         let imp = win.imp();
                         imp.rooms_idle_pending.set(false); // clear before any early return
                         let Some(rooms) = imp.pending_rooms.borrow_mut().take() else { return };
+                        tracing::info!(
+                            "ticker idle fired: {} rooms, is_active={}",
+                            rooms.len(), win.is_active()
+                        );
                         // Detect rooms read on another client BEFORE update_rooms
                         // overwrites prev_server_counts.
                         let cross_reads = rlv2.detect_cross_client_reads(&rooms);
@@ -1884,6 +1888,12 @@ impl MxWindow {
                                     let tx_seek = command_tx.clone();
                                     glib::idle_add_local_once(move || {
                                         let Some(win) = weak_win.upgrade() else { return };
+                                        // Log is_active() so we can tell if this idle fires
+                                        // on hover (compositor woke us) vs actual focus.
+                                        tracing::info!(
+                                            "bg_refresh idle fired: room={guard_rid} is_active={}",
+                                            win.is_active()
+                                        );
                                         let Some((msgs, token)) = win.imp()
                                             .pending_bg_refresh.borrow_mut()
                                             .remove(&guard_rid)
@@ -1891,7 +1901,12 @@ impl MxWindow {
                                         let still_here = win.imp().current_room_id.borrow()
                                             .as_deref() == Some(&guard_rid);
                                         if still_here {
+                                            let _t_sm = std::time::Instant::now();
                                             mv.set_messages(&msgs, token);
+                                            tracing::info!(
+                                                "bg_refresh set_messages took {:?} (room={guard_rid})",
+                                                _t_sm.elapsed()
+                                            );
                                         }
                                         // Scroll after set_messages so event_index is populated.
                                         if let Some(eid) = pending_flash {

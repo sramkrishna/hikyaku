@@ -1071,6 +1071,7 @@ impl RoomListView {
     }
 
     pub fn update_rooms(&self, rooms: &[RoomInfo]) {
+        let _t_update = std::time::Instant::now();
         let imp = self.imp();
 
         // Cache room data for space drill-down + build index.
@@ -1194,6 +1195,7 @@ impl RoomListView {
 
         // Rebuild ListStores from registry (clones of shared GObjects).
         self.rebuild_stores(rooms);
+        tracing::info!("update_rooms: {} rooms, total {:?}", rooms.len(), _t_update.elapsed());
     }
 
     /// Returns rooms where the server's notification count dropped from >0 to 0
