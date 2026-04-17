@@ -169,6 +169,11 @@ mod imp {
         /// True while a debounced rebuild_stores is already queued via idle_add.
         /// Prevents N messages arriving in a burst from triggering N rebuilds.
         pub bump_rebuild_pending: std::cell::Cell<bool>,
+        /// Set of room_ids already bumped in the current drain cycle.
+        /// Once a room appears here, subsequent messages for that room skip
+        /// the O(n) cached_rooms scan — only the first message per room per
+        /// burst needs to update last_activity_ts.
+        pub bumped_rooms: RefCell<std::collections::HashSet<String>>,
         /// Search bar — toggled by the header magnifier button.
         pub search_bar: gtk::SearchBar,
         pub search_entry: gtk::SearchEntry,
@@ -362,6 +367,7 @@ mod imp {
                 last_structural_sig: RefCell::new(Vec::new()),
                 prev_server_counts: RefCell::new(std::collections::HashMap::new()),
                 bump_rebuild_pending: std::cell::Cell::new(false),
+                bumped_rooms: RefCell::new(std::collections::HashSet::new()),
                 search_bar,
                 search_entry,
                 search_store,
@@ -1007,7 +1013,14 @@ impl RoomListView {
     /// to 3 minutes for the next full RoomListUpdated.
     pub fn bump_room_activity(&self, room_id: &str, ts_secs: u64) {
         let imp = self.imp();
-        // Update the GObject property so sort comparisons reflect the new ts.
+
+        // Deduplication: only the FIRST message per room per drain cycle needs
+        // the O(n) cached_rooms scan.  Subsequent messages for the same room
+        // just update the GObject property (O(1)) and return — the rebuild
+        // already coalesces the full burst at Priority::LOW.
+        let already_bumped = imp.bumped_rooms.borrow().contains(room_id);
+
+        // Always update the GObject property so sort comparisons reflect new ts.
         {
             let registry = imp.room_registry.borrow();
             if let Some(obj) = registry.get(room_id) {
@@ -1016,12 +1029,19 @@ impl RoomListView {
                 }
             }
         }
-        // Update cached_rooms in-place — no clone, no allocation.
-        // Previously this called borrow().clone() + replace() before the debounce
-        // check, so a burst of N NewMessage events (e.g. 20+ on focus return) would
-        // clone the full room list N times on the GTK thread, causing 2–3 s freezes.
+
+        if already_bumped {
+            // cached_rooms already updated for this room this cycle; no need
+            // to scan again or schedule another rebuild (one is already pending).
+            return;
+        }
+
+        imp.bumped_rooms.borrow_mut().insert(room_id.to_owned());
+
+        // First bump for this room this cycle: update cached_rooms in-place.
         let found = update_room_activity_ts(&mut imp.cached_rooms.borrow_mut(), room_id, ts_secs);
         if !found { return; } // room not yet in list; next RoomListUpdated will place it
+
         // Force rebuild_stores to re-run by clearing the structural signature.
         imp.last_structural_sig.borrow_mut().clear();
 
@@ -1043,6 +1063,7 @@ impl RoomListView {
             };
             let imp = view.imp();
             imp.bump_rebuild_pending.set(false);
+            imp.bumped_rooms.borrow_mut().clear();
             let cached = imp.cached_rooms.borrow().clone();
             view.rebuild_stores(&cached);
             glib::ControlFlow::Break
@@ -2195,5 +2216,95 @@ mod tests {
         let sig_after = compute_structural_sig(&rooms);
         assert_ne!(sig_before, sig_after,
             "bump must change sig so rebuild_stores re-evaluates sort order");
+    }
+
+    // ── bumped_rooms deduplication (pure logic) ──────────────────────────────
+
+    /// Simulate what bump_room_activity does for the first message on a room:
+    /// update cached_rooms, mark room as bumped.  Return scan_count.
+    fn simulate_bump(
+        rooms: &mut Vec<RoomInfo>,
+        bumped: &mut std::collections::HashSet<String>,
+        room_id: &str,
+        ts: u64,
+    ) -> usize {
+        if bumped.contains(room_id) {
+            // Already bumped this cycle — skip O(n) scan.
+            return 0;
+        }
+        bumped.insert(room_id.to_owned());
+        let _ = update_room_activity_ts(rooms, room_id, ts);
+        1 // one scan performed
+    }
+
+    #[test]
+    fn dedup_first_message_scans_once() {
+        let mut rooms = vec![
+            make_room("Alpha", RoomKind::Room, None, false, 100),
+            make_room("Beta",  RoomKind::Room, None, false, 200),
+        ];
+        rooms[0].room_id = "!alpha:m.org".to_string();
+        rooms[1].room_id = "!beta:m.org".to_string();
+        let mut bumped = std::collections::HashSet::new();
+
+        let scans = simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 300);
+        assert_eq!(scans, 1, "first message for a room should scan once");
+        assert!(bumped.contains("!alpha:m.org"));
+        assert_eq!(rooms[0].last_activity_ts, 300);
+    }
+
+    #[test]
+    fn dedup_second_message_same_room_skips_scan() {
+        let mut rooms = vec![
+            make_room("Alpha", RoomKind::Room, None, false, 100),
+        ];
+        rooms[0].room_id = "!alpha:m.org".to_string();
+        let mut bumped = std::collections::HashSet::new();
+
+        simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 200);
+        let scans = simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 300);
+        assert_eq!(scans, 0, "second message for same room should skip scan");
+        // ts was updated by the first bump (200) and NOT by the skipped second
+        assert_eq!(rooms[0].last_activity_ts, 200,
+            "cached_rooms should not be re-scanned for duplicate room");
+    }
+
+    #[test]
+    fn dedup_different_rooms_each_scan_once() {
+        let mut rooms = vec![
+            make_room("Alpha", RoomKind::Room, None, false, 100),
+            make_room("Beta",  RoomKind::Room, None, false, 100),
+        ];
+        rooms[0].room_id = "!alpha:m.org".to_string();
+        rooms[1].room_id = "!beta:m.org".to_string();
+        let mut bumped = std::collections::HashSet::new();
+
+        // 4 messages: 2 for alpha, 2 for beta
+        let s1 = simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 200);
+        let s2 = simulate_bump(&mut rooms, &mut bumped, "!beta:m.org",  200);
+        let s3 = simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 300); // dup
+        let s4 = simulate_bump(&mut rooms, &mut bumped, "!beta:m.org",  300); // dup
+        assert_eq!(s1 + s2 + s3 + s4, 2, "only 2 scans total for 2 distinct rooms");
+    }
+
+    #[test]
+    fn dedup_cleared_between_cycles() {
+        let mut rooms = vec![
+            make_room("Alpha", RoomKind::Room, None, false, 100),
+        ];
+        rooms[0].room_id = "!alpha:m.org".to_string();
+        let mut bumped = std::collections::HashSet::new();
+
+        // Cycle 1
+        simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 200);
+        assert_eq!(rooms[0].last_activity_ts, 200);
+
+        // Simulate rebuild idle clearing bumped_rooms
+        bumped.clear();
+
+        // Cycle 2 — room must scan again
+        let scans = simulate_bump(&mut rooms, &mut bumped, "!alpha:m.org", 300);
+        assert_eq!(scans, 1, "after clear, first message of new cycle should scan");
+        assert_eq!(rooms[0].last_activity_ts, 300);
     }
 }
