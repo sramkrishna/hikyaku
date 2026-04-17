@@ -334,6 +334,10 @@ pub enum MatrixEvent {
     RegistrationSuccess { display_name: String, user_id: String },
     /// Account registration failed.
     RegistrationFailed { error: String },
+    /// A room's timeline has been silently pre-fetched into the cache.
+    /// No UI splice needed — the next SelectRoom for this room will hit
+    /// memory instantly and skip the loading state.
+    RoomPrefetched { room_id: String },
     /// Recovery key was generated for a new account.
     RecoveryKeyGenerated { key: String },
     /// Key file import result.
@@ -493,6 +497,16 @@ pub enum MatrixCommand {
     SeekToEvent {
         room_id: String,
         event_id: String,
+    },
+    /// Silently pre-warm the timeline cache for a space's sibling rooms.
+    /// Sent when the user opens a room that belongs to a space so that switching
+    /// to any sibling room is instant.  No RoomMessages event is sent to the GTK
+    /// thread — only RoomPrefetched per room once the cache is populated.
+    PrefetchSpace {
+        /// Room ID of the parent space (used for logging/dedup only).
+        space_id: String,
+        /// Room IDs to prefetch, already filtered to cold/unfresh rooms.
+        room_ids: Vec<String>,
     },
     /// Drain the command queue and then signal the sync loop to stop.
     /// Must be sent LAST by the application — all preceding commands run first.
@@ -1337,6 +1351,36 @@ async fn matrix_task(
                         tokio::spawn(async move {
                             yield_if_room_loading().await;
                             warmup_ollama_model(&endpoint, &model).await;
+                        });
+                    }
+                    Ok(MatrixCommand::PrefetchSpace { space_id, room_ids }) => {
+                        // Silently warm the cache for sibling rooms in a space.
+                        // Runs in a single spawned task, sequential per room so we
+                        // don't exhaust the matrix-sdk SQLite connection pool.
+                        // yield_if_room_loading() inside handle_prefetch_room
+                        // ensures SelectRoom always gets priority.
+                        let prefetch_client = client.clone();
+                        let prefetch_tx = event_tx.clone();
+                        let prefetch_cache = timeline_cache.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                "PrefetchSpace {space_id}: warming {} rooms",
+                                room_ids.len()
+                            );
+                            let mut warmed = 0u32;
+                            for room_id in room_ids.into_iter().take(10) {
+                                if handle_prefetch_room(
+                                    &prefetch_client,
+                                    &prefetch_tx,
+                                    &room_id,
+                                    prefetch_cache.clone(),
+                                ).await {
+                                    warmed += 1;
+                                }
+                            }
+                            tracing::info!(
+                                "PrefetchSpace {space_id}: done, warmed={warmed}"
+                            );
                         });
                     }
                     Ok(MatrixCommand::Shutdown) => {
@@ -3572,12 +3616,71 @@ async fn extract_messages(
     messages
 }
 
-/// Fetch recent messages for a room and send them to the UI.
-/// `key_fetched_rooms` tracks room IDs for which we've already triggered a
-/// key download from backup this session (to avoid redundant network calls).
-/// This set contains only room ID strings, NOT encryption keys.
-/// Pre-fetch a room's timeline into the cache without sending to the UI.
-/// Used during startup to warm the cache for unread rooms.
+/// Silently warm one room's timeline cache for space pre-fetching.
+///
+/// Fetches the last 50 messages, writes them to disk, and inserts into the
+/// in-memory cache.  Sends `RoomPrefetched` so window.rs can mark the room
+/// as warm.  Never sends `RoomMessages` — no GTK splice occurs.
+///
+/// Returns true if the room was actually fetched, false if it was already warm.
+async fn handle_prefetch_room(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    timeline_cache: super::room_cache::RoomCache,
+) -> bool {
+    use matrix_sdk::ruma::UInt;
+
+    // Respect any in-progress room load (SelectRoom) — yield until clear.
+    yield_if_room_loading().await;
+
+    // Skip if already warm (SelectRoom beat us here, or another prefetch won).
+    if timeline_cache.has_memory(room_id) {
+        return false;
+    }
+
+    let Ok(rid) = RoomId::parse(room_id) else { return false };
+    let Some(room) = client.get_room(&rid) else { return false };
+
+    let mut filter = matrix_sdk::ruma::api::client::filter::RoomEventFilter::default();
+    filter.types = Some(vec!["m.room.message".to_string(), "m.room.encrypted".to_string()]);
+    let mut opts = matrix_sdk::room::MessagesOptions::backward();
+    opts.limit = UInt::from(50u32);
+    opts.filter = filter;
+
+    let response = match room.messages(opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("PrefetchSpace: failed to fetch {room_id}: {e}");
+            return false;
+        }
+    };
+
+    let token = response.end.as_ref().map(|t| t.to_string());
+    let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
+
+    // Write to disk cache (spawn_blocking keeps the async loop free).
+    let disk_cache = timeline_cache.clone();
+    let disk_rid = room_id.to_string();
+    let disk_msgs = msgs.clone();
+    let disk_tok = token.clone();
+    tokio::task::spawn_blocking(move || {
+        disk_cache.save_disk(&disk_rid, &disk_msgs, disk_tok.as_deref());
+    });
+
+    // Seed in-memory cache so SelectRoom hits it immediately.
+    timeline_cache.insert_memory_if_absent(
+        room_id,
+        msgs,
+        token,
+        RoomMeta::default(),
+    );
+    timeline_cache.mark_fresh(room_id);
+
+    let _ = event_tx.send(MatrixEvent::RoomPrefetched { room_id: room_id.to_string() }).await;
+    tracing::info!("PrefetchSpace: warmed {room_id}");
+    true
+}
 
 /// Background room select — fetches messages and metadata, updates cache + UI.
 /// Runs in a spawned task so it doesn't block the command loop.

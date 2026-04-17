@@ -90,7 +90,7 @@ mod imp {
         /// Active GLib timer that pulses the loading progress bar in the hover popover.
         pub hover_pulse_timer: RefCell<Option<glib::SourceId>>,
         /// Latest RoomListUpdated snapshot — written by the event loop, drained
-        /// by the 50 ms ticker.  Always holds the most recent state; older
+        /// by the rooms idle.  Always holds the most recent state; older
         /// snapshots are silently discarded.
         pub pending_rooms: RefCell<Option<Vec<crate::matrix::RoomInfo>>>,
         /// Coalesced bg_refresh message batches — maps room_id → (messages,
@@ -100,8 +100,7 @@ mod imp {
         /// latest batch.  Without this, N events × 300–1000 ms = multi-second freeze.
         pub pending_bg_refresh: RefCell<std::collections::HashMap<String, (Vec<crate::matrix::MessageInfo>, Option<String>)>>,
         /// True while an idle callback for update_rooms() is already queued.
-        /// The ticker checks this before scheduling a new idle so that at most
-        /// one update is in-flight per timeslice — prevents stacking.
+        /// Checked before scheduling a new idle — at most one update in-flight.
         pub rooms_idle_pending: Cell<bool>,
         /// True until the first RoomListUpdated after SyncStarted arrives.
         /// NewMessage notifications are suppressed during this window to prevent
@@ -1013,6 +1012,31 @@ impl MxWindow {
             glib::spawn_future_local(async move {
                 let _ = tx.send(MatrixCommand::SelectRoom { room_id: rid, known_unread }).await;
             });
+
+            // Prefetch sibling rooms for spaces so next selection is instant.
+            let parent_space_id = room_list.imp().room_registry.borrow()
+                .get(&room_id)
+                .map(|o| o.parent_space_id())
+                .unwrap_or_default();
+            if !parent_space_id.is_empty() {
+                let sibling_ids: Vec<String> = room_list.imp().room_registry.borrow()
+                    .iter()
+                    .filter(|(rid, obj)| {
+                        **rid != room_id && obj.parent_space_id() == parent_space_id
+                    })
+                    .map(|(rid, _)| rid.clone())
+                    .collect();
+                if !sibling_ids.is_empty() {
+                    let tx = cmd_tx.clone();
+                    let sid = parent_space_id.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = tx.send(MatrixCommand::PrefetchSpace {
+                            space_id: sid,
+                            room_ids: sibling_ids,
+                        }).await;
+                    });
+                }
+            }
         });
 
         // Leave button is wired in setup_ui.
@@ -1488,10 +1512,12 @@ impl MxWindow {
             )
         );
 
-        // Focus change handler — clear unseen counter when window regains focus.
+        // Focus change handler — clear unseen counter when window regains focus
+        // and drain any bg_refresh that the idle deferred during hover.
         let _window_weak_focus = window.downgrade();
         let room_list_focus = imp.room_list_view.clone();
         let msg_view_focus = imp.message_view.clone();
+        let focus_cmd_tx = command_tx.clone();
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
                 let count = win.imp().unseen_while_unfocused.get();
@@ -1503,6 +1529,33 @@ impl MxWindow {
                         win.imp().local_unread.mark_read(&rid);
                     }
                     msg_view_focus.remove_dividers();
+                }
+                // Drain any bg_refresh deferred by the idle (hover, not focus).
+                let rid = win.imp().current_room_id.borrow().clone();
+                if let Some(ref rid) = rid {
+                    let pending = win.imp().pending_bg_refresh.borrow_mut().remove(rid);
+                    if let Some((msgs, token)) = pending {
+                        let _t = std::time::Instant::now();
+                        msg_view_focus.set_messages(&msgs, token);
+                        tracing::info!(
+                            "is_active drain set_messages took {:?} (room={rid})", _t.elapsed()
+                        );
+                        if let Some(eid) = win.imp().pending_flash_event_id.take() {
+                            let mv_ref = msg_view_focus.clone();
+                            let rid_clone = rid.clone();
+                            let tx = focus_cmd_tx.clone();
+                            let found = mv_ref.scroll_to_event(&eid);
+                            if !found {
+                                mv_ref.start_seek_loading();
+                                glib::spawn_future_local(async move {
+                                    let _ = tx.send(MatrixCommand::SeekToEvent {
+                                        room_id: rid_clone,
+                                        event_id: eid,
+                                    }).await;
+                                });
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -1551,105 +1604,6 @@ impl MxWindow {
         let login_page = imp.login_page.clone();
         let room_list_view = imp.room_list_view.clone();
         let message_view = imp.message_view.clone();
-        // ── Room-update ticker ───────────────────────────────────────────────────
-        // Fires every 50 ms (the "timeslice") at DEFAULT_IDLE priority (200).
-        // Running below GDK events (0) and the frame clock (GDK_PRIORITY_REDRAW=120)
-        // means the ticker never preempts a click or a focus-in event — the user
-        // always gets instant visual feedback before any room-list work runs.
-        // Under heavy sync load many RoomListUpdated snapshots are coalesced into
-        // the single latest snapshot.  When nothing is pending the tick is free.
-        {
-            let ticker_win = window.downgrade();
-            let ticker_rlv = room_list_view.clone();
-            glib::timeout_add_local_full(
-                std::time::Duration::from_millis(50),
-                glib::Priority::DEFAULT_IDLE,
-                move || {
-                    let Some(win) = ticker_win.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    {
-                        let imp = win.imp();
-                        // Nothing pending, or an idle is already in-flight: skip.
-                        // The in-flight guard ensures at most one update runs per
-                        // timeslice — predictable, no stacking.
-                        if imp.pending_rooms.borrow().is_none() || imp.rooms_idle_pending.get() {
-                            return glib::ControlFlow::Continue;
-                        }
-                        // Priority patch: synchronously update the currently open
-                        // room's GObject right now (1 room, ~8 guarded property
-                        // reads) so its sidebar row reflects the latest state
-                        // before the idle that refreshes everything else.
-                        let current_rid = imp.current_room_id.borrow().clone();
-                        if let Some(ref rid) = current_rid {
-                            let pending = imp.pending_rooms.borrow();
-                            if let Some(ref rooms) = *pending {
-                                if let Some(info) = rooms.iter().find(|r| &r.room_id == rid) {
-                                    ticker_rlv.patch_room(info);
-                                }
-                            }
-                        }
-                        imp.rooms_idle_pending.set(true);
-                    }
-                    // Hand off to idle so user input is never preempted.
-                    let win2 = ticker_win.clone();
-                    let rlv2 = ticker_rlv.clone();
-                    glib::idle_add_local_once(move || {
-                        let Some(win) = win2.upgrade() else { return };
-                        let imp = win.imp();
-                        imp.rooms_idle_pending.set(false); // clear before any early return
-                        let Some(rooms) = imp.pending_rooms.borrow_mut().take() else { return };
-                        tracing::info!(
-                            "ticker idle fired: {} rooms, is_active={}",
-                            rooms.len(), win.is_active()
-                        );
-                        // Detect rooms read on another client BEFORE update_rooms
-                        // overwrites prev_server_counts.
-                        let cross_reads = rlv2.detect_cross_client_reads(&rooms);
-                        rlv2.update_rooms(&rooms);
-                        // Mark rooms read on another client — zeroes broker count
-                        // with "read_elsewhere" semantics so we know why it zeroed.
-                        for room_id in cross_reads {
-                            imp.local_unread.mark_read_elsewhere(&room_id);
-                        }
-                        // Re-apply broker counts as a floor after the server sync
-                        // may have zeroed rooms the user hasn't visited.
-                        imp.local_unread.for_each_nonzero(|room_id, unread, highlights| {
-                            rlv2.set_room_unread_counts(room_id, unread, highlights);
-                        });
-                        // Keep favourite rooms in the bookmarks overview in sync.
-                        {
-                            let registry = rlv2.imp().room_registry.borrow();
-                            let mut favs: Vec<crate::models::RoomObject> = rooms.iter()
-                                .filter(|r| r.is_favourite)
-                                .filter_map(|r| registry.get(&r.room_id).cloned())
-                                .collect();
-                            favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
-                            imp.bookmarks_overview.set_favourite_rooms(&favs);
-                        }
-                        // Request avatar downloads for any new rooms with avatars.
-                        let to_fetch = {
-                            let mut requested = imp.requested_room_avatars.borrow_mut();
-                            rlv2.rooms_needing_avatars()
-                                .into_iter()
-                                .filter(|(id, _)| requested.insert(id.clone()))
-                                .collect::<Vec<_>>()
-                        };
-                        for (room_id, mxc_url) in to_fetch {
-                            if let Some(tx) = imp.command_tx.get() {
-                                let tx = tx.clone();
-                                glib::spawn_future_local(async move {
-                                    let _ = tx.send(crate::matrix::MatrixCommand::FetchRoomAvatar {
-                                        room_id, mxc_url,
-                                    }).await;
-                                });
-                            }
-                        }
-                    });
-                    glib::ControlFlow::Continue
-                },
-            );
-        }
 
         let window_weak = window.downgrade();
         glib::spawn_future_local(async move {
@@ -1780,12 +1734,72 @@ impl MxWindow {
                         toast_error(&toast_overlay, "Sync error", &error);
                     }
                     MatrixEvent::RoomListUpdated { rooms } => {
-                        // First room list after sync = catchup complete.
                         window.imp().initial_sync_done.set(true);
-                        // Store the latest snapshot; the 50 ms ticker drains it.
-                        // Multiple events arriving within one timeslice are
-                        // coalesced — only the newest snapshot is kept.
+                        // Immediately patch the current room's GObject so its
+                        // sidebar badge reflects the new state before the idle fires.
+                        let current_rid = window.imp().current_room_id.borrow().clone();
+                        if let Some(ref rid) = current_rid {
+                            if let Some(info) = rooms.iter().find(|r| &r.room_id == rid) {
+                                room_list_view.patch_room(info);
+                            }
+                        }
+                        // Coalesce: later snapshots replace earlier ones so the idle
+                        // always processes the most recent state.
                         window.imp().pending_rooms.replace(Some(rooms));
+                        // Schedule exactly one idle per pending batch — the flag
+                        // prevents stacking when events arrive faster than the idle runs.
+                        if !window.imp().rooms_idle_pending.get() {
+                            window.imp().rooms_idle_pending.set(true);
+                            let win2 = window.downgrade();
+                            let rlv2 = room_list_view.clone();
+                            glib::idle_add_local_once(move || {
+                                let Some(win) = win2.upgrade() else { return };
+                                let imp = win.imp();
+                                imp.rooms_idle_pending.set(false);
+                                let Some(rooms) = imp.pending_rooms.borrow_mut().take() else { return };
+                                tracing::info!("rooms idle fired: {} rooms", rooms.len());
+                                // Detect rooms read on another client BEFORE update_rooms
+                                // overwrites prev_server_counts.
+                                let cross_reads = rlv2.detect_cross_client_reads(&rooms);
+                                rlv2.update_rooms(&rooms);
+                                for room_id in cross_reads {
+                                    imp.local_unread.mark_read_elsewhere(&room_id);
+                                }
+                                // Re-apply broker counts as a floor — server sync may
+                                // have zeroed rooms the user hasn't visited locally.
+                                imp.local_unread.for_each_nonzero(|room_id, unread, highlights| {
+                                    rlv2.set_room_unread_counts(room_id, unread, highlights);
+                                });
+                                // Keep favourite rooms in the bookmarks overview in sync.
+                                {
+                                    let registry = rlv2.imp().room_registry.borrow();
+                                    let mut favs: Vec<crate::models::RoomObject> = rooms.iter()
+                                        .filter(|r| r.is_favourite)
+                                        .filter_map(|r| registry.get(&r.room_id).cloned())
+                                        .collect();
+                                    favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
+                                    imp.bookmarks_overview.set_favourite_rooms(&favs);
+                                }
+                                // Request avatar downloads for any new rooms with avatars.
+                                let to_fetch = {
+                                    let mut requested = imp.requested_room_avatars.borrow_mut();
+                                    rlv2.rooms_needing_avatars()
+                                        .into_iter()
+                                        .filter(|(id, _)| requested.insert(id.clone()))
+                                        .collect::<Vec<_>>()
+                                };
+                                for (room_id, mxc_url) in to_fetch {
+                                    if let Some(tx) = imp.command_tx.get() {
+                                        let tx = tx.clone();
+                                        glib::spawn_future_local(async move {
+                                            let _ = tx.send(crate::matrix::MatrixCommand::FetchRoomAvatar {
+                                                room_id, mxc_url,
+                                            }).await;
+                                        });
+                                    }
+                                }
+                            });
+                        }
                     }
                     MatrixEvent::BgRefreshStarted { room_id } => {
                         let current = window.imp().current_room_id.borrow().clone();
@@ -1888,12 +1902,24 @@ impl MxWindow {
                                     let tx_seek = command_tx.clone();
                                     glib::idle_add_local_once(move || {
                                         let Some(win) = weak_win.upgrade() else { return };
-                                        // Log is_active() so we can tell if this idle fires
-                                        // on hover (compositor woke us) vs actual focus.
+                                        let is_active = win.is_active();
                                         tracing::info!(
                                             "bg_refresh idle fired: room={guard_rid} is_active={}",
-                                            win.is_active()
+                                            is_active
                                         );
+                                        if !is_active {
+                                            // Wayland pointer-enter woke the main loop but the
+                                            // window has no keyboard focus.  Defer set_messages
+                                            // until actual focus — notify::is-active drains it.
+                                            // The batch stays in pending_bg_refresh.
+                                            // Restore any pending flash so it isn't lost.
+                                            if pending_flash.is_some() {
+                                                let mut slot = win.imp()
+                                                    .pending_flash_event_id.borrow_mut();
+                                                if slot.is_none() { *slot = pending_flash; }
+                                            }
+                                            return;
+                                        }
                                         let Some((msgs, token)) = win.imp()
                                             .pending_bg_refresh.borrow_mut()
                                             .remove(&guard_rid)
@@ -1908,7 +1934,6 @@ impl MxWindow {
                                                 _t_sm.elapsed()
                                             );
                                         }
-                                        // Scroll after set_messages so event_index is populated.
                                         if let Some(eid) = pending_flash {
                                             let found = mv.scroll_to_event(&eid);
                                             if !found {
@@ -2612,6 +2637,9 @@ impl MxWindow {
                             &format!("Watch alert: {room_name}"),
                             &msg,
                         );
+                    }
+                    MatrixEvent::RoomPrefetched { room_id } => {
+                        tracing::debug!("space prefetch warm: {room_id}");
                     }
                 }
             }

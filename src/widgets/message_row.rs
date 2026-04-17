@@ -231,6 +231,41 @@ mod imp {
             });
             obj.add_controller(hover);
 
+            // "row.copy" action — copies the message body to the clipboard.
+            // Registered here in constructed() so the action is wired once per
+            // pool slot, not on every bind.
+            let copy_body = self.body_text.clone();
+            let copy_action = gio::SimpleAction::new("copy", None);
+            copy_action.connect_activate(move |_, _| {
+                let text = copy_body.borrow().clone();
+                if !text.is_empty() {
+                    if let Some(display) = gtk::gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                }
+            });
+            let action_group = gio::SimpleActionGroup::new();
+            action_group.add_action(&copy_action);
+            obj.insert_action_group("row", Some(&action_group));
+
+            // Right-click on the row shows a clipboard context menu.
+            let body_click = gtk::GestureClick::builder().button(3).build();
+            let obj_weak = obj.downgrade();
+            body_click.connect_released(move |gesture, _, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let Some(row) = obj_weak.upgrade() else { return };
+                if row.imp().body_text.borrow().is_empty() { return; }
+                let menu = gio::Menu::new();
+                menu.append(Some("Copy"), Some("row.copy"));
+                let popover = gtk::PopoverMenu::from_model(Some(&menu));
+                popover.set_parent(&row);
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.set_has_arrow(false);
+                popover.connect_closed(|p| p.unparent());
+                popover.popup();
+            });
+            obj.add_controller(body_click);
+
             // Reply button — reads current event_id/sender/body from row state.
             let event_id = self.event_id.clone();
             let sender_text = self.sender_text.clone();

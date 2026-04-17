@@ -36,23 +36,24 @@ mod imp {
     #[derive(CompositeTemplate)]
     #[template(file = "src/widgets/message_view.blp")]
     pub struct MessageView {
-        // ── Per-room widget cache ────────────────────────────────────────────
-        /// Shared factory for all per-room ListViews (set once in constructed).
+        // ── Single shared ListView (constant widget tree size) ───────────────
+        /// The one and only ListView — its model is swapped on room switch.
+        /// Widget tree size stays constant regardless of rooms visited.
+        pub main_list_view: std::cell::OnceCell<gtk::ListView>,
+        /// The one and only ScrolledWindow wrapping main_list_view.
+        pub main_scrolled_window: std::cell::OnceCell<gtk::ScrolledWindow>,
+        /// Shared factory attached to main_list_view (set once in constructed).
         pub factory: std::cell::OnceCell<gtk::SignalListItemFactory>,
-        /// Stack holding per-room ScrolledWindow+ListView widgets (one per visited room).
-        /// Also holds the "__seek__" page added at construction time.
-        pub room_stack: gtk::Stack,
         /// Dedicated store for the seek context window — never the live store.
         pub seek_store: gio::ListStore,
-        /// ListView for the seek page (set once in constructed).
-        pub seek_list_view: std::cell::OnceCell<gtk::ListView>,
-        /// Blueprint placeholder that room_stack is inserted into.
+        /// Blueprint placeholder that main_scrolled_window is inserted into.
         #[template_child]
         pub room_list_placeholder: TemplateChild<gtk::Box>,
-        /// room_id → (scrolled_window, list_view, list_store)
-        pub room_view_cache: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::ListView, gio::ListStore)>>,
-        /// Insertion-order queue for room_view_cache LRU eviction.
-        pub room_view_order: RefCell<std::collections::VecDeque<String>>,
+        /// room_id → gio::ListStore (lightweight GObjects, no widget overhead).
+        pub list_store_cache: RefCell<HashMap<String, gio::ListStore>>,
+        /// Normalized scroll position (0.0–1.0) saved per room on switch-away.
+        /// Restored in an idle after model swap so users return to where they were.
+        pub saved_scroll_frac: RefCell<HashMap<String, f64>>,
         /// Currently visible room id (empty string = no room selected).
         pub current_room_id: RefCell<String>,
         /// Current room's list_store — updated by switch_room() for O(1) access.
@@ -222,20 +223,22 @@ mod imp {
         /// while the user is near the bottom — prevents repeated vadj.set_value()
         /// calls from breaking GTK's kinetic scroll gesture state machine.
         pub scroll_to_bottom_pending: Cell<bool>,
+        /// True when clear() has scheduled a deferred set_model idle that has
+        /// not fired yet.  When set_messages() calls set_model itself (first_load
+        /// path), it clears this flag so the idle skips the redundant swap.
+        pub model_swap_pending: Cell<bool>,
     }
 
     impl Default for MessageView {
         fn default() -> Self {
             Self {
+                main_list_view: std::cell::OnceCell::new(),
+                main_scrolled_window: std::cell::OnceCell::new(),
                 factory: std::cell::OnceCell::new(),
-                room_stack: gtk::Stack::builder()
-                    .transition_type(gtk::StackTransitionType::None)
-                    .build(),
                 seek_store: gio::ListStore::new::<crate::models::MessageObject>(),
-                seek_list_view: std::cell::OnceCell::new(),
                 room_list_placeholder: Default::default(),
-                room_view_cache: RefCell::new(HashMap::new()),
-                room_view_order: RefCell::new(std::collections::VecDeque::new()),
+                list_store_cache: RefCell::new(HashMap::new()),
+                saved_scroll_frac: RefCell::new(HashMap::new()),
                 current_room_id: RefCell::new(String::new()),
                 cur_list_store: RefCell::new(gio::ListStore::new::<MessageObject>()),
                 saved_event_indices: RefCell::new(HashMap::new()),
@@ -329,6 +332,7 @@ mod imp {
                     .css_classes(["osd", "toolbar"])
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
+                model_swap_pending: Cell::new(false),
             }
         }
     }
@@ -339,105 +343,26 @@ mod imp {
             self.cur_list_store.borrow().clone()
         }
 
-        /// Current room's list_view — O(1) clone from cache.
+        /// The single shared ListView — its model is swapped on room switch.
         pub fn list_view(&self) -> gtk::ListView {
-            let id = self.current_room_id.borrow().clone();
-            self.room_view_cache.borrow()
-                .get(&id)
-                .map(|(_, lv, _)| lv.clone())
-                .expect("list_view() called with no current room")
+            self.main_list_view.get().expect("list_view() called before constructed()").clone()
         }
 
-        /// Current room's scrolled_window — O(1) clone from cache.
+        /// The single shared ScrolledWindow wrapping main_list_view.
         pub fn scrolled_window(&self) -> gtk::ScrolledWindow {
-            let id = self.current_room_id.borrow().clone();
-            self.room_view_cache.borrow()
-                .get(&id)
-                .map(|(sw, _, _)| sw.clone())
-                .expect("scrolled_window() called with no current room")
+            self.main_scrolled_window.get().expect("scrolled_window() called before constructed()").clone()
         }
 
-        /// Maximum number of per-room (ScrolledWindow, ListView, ListStore) triples to
-        /// keep in memory.  When exceeded the oldest room is evicted — its GTK widgets
-        /// are removed from room_stack and dropped, freeing the ~20 pool-slot MessageRow
-        /// widgets (each backed by a heavy selectable GtkLabel / GtkTextView).
-        const MAX_CACHED_ROOMS: usize = 50;
-
-        /// Get or create the per-room (scrolled_window, list_view, list_store) triple.
-        /// On first call for a given room_id, creates a new ListView with the shared
-        /// factory and adds a ScrolledWindow to room_stack.  Subsequent calls return
-        /// the cached triple.
-        ///
-        /// `obj` is the outer MessageView — used to connect the scroll-to-top handler
-        /// on first visit (handler must not be reconnected on return visits).
-        pub fn ensure_room_view(
-            &self,
-            room_id: &str,
-            obj: &super::MessageView,
-        ) -> (gtk::ScrolledWindow, gtk::ListView, gio::ListStore) {
-            if let Some(entry) = self.room_view_cache.borrow().get(room_id) {
-                // Update LRU access order: move this room to the back so it
-                // is the LAST to be evicted.  Without this, the order is
-                // insertion-only and frequently-visited rooms can be evicted
-                // as early as rooms never revisited.
-                {
-                    let mut order = self.room_view_order.borrow_mut();
-                    order.retain(|rid| rid != room_id);
-                    order.push_back(room_id.to_string());
-                }
-                return entry.clone();
+        /// Get or create the per-room gio::ListStore.  Only stores data — no
+        /// widgets created here; the widget tree stays constant size regardless
+        /// of how many rooms are visited.
+        pub fn ensure_room_store(&self, room_id: &str) -> gio::ListStore {
+            if let Some(store) = self.list_store_cache.borrow().get(room_id) {
+                return store.clone();
             }
-
-            // Evict the oldest room if the cache is full.  Skip the currently
-            // visible room (current_room_id) since it may still be in use.
-            let current = self.current_room_id.borrow().clone();
-            while self.room_view_cache.borrow().len() >= Self::MAX_CACHED_ROOMS {
-                let candidate = self.room_view_order.borrow_mut()
-                    .iter()
-                    .find(|rid| **rid != current && **rid != room_id)
-                    .cloned();
-                let Some(evict_id) = candidate else { break };
-                self.room_view_order.borrow_mut().retain(|rid| rid != &evict_id);
-                if let Some((sw, _, _)) = self.room_view_cache.borrow_mut().remove(&evict_id) {
-                    self.room_stack.remove(&sw);
-                }
-                self.saved_event_indices.borrow_mut().remove(&evict_id);
-                self.saved_messages_loaded.borrow_mut().remove(&evict_id);
-                tracing::debug!("room_view_cache: evicted {evict_id}");
-            }
-
-            let list_store = gio::ListStore::new::<crate::models::MessageObject>();
-            let no_sel = gtk::NoSelection::new(Some(list_store.clone()));
-            let list_view = gtk::ListView::builder().build();
-            list_view.set_model(Some(&no_sel));
-            list_view.set_factory(self.factory.get());
-            let scrolled_window = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(&list_view)
-                .css_classes(["mx-tinted-bg"])
-                .build();
-            // Connect scroll-to-top handler once per room.
-            let view_weak = obj.downgrade();
-            scrolled_window.vadjustment().connect_value_notify(move |adj| {
-                if adj.value() < 50.0 {
-                    let Some(view) = view_weak.upgrade() else { return };
-                    let imp = view.imp();
-                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
-                        imp.fetching_older.set(true);
-                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
-                            cb();
-                        }
-                    }
-                }
-            });
-            self.room_stack.add_named(&scrolled_window, Some(room_id));
-            self.room_view_cache.borrow_mut().insert(
-                room_id.to_string(),
-                (scrolled_window.clone(), list_view.clone(), list_store.clone()),
-            );
-            self.room_view_order.borrow_mut().push_back(room_id.to_string());
-            (scrolled_window, list_view, list_store)
+            let store = gio::ListStore::new::<crate::models::MessageObject>();
+            self.list_store_cache.borrow_mut().insert(room_id.to_string(), store.clone());
+            store
         }
     }
 
@@ -640,14 +565,40 @@ mod imp {
                 }
             });
 
-            // Store the factory so ensure_room_view() can attach it to each
-            // per-room ListView.  Do NOT attach it to any global list_view —
-            // we use a per-room ListView+ListStore (GtkStack) approach instead.
+            // Attach factory to the single shared ListView.
             self.factory.set(factory).expect("factory already initialised");
-            // Add the room_stack to the blueprint placeholder.  Per-room
-            // ScrolledWindow+ListView widgets are added inside room_stack
-            // by ensure_room_view() on each room's first visit.
-            self.room_list_placeholder.append(&self.room_stack);
+
+            // Create the single shared ScrolledWindow + ListView.  All rooms share
+            // this one widget tree — only the model (gio::ListStore) is swapped on
+            // room switch.  Widget tree size is constant regardless of rooms visited.
+            let main_lv = gtk::ListView::builder().build();
+            main_lv.set_factory(self.factory.get());
+            let main_sw = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&main_lv)
+                .css_classes(["mx-tinted-bg"])
+                .build();
+
+            // Connect scroll-to-top handler once — works for all rooms since the
+            // ScrolledWindow is shared.
+            let view_weak = self.obj().downgrade();
+            main_sw.vadjustment().connect_value_notify(move |adj| {
+                if adj.value() < 50.0 {
+                    let Some(view) = view_weak.upgrade() else { return };
+                    let imp = view.imp();
+                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
+                        imp.fetching_older.set(true);
+                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                            cb();
+                        }
+                    }
+                }
+            });
+
+            self.main_list_view.set(main_lv).ok();
+            self.main_scrolled_window.set(main_sw.clone()).ok();
+            self.room_list_placeholder.append(&main_sw);
 
             // Assemble the seek banner: [spinner] [label] [Jump to latest btn]
             let seek_btn = gtk::Button::builder().label("Jump to latest").build();
@@ -655,29 +606,14 @@ mod imp {
             self.seek_banner.append(&self.seek_banner_label);
             self.seek_banner.append(&seek_btn);
 
-            // Insert above the room_stack.
+            // Insert above the main ScrolledWindow.
             self.room_list_placeholder.prepend(&self.seek_banner);
 
-            let view_weak = self.obj().downgrade();
+            let view_weak2 = self.obj().downgrade();
             seek_btn.connect_clicked(move |_| {
-                let Some(view) = view_weak.upgrade() else { return };
+                let Some(view) = view_weak2.upgrade() else { return };
                 view.cancel_seek();
             });
-
-            // Create the seek page in room_stack — one dedicated page, never
-            // modified, switched in/out in O(1) with no model changes on live views.
-            let seek_no_sel = gtk::NoSelection::new(Some(self.seek_store.clone()));
-            let seek_lv = gtk::ListView::builder().build();
-            seek_lv.set_model(Some(&seek_no_sel));
-            seek_lv.set_factory(self.factory.get());
-            let seek_scroll = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(&seek_lv)
-                .css_classes(["mx-tinted-bg"])
-                .build();
-            self.room_stack.add_named(&seek_scroll, Some("__seek__"));
-            self.seek_list_view.set(seek_lv).ok();
 
             // Helper: get full text from the TextView buffer.
             fn buf_text(buf: &gtk::TextBuffer) -> String {
@@ -737,8 +673,8 @@ mod imp {
                 }
             });
 
-            // Scroll-to-top for pagination is connected per-room inside
-            // ensure_room_view() so each room's ScrolledWindow gets the handler.
+            // Scroll-to-top for pagination is connected once in constructed() on
+            // the single shared ScrolledWindow.
 
             // Enter = send, Shift+Enter = newline.
             let send_key_ctrl = gtk::EventControllerKey::new();
@@ -1847,11 +1783,11 @@ impl MessageView {
             Some(m) => m,
             None => return false,
         };
-        // In seek mode use the seek store/list_view; otherwise use the live room's.
+        // The single shared ListView's model is already seek_store in seek mode
+        // and the live room store otherwise — always use imp.list_view().
         let in_seek = imp.seek_saved_event_index.borrow().is_some();
         let (store, list_view): (gio::ListStore, gtk::ListView) = if in_seek {
-            let lv = imp.seek_list_view.get().cloned().expect("seek_list_view not initialised");
-            (imp.seek_store.clone(), lv)
+            (imp.seek_store.clone(), imp.list_view())
         } else {
             (imp.list_store(), imp.list_view())
         };
@@ -1956,46 +1892,78 @@ impl MessageView {
             if !new_msgs.is_empty() {
                 let list_store = imp.list_store();
                 let mut any_at_end = false;
-                // Compute once — used inside the loop to gate the O(n) echo scan.
                 let my_id = imp.user_id.borrow().clone();
+
+                // Pass 1: echo patches — update existing GObjects in place, no new rows.
+                // Kept separate so patch_echo_event_id can freely borrow event_index
+                // without the drop/reborrow dance that the old single-pass loop needed.
+                let mut echo_patched: std::collections::HashSet<String> = Default::default();
+                for m in &new_msgs {
+                    tracing::debug!(
+                        "set_messages incremental: new msg event_id={} sender={} body={:?}",
+                        m.event_id, m.sender_id, body_preview(&m.body)
+                    );
+                    let is_own = !m.event_id.is_empty()
+                        && !my_id.is_empty()
+                        && m.sender_id == my_id;
+                    if is_own && self.patch_echo_event_id(&m.body, &m.event_id) {
+                        echo_patched.insert(m.event_id.clone());
+                        any_at_end = true;
+                    }
+                }
+
+                // Pass 2: pre-compute insert positions on the ORIGINAL list (before any
+                // insertions) so all end-appends can be batched into a single
+                // splice(orig_n, 0, &batch) — one items_changed signal instead of N.
+                // Gap-fills (older messages inserted mid-list) are rare; they get
+                // individual splices inserted high-to-low so pre-computed positions
+                // stay valid after each insertion.
+                let orig_n = list_store.n_items();
+                let mut end_appends: Vec<MessageObject> = Vec::new();
+                let mut gap_fills: Vec<(u32, MessageObject)> = Vec::new();
+
+                for m in &new_msgs {
+                    if echo_patched.contains(&m.event_id) { continue; }
+                    tracing::info!(
+                        "set_messages incremental: inserting event_id={} (no echo found)",
+                        m.event_id
+                    );
+                    let obj = Self::info_to_obj(m);
+                    let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
+                    if pos >= orig_n {
+                        end_appends.push(obj);
+                    } else {
+                        gap_fills.push((pos, obj));
+                    }
+                }
+
+                // One splice for all end-appends → one items_changed signal.
+                if !end_appends.is_empty() {
+                    let upcast: Vec<glib::Object> =
+                        end_appends.iter().map(|o| o.clone().upcast()).collect();
+                    list_store.splice(orig_n, 0, &upcast);
+                    any_at_end = true;
+                }
+
+                // Gap-fills high-to-low: each insert only shifts items above it,
+                // so positions computed on the original list remain correct.
+                gap_fills.sort_by_key(|(pos, _)| *pos);
+                for (pos, obj) in gap_fills.iter().rev() {
+                    list_store.splice(*pos, 0, &[obj.clone().upcast::<glib::Object>()]);
+                }
+
+                // Update event_index once for all newly inserted objects.
                 {
                     let mut idx = imp.event_index.borrow_mut();
-                    for m in &new_msgs {
-                        // If a local echo exists for this message (empty event_id,
-                        // same body), patch it instead of appending a duplicate.
-                        // This handles the race where bg_refresh arrives between
-                        // the echo being appended and MessageSent patching its event_id.
-                        // Guard: local echoes are always from the current user — never
-                        // scan for other senders' messages.  Without this guard every
-                        // incoming message (including other people's) triggers an O(n)
-                        // backwards scan and a spurious WARN.
-                        // Drop the index borrow first — patch_echo_event_id borrows it.
-                        drop(idx);
-                        tracing::debug!("set_messages incremental: new msg event_id={} sender={} body={:?}", m.event_id, m.sender_id, body_preview(&m.body));
-                        let is_own = !m.event_id.is_empty()
-                            && !my_id.is_empty()
-                            && m.sender_id == my_id;
-                        if is_own && self.patch_echo_event_id(&m.body, &m.event_id) {
-                            idx = imp.event_index.borrow_mut();
-                            any_at_end = true; // patched echo is at the end
-                            continue;
-                        }
-                        idx = imp.event_index.borrow_mut();
-                        tracing::info!("set_messages incremental: appending event_id={} (no echo found)", m.event_id);
-                        let obj = Self::info_to_obj(m);
-                        let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
-                        let n = list_store.n_items();
-                        if pos >= n {
-                            list_store.append(&obj);
-                            any_at_end = true;
-                        } else {
-                            list_store.splice(pos, 0, &[obj.clone().upcast::<glib::Object>()]);
-                        }
+                    for obj in end_appends.iter()
+                        .chain(gap_fills.iter().map(|(_, o)| o))
+                    {
                         if !obj.event_id().is_empty() {
-                            idx.insert(obj.event_id(), obj);
+                            idx.insert(obj.event_id(), obj.clone());
                         }
                     }
                 }
+
                 // Only scroll to bottom when new messages arrived at the end AND
                 // the user is already near the bottom.  If they are scrolled up
                 // reading history, append silently without disturbing their position.
@@ -2046,6 +2014,10 @@ impl MessageView {
         // re-attached below.  set_model(None) on an empty list is O(0) (instant),
         // unlike set_model(None) on a non-empty list which is O(N_content).
         if first_load {
+            // Detach model so GTK reads all N items in one shot on re-attach.
+            // Also disarm the deferred idle from clear() — we're doing the
+            // model setup here instead.
+            imp.model_swap_pending.set(false);
             imp.list_view().set_model(gtk::SelectionModel::NONE);
         }
         imp.list_store().splice(0, n, &objs);
@@ -2123,13 +2095,13 @@ impl MessageView {
             false
         };
 
-        // Re-attach the per-room model after the first-load splice.
-        // GTK reads all N items in one shot and binds only the ~15 visible rows,
-        // rather than processing items-changed for each of the N items during the
-        // splice above.  For bg_refresh (not first_load) the model stayed attached.
-        if first_load {
+        // Re-attach the model after the first-load splice or if the deferred
+        // idle from clear() hasn't fired yet (model_swap_pending=true means
+        // the ListView still shows the previous room's data).
+        if first_load || imp.model_swap_pending.get() {
             let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
             imp.list_view().set_model(Some(&no_sel));
+            imp.model_swap_pending.set(false);
         }
         imp.view_stack.set_visible_child_name("messages");
 
@@ -2242,8 +2214,9 @@ impl MessageView {
         *imp.seek_before_token.borrow_mut() = before_token;
         *imp.seek_target_event_id.borrow_mut() = Some(target_event_id.to_string());
 
-        // Switch to the seek page in room_stack — O(1), no model changes on live views.
-        imp.room_stack.set_visible_child_name("__seek__");
+        // Swap model to seek_store — same ListView, different data.
+        let seek_no_sel = gtk::NoSelection::new(Some(imp.seek_store.clone()));
+        imp.list_view().set_model(Some(&seek_no_sel));
 
         // Transition seek banner from "Finding…" → "Historical context" state.
         imp.seek_spinner.set_spinning(false);
@@ -2269,15 +2242,16 @@ impl MessageView {
         });
     }
 
-    /// Exit seek mode: switch the room_stack back to the live page (O(1)),
+    /// Exit seek mode: swap the ListView model back to the live room store,
     /// restore the event_index, and clear the seek store.
-    /// The live ListStore and its model are never touched — no freeze, no gap.
     pub fn cancel_seek(&self) {
         let imp = self.imp();
 
-        // Switch back to the live room page — O(1), no model changes.
+        // Swap model back to the live room store.
         let room_id = imp.current_room_id.borrow().clone();
-        imp.room_stack.set_visible_child_name(&room_id);
+        let live_store = imp.ensure_room_store(&room_id);
+        let no_sel = gtk::NoSelection::new(Some(live_store));
+        imp.list_view().set_model(Some(&no_sel));
 
         // Restore the live event_index.
         if let Some(saved) = imp.seek_saved_event_index.borrow_mut().take() {
@@ -2408,12 +2382,10 @@ impl MessageView {
 
     /// Prepare for a room switch to `room_id`.
     ///
-    /// For rooms visited before this is O(1): the per-room ListView stays live
-    /// in room_stack and we just call set_visible_child_name.  The user sees
-    /// previous messages immediately; bg_refresh splices only if content changed.
-    ///
-    /// For first-time rooms a new ListView+ListStore is created (still O(1)).
-    /// view_stack shows the loading spinner until set_messages arrives.
+    /// Swaps the single shared ListView's model to the room's gio::ListStore.
+    /// The widget tree stays constant size regardless of rooms visited — only
+    /// the data model pointer changes.  On return visits the existing messages
+    /// are visible immediately; bg_refresh splices only if content changed.
     pub fn clear(&self, room_id: &str) {
         let imp = self.imp();
         // Cancel any previous deferred-loading timer.
@@ -2425,22 +2397,27 @@ impl MessageView {
         // ── Save outgoing room state ─────────────────────────────────────────
         let old_room_id = imp.current_room_id.borrow().clone();
         if !old_room_id.is_empty() {
+            // Save normalized scroll position so we can restore it on return.
+            let sw = imp.scrolled_window();
+            let adj = sw.vadjustment();
+            let max = (adj.upper() - adj.page_size()).max(1.0);
+            let frac = (adj.value() / max).clamp(0.0, 1.0);
+            imp.saved_scroll_frac.borrow_mut().insert(old_room_id.clone(), frac);
+
             let idx = imp.event_index.borrow().clone();
             imp.saved_event_indices.borrow_mut().insert(old_room_id.clone(), idx);
             imp.saved_messages_loaded.borrow_mut()
                 .insert(old_room_id, imp.messages_loaded.get());
         }
 
-        // ── Set up incoming room view ────────────────────────────────────────
-        let is_return_visit = imp.room_view_cache.borrow().contains_key(room_id);
-        let (_, _, list_store) = imp.ensure_room_view(room_id, self);
-        *imp.cur_list_store.borrow_mut() = list_store;
+        // ── Set up incoming room store (no widget creation) ──────────────────
+        let is_return_visit = imp.list_store_cache.borrow().contains_key(room_id);
+        let list_store = imp.ensure_room_store(room_id);
+        *imp.cur_list_store.borrow_mut() = list_store.clone();
         *imp.current_room_id.borrow_mut() = room_id.to_string();
 
         // Restore per-room state for return visits so set_messages can skip an
-        // unnecessary splice when the server returns the same data we already
-        // show.  The server fetch always runs (see client.rs SelectRoom), so
-        // any gap messages detected by has_new will still trigger a splice.
+        // unnecessary splice when the server returns the same data we already show.
         if let Some(saved_idx) = imp.saved_event_indices.borrow_mut().remove(room_id) {
             *imp.event_index.borrow_mut() = saved_idx;
         } else {
@@ -2457,8 +2434,6 @@ impl MessageView {
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
         imp.fully_read_event_id.replace(None);
-        // Clear any pending scroll idle from the old room so new-room scroll
-        // isn't blocked if the old idle fires after the switch.
         imp.scroll_to_bottom_pending.set(false);
 
         // Clear info banners.
@@ -2480,15 +2455,46 @@ impl MessageView {
         imp.reply_preview.set_visible(false);
         imp.typing_label.set_visible(false);
 
-        // ── Switch to the new room view (O(1)) ───────────────────────────────
-        imp.room_stack.set_visible_child_name(room_id);
-        if is_return_visit && was_loaded {
-            // Show existing messages instantly; server fetch (always running)
-            // will splice in any new/gap messages via the has_new check.
-            imp.view_stack.set_visible_child_name("messages");
+        // ── Defer the model swap to an idle ──────────────────────────────────
+        // set_model() triggers a GTK layout pass which requires a Wayland frame
+        // callback.  After the app has been idle, the compositor may take 1-5s
+        // to deliver the first callback.  By showing the loading spinner NOW
+        // (a simple visibility toggle — no layout needed) and deferring
+        // set_model to an idle, the sidebar highlight and spinner appear on
+        // the very next frame, giving instant click feedback.  The idle fires
+        // once the frame clock is running, so set_model is fast.
+        imp.view_stack.set_visible_child_name("loading");
+
+        let saved_frac = if is_return_visit && was_loaded {
+            imp.saved_scroll_frac.borrow_mut().remove(room_id)
         } else {
-            imp.view_stack.set_visible_child_name("loading");
-        }
+            None
+        };
+        imp.model_swap_pending.set(true);
+        let view_weak = self.downgrade();
+        let room_id_owned = room_id.to_string();
+        glib::idle_add_local_once(move || {
+            let Some(view) = view_weak.upgrade() else { return };
+            let imp = view.imp();
+            // Guard: room changed while this idle was queued (rapid switching).
+            if *imp.current_room_id.borrow() != room_id_owned { return; }
+            // Guard: set_messages() already attached the model (first_load path).
+            if !imp.model_swap_pending.get() { return; }
+            imp.model_swap_pending.set(false);
+            let store = imp.ensure_room_store(&room_id_owned);
+            let no_sel = gtk::NoSelection::new(Some(store));
+            imp.list_view().set_model(Some(&no_sel));
+            if is_return_visit && was_loaded {
+                imp.view_stack.set_visible_child_name("messages");
+                if let Some(frac) = saved_frac {
+                    let adj = imp.scrolled_window().vadjustment();
+                    let max = (adj.upper() - adj.page_size()).max(0.0);
+                    adj.set_value(frac * max);
+                }
+            }
+            // else: leave on "loading"; set_messages() will handle it.
+        });
+
         tracing::info!(
             "clear: room={room_id} return={is_return_visit} was_loaded={was_loaded}"
         );
@@ -3019,37 +3025,6 @@ pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -
     messages_empty && !first_load
 }
 
-/// Pure helper: choose the room to evict from the view cache.
-///
-/// Returns the first entry in `order` that is neither `current_room` nor
-/// `incoming_room`.  Returns `None` if every entry is one of the two protected
-/// rooms (cache too small to evict safely).
-///
-/// `order` is the insertion-order queue: oldest entry is at index 0.
-#[cfg(test)]
-pub(crate) fn lru_evict_candidate<'a>(
-    order: &'a [&'a str],
-    current_room: &str,
-    incoming_room: &str,
-) -> Option<&'a str> {
-    order.iter().copied().find(|&rid| rid != current_room && rid != incoming_room)
-}
-
-/// Pure helper: record an access to `room_id` in the LRU order.
-///
-/// Moves `room_id` to the back of `order` (most-recently-used position) so
-/// it is the LAST room to be considered for eviction.  If `room_id` is not
-/// already in `order` it is appended (first-time registration).
-///
-/// This is the function that was previously missing: without calling it on
-/// every cache hit, `lru_evict_candidate` operated on insertion order rather
-/// than access order — a frequently-visited room could be evicted ahead of
-/// one never revisited.
-#[cfg(test)]
-pub(crate) fn lru_touch(order: &mut std::collections::VecDeque<String>, room_id: &str) {
-    order.retain(|rid| rid != room_id);
-    order.push_back(room_id.to_string());
-}
 
 /// Pure helper: should a live-appended message be tinted as "new"?
 /// Only tint when the window is not focused AND the message is not from
@@ -3223,11 +3198,10 @@ pub(crate) fn incremental_prev_batch(
 mod tests {
     use super::{
         compute_divider_pos, divider_decision, divider_should_mark, incremental_prev_batch,
-        is_echo_duplicate, lru_evict_candidate, lru_touch, sorted_insert_pos_in, unread_label,
+        is_echo_duplicate, sorted_insert_pos_in, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
-    use std::collections::VecDeque;
 
     /// Build a timeline split at `read_count`: the first `read_count` events are
     /// read, the rest are new.  Returns `(all_ids, fully_read_id, unread_count,
@@ -3954,147 +3928,6 @@ mod tests {
     #[test]
     fn insert_single_item_after() {
         assert_eq!(insert_pos(&[50], 100), 1);
-    }
-
-    // ── lru_evict_candidate ─────────────────────────────────────────────────
-    // Guards the room_view_cache eviction logic.  A regression here means
-    // the wrong room gets evicted (possibly the room the user is in), causing
-    // an O(n) full-splice on a room the user never left.
-
-    #[test]
-    fn evict_oldest_non_current() {
-        let order = ["room_a", "room_b", "room_c", "room_d"];
-        // room_a is oldest; not current or incoming → should be evicted.
-        assert_eq!(lru_evict_candidate(&order, "room_d", "room_e"), Some("room_a"));
-    }
-
-    #[test]
-    fn evict_skips_current_room() {
-        let order = ["room_a", "room_b"];
-        // room_a is oldest but it IS current — skip it, evict room_b.
-        assert_eq!(lru_evict_candidate(&order, "room_a", "room_c"), Some("room_b"));
-    }
-
-    #[test]
-    fn evict_skips_incoming_room() {
-        let order = ["room_a", "room_b", "room_c"];
-        // room_a is oldest but it IS the incoming room — skip it, evict room_b.
-        assert_eq!(lru_evict_candidate(&order, "room_d", "room_a"), Some("room_b"));
-    }
-
-    #[test]
-    fn evict_returns_none_when_all_protected() {
-        // Only current and incoming in the cache — nothing safe to evict.
-        let order = ["room_a", "room_b"];
-        assert_eq!(lru_evict_candidate(&order, "room_a", "room_b"), None);
-    }
-
-    #[test]
-    fn evict_empty_order() {
-        assert_eq!(lru_evict_candidate(&[], "room_a", "room_b"), None);
-    }
-
-    // ── lru_touch — access-order update ─────────────────────────────────────
-    // These guard the fix for the regression where re-accessed rooms were NOT
-    // moved to the back of the eviction order.  Without lru_touch, a room
-    // visited 100 times could be evicted ahead of a room never revisited,
-    // forcing an O(N) pool re-creation every time the user switched back to it.
-
-    fn make_order(rooms: &[&str]) -> VecDeque<String> {
-        rooms.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn touch_moves_room_to_back() {
-        // room_a is first (oldest). After a touch it must be last (newest).
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        lru_touch(&mut order, "room_a");
-        assert_eq!(order.back().map(|s| s.as_str()), Some("room_a"));
-    }
-
-    #[test]
-    fn touch_removes_old_position() {
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        lru_touch(&mut order, "room_a");
-        // room_a must appear exactly once.
-        let count = order.iter().filter(|s| s.as_str() == "room_a").count();
-        assert_eq!(count, 1, "room_a must appear exactly once after touch");
-        assert_eq!(order.len(), 3);
-    }
-
-    #[test]
-    fn touch_middle_room_moves_it_to_back() {
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        lru_touch(&mut order, "room_b");
-        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
-        assert_eq!(v, ["room_a", "room_c", "room_b"]);
-    }
-
-    #[test]
-    fn touch_already_last_is_idempotent() {
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        lru_touch(&mut order, "room_c");
-        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
-        assert_eq!(v, ["room_a", "room_b", "room_c"]);
-    }
-
-    #[test]
-    fn touch_unknown_room_appends_it() {
-        let mut order = make_order(&["room_a", "room_b"]);
-        lru_touch(&mut order, "room_new");
-        assert_eq!(order.back().map(|s| s.as_str()), Some("room_new"));
-        assert_eq!(order.len(), 3);
-    }
-
-    // ── combined: touch + evict invariant ────────────────────────────────────
-    // This is the regression scenario: visiting room_a repeatedly must not
-    // cause it to be evicted ahead of rooms that were never re-accessed.
-
-    #[test]
-    fn touched_room_is_not_evict_candidate() {
-        // Initial order: room_a (oldest), room_b, room_c.
-        // Without a touch, room_a would be the eviction candidate.
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        // Simulate the user opening room_a (cache hit → lru_touch).
-        lru_touch(&mut order, "room_a");
-        // Order is now: room_b, room_c, room_a.
-        // Now open room_d (not in cache) while current=room_a.
-        // room_b must be the eviction candidate, NOT room_a.
-        let order_refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
-        let candidate = lru_evict_candidate(&order_refs, "room_a", "room_d");
-        assert_eq!(candidate, Some("room_b"),
-            "room_b (least recently accessed) must be evicted, not room_a which was just touched");
-    }
-
-    #[test]
-    fn repeated_touches_keep_room_at_back() {
-        let mut order = make_order(&["room_a", "room_b", "room_c"]);
-        // Visit room_a three times.
-        lru_touch(&mut order, "room_a");
-        lru_touch(&mut order, "room_a");
-        lru_touch(&mut order, "room_a");
-        assert_eq!(order.back().map(|s| s.as_str()), Some("room_a"));
-        assert_eq!(order.len(), 3, "no duplicates after repeated touches");
-    }
-
-    #[test]
-    fn interleaved_touches_produce_correct_eviction_order() {
-        // User visits: a, b, c, then goes back to a, then to b.
-        // Eviction order should be: c first (least recently visited), then a, then b.
-        let mut order = VecDeque::new();
-        // First visits (push_back on first creation).
-        lru_touch(&mut order, "room_a");
-        lru_touch(&mut order, "room_b");
-        lru_touch(&mut order, "room_c");
-        // Return visits (lru_touch on cache hit).
-        lru_touch(&mut order, "room_a");
-        lru_touch(&mut order, "room_b");
-        // Order: room_c, room_a, room_b (c oldest, b newest).
-        let v: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
-        assert_eq!(v, ["room_c", "room_a", "room_b"]);
-        // Opening a new room with room_b as current — room_c evicted first.
-        let candidate = lru_evict_candidate(&v, "room_b", "room_new");
-        assert_eq!(candidate, Some("room_c"));
     }
 
     // ── incremental_prev_batch (pagination token restoration) ────────────────
