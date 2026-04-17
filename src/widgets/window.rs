@@ -2060,8 +2060,14 @@ impl MxWindow {
                                 message.timestamp,
                             );
                         }
-                        // Bubble the room to the top of the list immediately.
-                        if message.timestamp > 0 {
+                        // Bubble the room to the top of the list immediately —
+                        // but only when the window is active.  When unfocused,
+                        // room ordering is invisible to the user; the next
+                        // update_rooms call (from the 50 ms ticker after a
+                        // RoomListUpdated arrives) will sort rooms correctly.
+                        // Skipping this avoids O(rooms) scans and rebuild_stores
+                        // calls for every NewMessage during a backlog drain.
+                        if message.timestamp > 0 && window_focused {
                             room_list_view.bump_room_activity(&room_id, message.timestamp);
                         }
                     }

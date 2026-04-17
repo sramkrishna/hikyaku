@@ -1044,12 +1044,21 @@ impl RoomListView {
         }
         imp.bump_rebuild_pending.set(true);
         let view_weak = self.downgrade();
-        glib::idle_add_local_once(move || {
-            let Some(view) = view_weak.upgrade() else { return };
+        // Use Priority::LOW (300) — lower than DEFAULT_IDLE (200) — so this
+        // rebuild fires AFTER the event-loop future has finished draining the
+        // backlog.  The future continuation is scheduled at DEFAULT_IDLE (200)
+        // each time it yields, so all remaining events are processed before any
+        // rebuild_stores call runs.  This coalesces an entire burst of N
+        // NewMessage events into a single rebuild regardless of burst size.
+        glib::idle_add_local_full(glib::Priority::LOW, move || {
+            let Some(view) = view_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             let imp = view.imp();
             imp.bump_rebuild_pending.set(false);
             let cached = imp.cached_rooms.borrow().clone();
             view.rebuild_stores(&cached);
+            glib::ControlFlow::Break
         });
     }
 
