@@ -2473,13 +2473,20 @@ impl MessageView {
         imp.model_swap_pending.set(true);
         let view_weak = self.downgrade();
         let room_id_owned = room_id.to_string();
-        glib::idle_add_local_once(move || {
-            let Some(view) = view_weak.upgrade() else { return };
+        // add_tick_callback calls begin_updating() on the frame clock, which
+        // explicitly requests a vsync frame from the compositor.  Unlike
+        // idle_add_local_once, this is guaranteed to fire within ~16ms even
+        // after the app has been idle for minutes (the compositor restarts frame
+        // callbacks on begin_updating regardless of how long it was paused).
+        imp.scrolled_window().add_tick_callback(move |_sw, _clock| {
+            let Some(view) = view_weak.upgrade() else { return glib::ControlFlow::Break; };
             let imp = view.imp();
-            // Guard: room changed while this idle was queued (rapid switching).
-            if *imp.current_room_id.borrow() != room_id_owned { return; }
+            // Guard: room changed while tick was pending (rapid switching).
+            if *imp.current_room_id.borrow() != room_id_owned {
+                return glib::ControlFlow::Break;
+            }
             // Guard: set_messages() already attached the model (first_load path).
-            if !imp.model_swap_pending.get() { return; }
+            if !imp.model_swap_pending.get() { return glib::ControlFlow::Break; }
             imp.model_swap_pending.set(false);
             let store = imp.ensure_room_store(&room_id_owned);
             let no_sel = gtk::NoSelection::new(Some(store));
@@ -2493,6 +2500,7 @@ impl MessageView {
                 }
             }
             // else: leave on "loading"; set_messages() will handle it.
+            glib::ControlFlow::Break
         });
 
         tracing::info!(
