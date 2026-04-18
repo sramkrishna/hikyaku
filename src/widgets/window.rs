@@ -956,6 +956,7 @@ impl MxWindow {
             let cache_hit = window_weak.upgrade()
                 .and_then(|w| w.imp().timeline_cache.get().cloned())
                 .and_then(|cache| cache.get_memory(&room_id));
+            tracing::info!("room_selected phase3a (get_memory) took {:?}", _t_phase3.elapsed());
 
             if let Some((msgs, prev_batch, mut meta)) = cache_hit {
                 meta.unread_count = meta.unread_count.max(known_unread);
@@ -968,12 +969,15 @@ impl MxWindow {
                             .map(|o| o.kind() == crate::matrix::RoomKind::DirectMessage)
                             .unwrap_or(false)
                     };
+                    tracing::info!("room_selected phase3b (is_dm lookup) took {:?}", _t_phase3.elapsed());
                     msg_view.set_is_dm_room(is_dm);
                     msg_view.set_no_media(wimp.room_list_view.resolve_no_media(&room_id));
+                    tracing::info!("room_selected phase3c (set_is_dm+no_media) took {:?}", _t_phase3.elapsed());
                     // Switch to the new room's per-room ListView (O(1)).
                     // For return visits existing messages show immediately;
                     // for first visits the spinner shows until set_messages arrives.
                     msg_view.clear(&room_id);
+                    tracing::info!("room_selected phase3d (clear) took {:?}", _t_phase3.elapsed());
                     msg_view.set_room_meta(&meta);
                     if let Some(btn) = wimp.bookmark_button.get() {
                         btn.set_icon_name(if meta.is_favourite {
@@ -992,8 +996,12 @@ impl MxWindow {
                     // detached (O(N) memory, no GTK layout until re-attach).
                     // Deferring to idle caused vsync starvation on Lunar Lake
                     // (see clear() comment for details).
+                    let _t_sm = std::time::Instant::now();
                     msg_view.set_messages(&msgs, prev_batch);
+                    tracing::info!("room_selected phase3e (set_messages) took {:?}", _t_sm.elapsed());
+                    let _t_bm = std::time::Instant::now();
                     msg_view.load_bookmarks(&room_id);
+                    tracing::info!("room_selected phase3f (load_bookmarks) took {:?}", _t_bm.elapsed());
                 }
             } else {
                 // Cold cache — show loading state and wait for Tokio.
