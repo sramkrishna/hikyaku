@@ -2933,6 +2933,10 @@ impl MessageView {
 
     /// Show or hide the banner that indicates a background refresh is in
     /// progress while stale cached messages are displayed.
+    pub fn is_loading(&self) -> bool {
+        self.imp().view_stack.visible_child_name().as_deref() == Some("loading")
+    }
+
     pub fn set_refreshing(&self, refreshing: bool) {
         // Only show "Updating messages" when there are no messages yet (first
         // load of the room).  Background re-fetches triggered by SyncGap on

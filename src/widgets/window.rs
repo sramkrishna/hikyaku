@@ -1898,12 +1898,15 @@ impl MxWindow {
                                     messages,
                                     prev_batch_token,
                                 );
-                                if window.is_active() {
-                                    // Active window: consume immediately.
-                                    // idle_add_local_once (priority 200) is starved by the
-                                    // loading spinner's begin_updating() at priority 120,
-                                    // causing 1-5s delays for cold-cache rooms and after
-                                    // app-idle periods on some hardware (e.g. Lunar Lake).
+                                if window.is_active() && message_view.is_loading() {
+                                    // Consume synchronously only while the loading spinner is
+                                    // visible.  The spinner's begin_updating() keeps a tick
+                                    // callback at GDK_PRIORITY_REDRAW (120) which starves
+                                    // idle_add_local_once (priority 200), causing 1-5s delays
+                                    // for cold-cache rooms.  When messages are already shown
+                                    // (user is scrolling), the spinner is off and the idle
+                                    // fires promptly — calling synchronously there would block
+                                    // the frame and cause scroll jank.
                                     let Some((msgs, token)) = window.imp()
                                         .pending_bg_refresh.borrow_mut()
                                         .remove(&room_id)
