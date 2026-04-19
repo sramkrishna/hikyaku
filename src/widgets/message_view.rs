@@ -36,17 +36,17 @@ mod imp {
     #[derive(CompositeTemplate)]
     #[template(file = "src/widgets/message_view.blp")]
     pub struct MessageView {
-        // ── Single shared ListView (constant widget tree size) ───────────────
-        /// The one and only ListView — its model is swapped on room switch.
-        /// Widget tree size stays constant regardless of rooms visited.
-        pub main_list_view: std::cell::OnceCell<gtk::ListView>,
-        /// The one and only ScrolledWindow wrapping main_list_view.
-        pub main_scrolled_window: std::cell::OnceCell<gtk::ScrolledWindow>,
-        /// Shared factory attached to main_list_view (set once in constructed).
+        // ── Per-room ListView + GtkStack (O(1) room switch) ──────────────────
+        /// Stack containing one ScrolledWindow per visited room.
+        /// set_visible_child_name(room_id) on switch — no items_changed, no splice.
+        pub room_view_stack: std::cell::OnceCell<gtk::Stack>,
+        /// room_id → (ScrolledWindow, ListView) — widget tree kept alive.
+        pub room_view_cache: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::ListView)>>,
+        /// Shared factory — one instance, reused for every per-room ListView.
         pub factory: std::cell::OnceCell<gtk::SignalListItemFactory>,
         /// Dedicated store for the seek context window — never the live store.
         pub seek_store: gio::ListStore,
-        /// Blueprint placeholder that main_scrolled_window is inserted into.
+        /// Blueprint placeholder where room_view_stack is inserted.
         #[template_child]
         pub room_list_placeholder: TemplateChild<gtk::Box>,
         /// room_id → gio::ListStore (lightweight GObjects, no widget overhead).
@@ -228,8 +228,8 @@ mod imp {
     impl Default for MessageView {
         fn default() -> Self {
             Self {
-                main_list_view: std::cell::OnceCell::new(),
-                main_scrolled_window: std::cell::OnceCell::new(),
+                room_view_stack: std::cell::OnceCell::new(),
+                room_view_cache: RefCell::new(HashMap::new()),
                 factory: std::cell::OnceCell::new(),
                 seek_store: gio::ListStore::new::<crate::models::MessageObject>(),
                 room_list_placeholder: Default::default(),
@@ -338,14 +338,22 @@ mod imp {
             self.cur_list_store.borrow().clone()
         }
 
-        /// The single shared ListView — its model is swapped on room switch.
+        /// ListView for the currently visible room.
         pub fn list_view(&self) -> gtk::ListView {
-            self.main_list_view.get().expect("list_view() called before constructed()").clone()
+            let rid = self.current_room_id.borrow().clone();
+            self.room_view_cache.borrow()
+                .get(&rid)
+                .map(|(_, lv)| lv.clone())
+                .expect("list_view() called before room is set up")
         }
 
-        /// The single shared ScrolledWindow wrapping main_list_view.
+        /// ScrolledWindow for the currently visible room.
         pub fn scrolled_window(&self) -> gtk::ScrolledWindow {
-            self.main_scrolled_window.get().expect("scrolled_window() called before constructed()").clone()
+            let rid = self.current_room_id.borrow().clone();
+            self.room_view_cache.borrow()
+                .get(&rid)
+                .map(|(sw, _)| sw.clone())
+                .expect("scrolled_window() called before room is set up")
         }
 
         /// Get or create the per-room gio::ListStore.  Only stores data — no
@@ -358,6 +366,59 @@ mod imp {
             let store = gio::ListStore::new::<crate::models::MessageObject>();
             self.list_store_cache.borrow_mut().insert(room_id.to_string(), store.clone());
             store
+        }
+
+        /// Get or create the per-room ScrolledWindow+ListView in room_view_stack.
+        ///
+        /// On first call for a room: creates the widgets, connects the scroll-to-top
+        /// signal (for backpagination), sets the model, and adds to room_view_stack.
+        /// On subsequent calls: returns the cached widgets without touching the model.
+        ///
+        /// The factory is shared across all per-room ListViews — setup/bind closures
+        /// capture a reference to the MessageView, not to a specific ListView, so
+        /// multiple ListViews using the same factory work correctly.
+        pub fn ensure_room_view(&self, room_id: &str) {
+            if self.room_view_cache.borrow().contains_key(room_id) {
+                return;
+            }
+
+            let store = self.ensure_room_store(room_id);
+            let no_sel = gtk::NoSelection::new(Some(store));
+
+            let lv = gtk::ListView::builder().build();
+            lv.set_factory(self.factory.get());
+            lv.set_model(Some(&no_sel));
+
+            let sw = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .child(&lv)
+                .css_classes(["mx-tinted-bg"])
+                .build();
+
+            // Backpagination: when user scrolls near the top, request older messages.
+            // Guard on current_room_id so hidden rooms don't accidentally trigger this.
+            let view_weak = self.obj().downgrade();
+            let guard_rid = room_id.to_string();
+            sw.vadjustment().connect_value_notify(move |adj| {
+                if adj.value() >= 50.0 { return; }
+                let Some(view) = view_weak.upgrade() else { return };
+                let imp = view.imp();
+                if *imp.current_room_id.borrow() != guard_rid { return; }
+                if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
+                    imp.fetching_older.set(true);
+                    if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                        cb();
+                    }
+                }
+            });
+
+            self.room_view_stack.get()
+                .expect("room_view_stack must be set in constructed()")
+                .add_named(&sw, Some(room_id));
+
+            self.room_view_cache.borrow_mut()
+                .insert(room_id.to_string(), (sw, lv));
         }
     }
 
@@ -560,40 +621,18 @@ mod imp {
                 }
             });
 
-            // Attach factory to the single shared ListView.
+            // Store factory; per-room ListViews are created on demand in ensure_room_view().
             self.factory.set(factory).expect("factory already initialised");
 
-            // Create the single shared ScrolledWindow + ListView.  All rooms share
-            // this one widget tree — only the model (gio::ListStore) is swapped on
-            // room switch.  Widget tree size is constant regardless of rooms visited.
-            let main_lv = gtk::ListView::builder().build();
-            main_lv.set_factory(self.factory.get());
-            let main_sw = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
+            // Stack that holds one ScrolledWindow+ListView per visited room.
+            // set_visible_child_name(room_id) on switch is O(1) — no items_changed,
+            // no set_model(), no GTK layout work.
+            let stack = gtk::Stack::builder()
+                .transition_type(gtk::StackTransitionType::None)
                 .vexpand(true)
-                .child(&main_lv)
-                .css_classes(["mx-tinted-bg"])
                 .build();
-
-            // Connect scroll-to-top handler once — works for all rooms since the
-            // ScrolledWindow is shared.
-            let view_weak = self.obj().downgrade();
-            main_sw.vadjustment().connect_value_notify(move |adj| {
-                if adj.value() < 50.0 {
-                    let Some(view) = view_weak.upgrade() else { return };
-                    let imp = view.imp();
-                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
-                        imp.fetching_older.set(true);
-                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
-                            cb();
-                        }
-                    }
-                }
-            });
-
-            self.main_list_view.set(main_lv).ok();
-            self.main_scrolled_window.set(main_sw.clone()).ok();
-            self.room_list_placeholder.append(&main_sw);
+            self.room_view_stack.set(stack.clone()).ok();
+            self.room_list_placeholder.append(&stack);
 
             // Assemble the seek banner: [spinner] [label] [Jump to latest btn]
             let seek_btn = gtk::Button::builder().label("Jump to latest").build();
@@ -2400,10 +2439,13 @@ impl MessageView {
                 .insert(old_room_id, imp.messages_loaded.get());
         }
 
-        // ── Set up incoming room store (no widget creation) ──────────────────
-        let is_return_visit = imp.list_store_cache.borrow().contains_key(room_id);
+        // ── Set up incoming room view and store ──────────────────────────────
+        let is_return_visit = imp.room_view_cache.borrow().contains_key(room_id);
+        // Create per-room ListView+ScrolledWindow on first visit (O(1) setup).
+        // On return visits ensure_room_view is a no-op.
+        imp.ensure_room_view(room_id);
         let list_store = imp.ensure_room_store(room_id);
-        *imp.cur_list_store.borrow_mut() = list_store.clone();
+        *imp.cur_list_store.borrow_mut() = list_store;
         *imp.current_room_id.borrow_mut() = room_id.to_string();
 
         // Restore per-room state for return visits so set_messages can skip an
@@ -2445,13 +2487,12 @@ impl MessageView {
         imp.reply_preview.set_visible(false);
         imp.typing_label.set_visible(false);
 
-        // ── Swap the model synchronously ─────────────────────────────────────
-        let _t_clear = std::time::Instant::now();
-        let no_sel = gtk::NoSelection::new(Some(list_store));
-        tracing::info!("clear: NoSelection::new took {:?}", _t_clear.elapsed());
-        let _t_set = std::time::Instant::now();
-        imp.list_view().set_model(Some(&no_sel));
-        tracing::info!("clear: set_model took {:?}", _t_set.elapsed());
+        // ── Switch to this room's ListView — O(1), no items_changed ──────────
+        // ensure_room_view creates the per-room widgets once; on return visits
+        // room_view_stack.set_visible_child_name() just unhides the existing tree.
+        // No set_model(), no splice, no GTK layout work on room switch.
+        imp.ensure_room_view(room_id);
+        imp.room_view_stack.get().unwrap().set_visible_child_name(room_id);
 
         if should_show_loading_after_switch(is_return_visit, was_loaded) {
             imp.view_stack.set_visible_child_name("loading");
