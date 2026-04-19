@@ -2453,26 +2453,23 @@ impl MessageView {
         imp.list_view().set_model(Some(&no_sel));
         tracing::info!("clear: set_model took {:?}", _t_set.elapsed());
 
-        if is_return_visit && was_loaded {
-            // Return visit: show existing messages immediately (no loading flash).
+        if should_show_loading_after_switch(is_return_visit, was_loaded) {
+            imp.view_stack.set_visible_child_name("loading");
+        } else {
+            // Return visit with loaded messages: show immediately (no loading flash).
             imp.view_stack.set_visible_child_name("messages");
-            // Scroll restore is deferred one idle so GTK has computed heights
-            // in the layout pass.  Idle fires at priority 200, after the frame
-            // (priority 120) has measured rows — adj.upper() is then correct.
+            // Scroll restore deferred one idle so GTK has computed row heights.
             if let Some(frac) = imp.saved_scroll_frac.borrow_mut().remove(room_id) {
                 let view_weak = self.downgrade();
                 let room_id_owned = room_id.to_string();
                 glib::idle_add_local_once(move || {
                     let Some(view) = view_weak.upgrade() else { return };
                     let imp = view.imp();
-                    if *imp.current_room_id.borrow() != room_id_owned { return; }
+                    if *imp.current_room_id.borrow() != room_id_owned { return };
                     let adj = imp.scrolled_window().vadjustment();
                     adj.set_value(scroll_restore_value(frac, adj.upper(), adj.page_size()));
                 });
             }
-        } else {
-            // First visit: show loading spinner; set_messages() will switch to messages.
-            imp.view_stack.set_visible_child_name("loading");
         }
 
         tracing::info!(
@@ -3020,6 +3017,23 @@ pub(crate) fn scroll_restore_value(frac: f64, upper: f64, page_size: f64) -> f64
 /// are already displayed — only the first-load path may process an empty slice.
 pub(crate) fn should_skip_empty_splice(messages_empty: bool, first_load: bool) -> bool {
     messages_empty && !first_load
+}
+
+/// After a room switch, should the view show the loading spinner?
+///
+/// Only return visits where messages were previously loaded get to show
+/// messages immediately.  Everything else shows the spinner and waits for
+/// RoomMessages to arrive via bg_refresh.
+///
+/// This is the invariant that ensures:
+///  - First visit → spinner (cold cache, wait for data)
+///  - Return visit, was_loaded=true  → messages immediately (O(1) stack switch)
+///  - Return visit, was_loaded=false → spinner (previous visit didn't finish loading)
+pub(crate) fn should_show_loading_after_switch(
+    is_return_visit: bool,
+    was_loaded: bool,
+) -> bool {
+    !(is_return_visit && was_loaded)
 }
 
 
@@ -3973,7 +3987,8 @@ mod tests {
     // Regression guard: these normalise scroll position across room switches.
     // If the math changes, restored position will be wrong on return visits.
 
-    use super::{scroll_save_frac, scroll_restore_value};
+    use super::{scroll_save_frac, scroll_restore_value, should_show_loading_after_switch};
+    use std::collections::HashMap;
 
     #[test]
     fn scroll_save_bottom() {
@@ -4020,5 +4035,70 @@ mod tests {
         // When content fits entirely on screen, restored value should be 0.
         let value = scroll_restore_value(0.5, 20.0, 20.0);
         assert!((value - 0.0).abs() < 1e-9, "zero-range restore → 0.0, got {value}");
+    }
+
+    // ── should_show_loading_after_switch ─────────────────────────────────────
+    // Regression guard for the per-room ListView refactor.
+    //
+    // The invariant: only return visits where messages were fully loaded get
+    // to skip the spinner.  If this logic is wrong, users see a spinner on
+    // every return visit (was_loaded not restored) or see stale messages where
+    // the spinner should be (is_return_visit detection broken).
+
+    #[test]
+    fn loading_shown_on_first_visit() {
+        assert!(should_show_loading_after_switch(false, false),
+            "first visit (is_return_visit=false) must show loading");
+    }
+
+    #[test]
+    fn loading_shown_on_return_visit_not_yet_loaded() {
+        // Room was visited but messages never finished loading (e.g. network error).
+        assert!(should_show_loading_after_switch(true, false),
+            "return visit with was_loaded=false must show loading");
+    }
+
+    #[test]
+    fn no_loading_on_return_visit_with_loaded_messages() {
+        // Happy path: return to a room whose messages are in the store.
+        assert!(!should_show_loading_after_switch(true, true),
+            "return visit with was_loaded=true must NOT show loading");
+    }
+
+    // ── per-room messages_loaded save/restore ─────────────────────────────────
+    // Scenario: switch A→B→A and verify was_loaded is correctly round-tripped.
+    // This is the pure-logic part of what clear() does for saved_messages_loaded.
+
+    #[test]
+    fn messages_loaded_survives_room_switch() {
+        let mut saved: HashMap<String, bool> = HashMap::new();
+
+        // User visits room A; set_messages() fires → messages_loaded = true.
+        // On switch away from A, clear() saves it.
+        saved.insert("!a:s".into(), true);
+
+        // User visits room B (first visit, not in map yet).
+        let was_loaded_b = saved.remove("!b:s").unwrap_or(false);
+        assert!(!was_loaded_b, "first visit to B: was_loaded must be false");
+
+        // set_messages() for B fires → messages_loaded = true; save on switch away.
+        saved.insert("!b:s".into(), true);
+
+        // Return to room A.
+        let was_loaded_a2 = saved.remove("!a:s").unwrap_or(false);
+        assert!(was_loaded_a2,
+            "return to A: was_loaded must be true (saved before B was visited)");
+        // Loading decision: return visit + was_loaded=true → show messages.
+        assert!(!should_show_loading_after_switch(true, was_loaded_a2));
+    }
+
+    #[test]
+    fn messages_loaded_false_when_room_never_loaded() {
+        let saved: HashMap<String, bool> = HashMap::new();
+        // Room C was added to the view cache but set_messages() never fired.
+        let was_loaded = saved.get("!c:s").copied().unwrap_or(false);
+        assert!(!was_loaded);
+        assert!(should_show_loading_after_switch(true, was_loaded),
+            "return visit with no saved state must show loading");
     }
 }
