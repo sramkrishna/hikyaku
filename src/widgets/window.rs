@@ -1898,15 +1898,10 @@ impl MxWindow {
                                     messages,
                                     prev_batch_token,
                                 );
-                                if window.is_active() && message_view.is_loading() {
-                                    // Consume synchronously only while the loading spinner is
-                                    // visible.  The spinner's begin_updating() keeps a tick
-                                    // callback at GDK_PRIORITY_REDRAW (120) which starves
-                                    // idle_add_local_once (priority 200), causing 1-5s delays
-                                    // for cold-cache rooms.  When messages are already shown
-                                    // (user is scrolling), the spinner is off and the idle
-                                    // fires promptly — calling synchronously there would block
-                                    // the frame and cause scroll jank.
+                                if should_process_bg_refresh_sync(
+                                    window.is_active(),
+                                    message_view.is_loading(),
+                                ) {
                                     let Some((msgs, token)) = window.imp()
                                         .pending_bg_refresh.borrow_mut()
                                         .remove(&room_id)
@@ -6973,6 +6968,22 @@ fn parse_matrix_link_or_id(text: &str) -> Option<String> {
 /// the window is unfocused, only the first call schedules an idle and all 10
 /// calls update the slot with the latest data.  The idle fires once and calls
 /// `set_messages()` exactly once with the most recent batch.
+/// Returns true iff the bg_refresh batch for the currently-visible room should
+/// be consumed synchronously instead of deferred to idle_add_local_once.
+///
+/// Synchronous processing is correct only when the loading spinner is shown:
+/// the spinner's begin_updating() keeps a tick callback at GDK_PRIORITY_REDRAW
+/// (120), which starves idle_add_local_once (priority 200) indefinitely.
+/// When messages are already visible (is_loading = false), the spinner is off
+/// and the idle fires promptly; calling synchronously there blocks the current
+/// frame and causes visible scroll jank.
+pub(crate) fn should_process_bg_refresh_sync(
+    window_active: bool,
+    view_is_loading: bool,
+) -> bool {
+    window_active && view_is_loading
+}
+
 fn bg_refresh_insert(
     map: &mut std::collections::HashMap<String, (Vec<crate::matrix::MessageInfo>, Option<String>)>,
     room_id: &str,
@@ -7008,7 +7019,7 @@ fn percent_decode_simple(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bg_refresh_insert;
+    use super::{bg_refresh_insert, should_process_bg_refresh_sync};
     use crate::matrix::MessageInfo;
     use std::collections::HashMap;
 
@@ -7146,5 +7157,57 @@ mod tests {
         // Switch to a room for which no bg_refresh is pending.
         map.retain(|rid, _| rid == "!new_room:s");
         assert!(map.is_empty());
+    }
+
+    // ── should_process_bg_refresh_sync ──────────────────────────────────────
+    // Regression guard: we introduced scroll jank by processing synchronously
+    // even when messages were already visible (is_loading=false).  The gate
+    // must restrict sync processing to the loading-spinner state only.
+
+    #[test]
+    fn sync_only_when_active_and_loading() {
+        // Nominal case: window has focus AND view is showing the loading spinner.
+        assert!(should_process_bg_refresh_sync(true, true));
+    }
+
+    #[test]
+    fn no_sync_when_messages_visible() {
+        // Regression case: messages already shown (user scrolling) — must defer
+        // to idle so we don't block the frame and cause scroll jank.
+        assert!(!should_process_bg_refresh_sync(true, false));
+    }
+
+    #[test]
+    fn no_sync_when_window_inactive() {
+        // Unfocused window: even if spinner is showing, defer to idle;
+        // the notify::is-active handler will drain pending_bg_refresh on focus.
+        assert!(!should_process_bg_refresh_sync(false, true));
+    }
+
+    #[test]
+    fn no_sync_when_inactive_and_not_loading() {
+        assert!(!should_process_bg_refresh_sync(false, false));
+    }
+
+    // ── synchronous-consume then re-schedule scenario ────────────────────────
+    // After the active+loading path removes the entry from pending_bg_refresh,
+    // a subsequent bg_refresh for the same room must schedule a fresh idle
+    // (had_pending = false) so the data is not silently dropped.
+
+    #[test]
+    fn sync_consume_then_idle_reschedule() {
+        let mut map = HashMap::new();
+        // First batch arrives while loading — it will be consumed synchronously
+        // (not via idle), so no idle is scheduled.  The entry is inserted, then
+        // immediately removed by the sync path.
+        let had1 = bg_refresh_insert(&mut map, "!r:s", batch(&["$ev1"]), None);
+        assert!(!had1, "first insert must not see a prior entry");
+        // Simulate the sync path consuming the entry.
+        map.remove("!r:s");
+        // A follow-up batch (e.g. server push after first load) must reschedule
+        // — had_pending must be false so the idle is not suppressed.
+        let had2 = bg_refresh_insert(&mut map, "!r:s", batch(&["$ev2"]), None);
+        assert!(!had2, "after sync consume, next insert must reschedule idle");
+        assert_eq!(map["!r:s"].0[0].event_id, "$ev2");
     }
 }

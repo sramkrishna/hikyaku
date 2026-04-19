@@ -2391,8 +2391,7 @@ impl MessageView {
             // Save normalized scroll position so we can restore it on return.
             let sw = imp.scrolled_window();
             let adj = sw.vadjustment();
-            let max = (adj.upper() - adj.page_size()).max(1.0);
-            let frac = (adj.value() / max).clamp(0.0, 1.0);
+            let frac = scroll_save_frac(adj.value(), adj.upper(), adj.page_size());
             imp.saved_scroll_frac.borrow_mut().insert(old_room_id.clone(), frac);
 
             let idx = imp.event_index.borrow().clone();
@@ -2447,17 +2446,12 @@ impl MessageView {
         imp.typing_label.set_visible(false);
 
         // ── Swap the model synchronously ─────────────────────────────────────
-        // Deferring to add_tick_callback (the previous approach) caused a
-        // vsync-starvation bug on Lunar Lake: the GtkSpinner shown during
-        // loading calls begin_updating() at 60Hz (priority 120), which
-        // prevented the priority-200 idle_add_local_once(set_messages) from
-        // ever running — causing 1-1.5s delays on every room switch.
-        //
-        // set_model on an empty store is O(1).  On a pre-populated store the
-        // bind callbacks for visible rows are O(~15 rows) and are deferred to
-        // the next GTK layout pass — the handler returns in <5ms either way.
+        let _t_clear = std::time::Instant::now();
         let no_sel = gtk::NoSelection::new(Some(list_store));
+        tracing::info!("clear: NoSelection::new took {:?}", _t_clear.elapsed());
+        let _t_set = std::time::Instant::now();
         imp.list_view().set_model(Some(&no_sel));
+        tracing::info!("clear: set_model took {:?}", _t_set.elapsed());
 
         if is_return_visit && was_loaded {
             // Return visit: show existing messages immediately (no loading flash).
@@ -2473,8 +2467,7 @@ impl MessageView {
                     let imp = view.imp();
                     if *imp.current_room_id.borrow() != room_id_owned { return; }
                     let adj = imp.scrolled_window().vadjustment();
-                    let max = (adj.upper() - adj.page_size()).max(0.0);
-                    adj.set_value(frac * max);
+                    adj.set_value(scroll_restore_value(frac, adj.upper(), adj.page_size()));
                 });
             }
         } else {
@@ -3007,6 +3000,19 @@ where
         }
     }
     lo
+}
+
+/// Normalize the current scroll position to a [0,1] fraction for save/restore.
+/// `upper` and `page_size` come from `vadjustment()`.
+pub(crate) fn scroll_save_frac(value: f64, upper: f64, page_size: f64) -> f64 {
+    let max = (upper - page_size).max(1.0);
+    (value / max).clamp(0.0, 1.0)
+}
+
+/// Restore a saved scroll fraction to an absolute `vadjustment` value.
+pub(crate) fn scroll_restore_value(frac: f64, upper: f64, page_size: f64) -> f64 {
+    let max = (upper - page_size).max(0.0);
+    frac * max
 }
 
 /// Pure helper: should `set_messages` skip the splice when the payload is empty?
@@ -3961,5 +3967,58 @@ mod tests {
         let result = incremental_prev_batch(Some("deep_token"), None);
         assert_eq!(result.as_deref(), Some("deep_token"),
             "existing pagination token must survive a None in bg_refresh");
+    }
+
+    // ── scroll_save_frac / scroll_restore_value ──────────────────────────────
+    // Regression guard: these normalise scroll position across room switches.
+    // If the math changes, restored position will be wrong on return visits.
+
+    use super::{scroll_save_frac, scroll_restore_value};
+
+    #[test]
+    fn scroll_save_bottom() {
+        // At the very bottom: value == upper - page_size → frac == 1.0.
+        let frac = scroll_save_frac(480.0, 500.0, 20.0);
+        assert!((frac - 1.0).abs() < 1e-9, "bottom → frac 1.0, got {frac}");
+    }
+
+    #[test]
+    fn scroll_save_top() {
+        let frac = scroll_save_frac(0.0, 500.0, 20.0);
+        assert!((frac - 0.0).abs() < 1e-9, "top → frac 0.0, got {frac}");
+    }
+
+    #[test]
+    fn scroll_save_midpoint() {
+        // value = 240, max = 480 → frac = 0.5.
+        let frac = scroll_save_frac(240.0, 500.0, 20.0);
+        assert!((frac - 0.5).abs() < 1e-9, "midpoint → frac 0.5, got {frac}");
+    }
+
+    #[test]
+    fn scroll_save_clamps_to_zero_on_tiny_list() {
+        // upper == page_size: nothing to scroll, max forced to 1.0 to avoid /0.
+        // value == 0 → fraction 0.0.
+        let frac = scroll_save_frac(0.0, 20.0, 20.0);
+        assert!((frac - 0.0).abs() < 1e-9, "tiny list top → frac 0.0, got {frac}");
+    }
+
+    #[test]
+    fn scroll_restore_roundtrip() {
+        // Save then restore must be lossless.
+        let value_in = 240.0_f64;
+        let upper = 500.0_f64;
+        let page = 20.0_f64;
+        let frac = scroll_save_frac(value_in, upper, page);
+        let value_out = scroll_restore_value(frac, upper, page);
+        assert!((value_out - value_in).abs() < 1e-6,
+            "save→restore roundtrip: in={value_in} out={value_out}");
+    }
+
+    #[test]
+    fn scroll_restore_zero_range_returns_zero() {
+        // When content fits entirely on screen, restored value should be 0.
+        let value = scroll_restore_value(0.5, 20.0, 20.0);
+        assert!((value - 0.0).abs() < 1e-9, "zero-range restore → 0.0, got {value}");
     }
 }
