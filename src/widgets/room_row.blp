@@ -4,20 +4,25 @@ using Adw 1;
 template $MxRoomRow : Gtk.Box {
   orientation: horizontal;
   spacing: 8;
-  margin-top: 4;
-  margin-bottom: 4;
+  margin-top: 1;
+  margin-bottom: 1;
   margin-start: 6;
   margin-end: 6;
 
   Adw.Avatar avatar {
     size: 32;
     show-initials: true;
+    margin-top: 6;
+    margin-start: 6;
+    margin-bottom: 6;
   }
 
   Gtk.Box name_box {
     orientation: vertical;
     hexpand: true;
     valign: center;
+    margin-top: 6;
+    margin-bottom: 6;
 
     Gtk.Label name_label {
       halign: start;
