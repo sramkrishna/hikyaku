@@ -1889,18 +1889,48 @@ impl MxWindow {
                             let pending_flash = window.imp().pending_flash_event_id.take();
 
                             if is_background {
-                                // Coalesce: store the LATEST batch for this room, schedule
-                                // at most one idle per room.  If 10 bg_refresh events arrive
-                                // while the window is unfocused, only the last batch fires
-                                // set_messages() — not all 10 (which would each take 300-
-                                // 1000 ms, causing a multi-second freeze on return).
+                                // Coalesce: always store the latest batch, dropping older
+                                // ones.  If 10 bg_refresh events arrive while unfocused,
+                                // only the last batch fires set_messages — not all 10.
                                 let had_pending = bg_refresh_insert(
                                     &mut window.imp().pending_bg_refresh.borrow_mut(),
                                     &room_id,
                                     messages,
                                     prev_batch_token,
                                 );
-                                if !had_pending {
+                                if window.is_active() {
+                                    // Active window: consume immediately.
+                                    // idle_add_local_once (priority 200) is starved by the
+                                    // loading spinner's begin_updating() at priority 120,
+                                    // causing 1-5s delays for cold-cache rooms and after
+                                    // app-idle periods on some hardware (e.g. Lunar Lake).
+                                    let Some((msgs, token)) = window.imp()
+                                        .pending_bg_refresh.borrow_mut()
+                                        .remove(&room_id)
+                                    else { return };  // consumed by a concurrent drain
+                                    let _t_sm = std::time::Instant::now();
+                                    message_view.set_messages(&msgs, token);
+                                    tracing::info!(
+                                        "bg_refresh set_messages (sync) took {:?} (room={room_id})",
+                                        _t_sm.elapsed()
+                                    );
+                                    if let Some(eid) = pending_flash {
+                                        let found = message_view.scroll_to_event(&eid);
+                                        if !found {
+                                            message_view.start_seek_loading();
+                                            let rid = room_id.clone();
+                                            let tx = command_tx.clone();
+                                            glib::spawn_future_local(async move {
+                                                let _ = tx.send(MatrixCommand::SeekToEvent {
+                                                    room_id: rid,
+                                                    event_id: eid,
+                                                }).await;
+                                            });
+                                        }
+                                    }
+                                } else if !had_pending {
+                                    // Unfocused window: schedule one idle per room.
+                                    // notify::is-active drains pending_bg_refresh on focus.
                                     let mv = message_view.clone();
                                     let weak_win = window.downgrade();
                                     let guard_rid = room_id.clone();
@@ -1914,10 +1944,7 @@ impl MxWindow {
                                         );
                                         if !is_active {
                                             // Wayland pointer-enter woke the main loop but the
-                                            // window has no keyboard focus.  Defer set_messages
-                                            // until actual focus — notify::is-active drains it.
-                                            // The batch stays in pending_bg_refresh.
-                                            // Restore any pending flash so it isn't lost.
+                                            // window has no keyboard focus.  Defer until focus.
                                             if pending_flash.is_some() {
                                                 let mut slot = win.imp()
                                                     .pending_flash_event_id.borrow_mut();
