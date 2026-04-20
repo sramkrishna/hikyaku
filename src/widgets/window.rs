@@ -1529,7 +1529,12 @@ impl MxWindow {
                 std::rc::Rc::new(std::cell::Cell::new(None));
             let ts_idle = enter_ts.clone();
             let ts_tick = enter_ts.clone();
-            motion.connect_enter(move |_, _, _| {
+            motion.connect_enter(move |ctrl, _, _| {
+                // Request a frame immediately on pointer-enter so Mutter wakes
+                // the surface's frame clock without waiting for CSS :hover machinery.
+                if let Some(fc) = ctrl.widget().and_then(|w| w.frame_clock()) {
+                    fc.request_phase(gtk::gdk::FrameClockPhase::PAINT);
+                }
                 if ts_idle.get().is_some() { return; }
                 let t1 = std::time::Instant::now();
                 ts_idle.set(Some(t1));
