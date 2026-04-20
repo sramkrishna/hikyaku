@@ -19,26 +19,10 @@ template $MxMessageView : Gtk.Box {
     }
 
     Gtk.StackPage {
-      name: "loading";
-      child: Gtk.Box {
-        orientation: vertical;
-        valign: center;
-        halign: center;
-        vexpand: true;
-        hexpand: true;
-
-        Gtk.Spinner loading_spinner {
-          spinning: true;
-          width-request: 32;
-          height-request: 32;
-        }
-      };
-    }
-
-    Gtk.StackPage {
       name: "messages";
-      child: Gtk.Box {
-        orientation: vertical;
+      child: Gtk.Overlay {
+        Gtk.Box {
+          orientation: vertical;
 
         // Room info banner — topic, tombstone, pinned messages.
         Gtk.Box info_banner {
@@ -237,7 +221,28 @@ template $MxMessageView : Gtk.Box {
             valign: center;
           }
         }
-      };
+      }
+
+      // Loading overlay — covers the ListView while messages are fetching.
+      // Keeping the ListView allocated (not in a separate Stack page) lets the
+      // factory pool warm up before the spinner hides, eliminating first-scroll jank.
+      [overlay]
+      Gtk.Box room_loading_overlay {
+        orientation: vertical;
+        vexpand: true;
+        hexpand: true;
+        visible: false;
+
+        Gtk.Spinner {
+          spinning: true;
+          width-request: 32;
+          height-request: 32;
+          valign: center;
+          halign: center;
+          vexpand: true;
+        }
+      }
+    };
     }
   }
 }

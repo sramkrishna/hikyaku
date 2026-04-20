@@ -68,7 +68,7 @@ mod imp {
         #[template_child]
         pub view_stack: TemplateChild<gtk::Stack>,
         #[template_child]
-        pub loading_spinner: TemplateChild<gtk::Spinner>,
+        pub room_loading_overlay: TemplateChild<gtk::Box>,
         #[template_child]
         pub attach_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -240,7 +240,7 @@ mod imp {
                 saved_event_indices: RefCell::new(HashMap::new()),
                 saved_messages_loaded: RefCell::new(HashMap::new()),
                 view_stack: Default::default(),
-                loading_spinner: Default::default(),
+                room_loading_overlay: Default::default(),
                 attach_button: Default::default(),
                 input_view: Default::default(),
                 input_placeholder: Default::default(),
@@ -2133,7 +2133,10 @@ impl MessageView {
             let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
             imp.list_view().set_model(Some(&no_sel));
         }
+        // Ensure "messages" is visible (handles placeholder→messages transition)
+        // and hide the loading overlay.
         imp.view_stack.set_visible_child_name("messages");
+        imp.room_loading_overlay.set_visible(false);
 
         // Only auto-scroll on the first load.  Subsequent bg_refresh calls
         // leave the viewport where the user left it.
@@ -2255,8 +2258,9 @@ impl MessageView {
         if let Some(btn) = imp.seek_banner.last_child() { btn.set_visible(true); }
         imp.seek_banner.set_visible(true);
 
-        // Ensure message view is showing.
+        // Ensure message view is showing, overlay hidden.
         imp.view_stack.set_visible_child_name("messages");
+        imp.room_loading_overlay.set_visible(false);
 
         tracing::info!(
             "load_seek_result: {} messages, target={target_event_id}",
@@ -2494,11 +2498,14 @@ impl MessageView {
         imp.ensure_room_view(room_id);
         imp.room_view_stack.get().unwrap().set_visible_child_name(room_id);
 
+        // Always show "messages" so the ListView gets a real size allocation —
+        // this lets the factory pool warm up behind the loading overlay.
+        imp.view_stack.set_visible_child_name("messages");
         if should_show_loading_after_switch(is_return_visit, was_loaded) {
-            imp.view_stack.set_visible_child_name("loading");
+            imp.room_loading_overlay.set_visible(true);
         } else {
-            // Return visit with loaded messages: show immediately (no loading flash).
-            imp.view_stack.set_visible_child_name("messages");
+            // Return visit with loaded messages: reveal immediately (no overlay).
+            imp.room_loading_overlay.set_visible(false);
             // Scroll restore deferred one idle so GTK has computed row heights.
             if let Some(frac) = imp.saved_scroll_frac.borrow_mut().remove(room_id) {
                 let view_weak = self.downgrade();
@@ -2965,7 +2972,7 @@ impl MessageView {
     /// Show or hide the banner that indicates a background refresh is in
     /// progress while stale cached messages are displayed.
     pub fn is_loading(&self) -> bool {
-        self.imp().view_stack.visible_child_name().as_deref() == Some("loading")
+        self.imp().room_loading_overlay.is_visible()
     }
 
     pub fn set_refreshing(&self, refreshing: bool) {
