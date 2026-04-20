@@ -2833,13 +2833,9 @@ impl MessageView {
             tracing::info!("append_message: echo patch fallback for event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
             return;
         }
-        // Cap: prevent unbounded list growth that degrades GTK ListView scroll
-        // performance with variable-height rows (observed 600–800+ items).
-        // When the user is scrolled back reading history and the list is at
-        // capacity, skip the append for this live message.  We intentionally
-        // do NOT insert into event_index here either — the message will appear
-        // absent from the index and will be included the next time the
-        // incremental bg_refresh path runs, so no messages are permanently lost.
+        // When the user is scrolled back reading history and the store is at cap,
+        // skip the append — no event_index insert either.  The message will appear
+        // on the next bg_refresh incremental pass; nothing is permanently lost.
         const MAX_STORE_SIZE: u32 = 400;
         if !msg.event_id.is_empty()
             && gio::prelude::ListModelExt::n_items(&self.imp().list_store()) >= MAX_STORE_SIZE
@@ -2861,7 +2857,39 @@ impl MessageView {
             obj.set_is_new_message(true);
             self.imp().new_message_objs.borrow_mut().push(obj.clone());
         }
-        self.imp().list_store().append(&obj);
+        let imp = self.imp();
+        imp.list_store().append(&obj);
+
+        // Evict oldest messages from the front to maintain the cap.
+        // This covers the near-bottom case where the skip above doesn't fire.
+        // Mirrors the tail-eviction in prepend_messages(); echoes are guarded.
+        {
+            let store = imp.list_store();
+            let n = store.n_items();
+            if n > MAX_STORE_SIZE {
+                let ids: Vec<String> = (0..n)
+                    .filter_map(|i| store.item(i).and_downcast::<MessageObject>()
+                        .map(|o| o.event_id()))
+                    .collect();
+                let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                let evict = front_evict_count(&id_refs, MAX_STORE_SIZE as usize) as u32;
+                if evict > 0 {
+                    {
+                        let mut idx = imp.event_index.borrow_mut();
+                        for i in 0..evict {
+                            if let Some(o) = store.item(i).and_downcast::<MessageObject>() {
+                                idx.remove(&o.event_id());
+                            }
+                        }
+                    }
+                    store.splice(0, evict, &[] as &[MessageObject]);
+                    tracing::debug!(
+                        "append_message: evicted {} from front, store={}", evict, n - evict
+                    );
+                }
+            }
+        }
+
         // Only drag the viewport to the bottom when the user is already there.
         // If they are scrolled up reading history, new messages append silently.
         if self.is_near_bottom() {
@@ -3084,6 +3112,26 @@ pub(crate) fn should_show_loading_after_switch(
     !(is_return_visit && was_loaded)
 }
 
+/// How many items to evict from the front of the store after an append.
+///
+/// Scans `event_ids[0..target]` and stops before the first unconfirmed echo
+/// (empty event_id). Echoes are in-flight sent messages; removing them would
+/// make the message vanish and reappear when the server confirms it.
+///
+/// `event_ids` — event IDs of the store items in order (oldest first).
+/// `max_size`  — the cap to maintain (typically MAX_STORE_SIZE = 400).
+pub(crate) fn front_evict_count(event_ids: &[&str], max_size: usize) -> usize {
+    let n = event_ids.len();
+    if n <= max_size { return 0; }
+    let target = n - max_size;
+    let mut count = 0;
+    while count < target {
+        if event_ids[count].is_empty() { break; }
+        count += 1;
+    }
+    count
+}
+
 
 /// Pure helper: should a live-appended message be tinted as "new"?
 /// Only tint when the window is not focused AND the message is not from
@@ -3256,8 +3304,8 @@ pub(crate) fn incremental_prev_batch(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_divider_pos, divider_decision, divider_should_mark, incremental_prev_batch,
-        is_echo_duplicate, sorted_insert_pos_in, unread_label,
+        compute_divider_pos, divider_decision, divider_should_mark, front_evict_count,
+        incremental_prev_batch, is_echo_duplicate, sorted_insert_pos_in, unread_label,
         effective_unread_count,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
@@ -4148,5 +4196,54 @@ mod tests {
         assert!(!was_loaded);
         assert!(should_show_loading_after_switch(true, was_loaded),
             "return visit with no saved state must show loading");
+    }
+
+    // ── front_evict_count ────────────────────────────────────────────────────
+
+    #[test]
+    fn front_evict_under_cap_no_eviction() {
+        let ids = ["a", "b", "c"];
+        assert_eq!(front_evict_count(&ids, 400), 0);
+        assert_eq!(front_evict_count(&ids, 3), 0);
+        assert_eq!(front_evict_count(&ids, 4), 0);
+    }
+
+    #[test]
+    fn front_evict_one_over_cap() {
+        let ids: Vec<&str> = (0..401).map(|_| "x").collect();
+        assert_eq!(front_evict_count(&ids, 400), 1);
+    }
+
+    #[test]
+    fn front_evict_many_over_cap() {
+        let ids: Vec<&str> = (0..450).map(|_| "x").collect();
+        assert_eq!(front_evict_count(&ids, 400), 50);
+    }
+
+    #[test]
+    fn front_evict_stops_before_echo_at_front() {
+        // Echo (empty event_id) at position 0 — nothing should be evicted.
+        let ids = ["", "b", "c", "d", "e"];
+        assert_eq!(front_evict_count(&ids, 4), 0, "echo at front stops eviction");
+    }
+
+    #[test]
+    fn front_evict_stops_before_echo_mid_range() {
+        // Echo at position 1 — can only evict position 0.
+        let ids = ["a", "", "c", "d", "e"];
+        assert_eq!(front_evict_count(&ids, 4), 1, "stops before echo at pos 1");
+    }
+
+    #[test]
+    fn front_evict_echo_outside_eviction_range_ignored() {
+        // Echo is beyond the eviction target — should not affect count.
+        // 5 items, cap=3: need to evict 2; echo is at position 3 (outside target).
+        let ids = ["a", "b", "c", "", "e"];
+        assert_eq!(front_evict_count(&ids, 3), 2);
+    }
+
+    #[test]
+    fn front_evict_empty_store() {
+        assert_eq!(front_evict_count(&[], 400), 0);
     }
 }
