@@ -180,6 +180,7 @@ template $MxMessageView : Gtk.Box {
             icon-name: "mail-attachment-symbolic";
             tooltip-text: "Attach image, video, or file";
             styles ["circular", "flat"]
+            valign: center;
           }
 
           Gtk.Overlay input_overlay {
@@ -219,19 +220,21 @@ template $MxMessageView : Gtk.Box {
             icon-name: "format-text-bold-symbolic";
             tooltip-text: "Markdown mode";
             styles ["circular", "flat"]
+            valign: center;
           }
 
           Gtk.MenuButton emoji_button {
             icon-name: "face-smile-symbolic";
             tooltip-text: "Insert emoji";
             styles ["circular", "flat"]
-
+            valign: center;
             popover: Gtk.EmojiChooser emoji_chooser {};
           }
 
           Gtk.Button send_button {
             icon-name: "go-up-symbolic";
             styles ["circular", "suggested-action"]
+            valign: center;
           }
         }
       };

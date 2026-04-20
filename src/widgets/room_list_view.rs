@@ -229,6 +229,7 @@ mod imp {
             let space_child_header = adw::HeaderBar::builder()
                 .title_widget(&space_child_title)
                 .show_title(true)
+                .show_end_title_buttons(false)
                 .build();
 
             let space_child_view = gtk::Box::builder()
