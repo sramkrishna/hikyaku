@@ -1517,6 +1517,40 @@ impl MxWindow {
             )
         );
 
+        // Hover timing diagnostic — measures pause from pointer-enter to first frame.
+        // Three timestamps:
+        //   T1 (hover-enter)  — recorded synchronously in connect_enter
+        //   T2 (pre-idle)     — idle fired; captures GLib source dispatch overhead
+        //   T3 (first-frame)  — add_tick_callback; captures Wayland frame scheduling
+        // Run with: RUST_LOG=hikyaku=info ./target/debug/hikyaku 2>&1 | grep hover
+        {
+            let motion = gtk::EventControllerMotion::new();
+            let enter_ts: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> =
+                std::rc::Rc::new(std::cell::Cell::new(None));
+            let ts_idle = enter_ts.clone();
+            let ts_tick = enter_ts.clone();
+            motion.connect_enter(move |_, _, _| {
+                if ts_idle.get().is_some() { return; }
+                let t1 = std::time::Instant::now();
+                ts_idle.set(Some(t1));
+                tracing::info!("hover: pointer-enter (T1)");
+                let ts2 = ts_idle.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(t) = ts2.get() {
+                        tracing::info!("hover: pre-idle (T2) {:?} after T1 — GLib dispatch overhead", t.elapsed());
+                    }
+                });
+            });
+            window.add_tick_callback(move |_, _clock| {
+                if let Some(t) = ts_tick.get() {
+                    tracing::info!("hover: first-frame (T3) {:?} after T1 — Wayland frame latency", t.elapsed());
+                    ts_tick.set(None);
+                }
+                glib::ControlFlow::Continue
+            });
+            window.add_controller(motion);
+        }
+
         // Focus change handler — clear unseen counter when window regains focus
         // and drain any bg_refresh that the idle deferred during hover.
         let _window_weak_focus = window.downgrade();
