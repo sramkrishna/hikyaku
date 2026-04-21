@@ -984,6 +984,7 @@ impl MessageRow {
         let body = msg.body();
         let formatted_body = msg.formatted_body();
         let timestamp = msg.timestamp();
+        let formatted_ts = msg.formatted_timestamp();
         let reply_to = msg.reply_to();
         let thread_root = msg.thread_root();
         let reactions_json = msg.reactions_json();
@@ -1194,7 +1195,7 @@ impl MessageRow {
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, timestamp, highlight_names, force_highlight, &ctx.rolodex_ids);
+        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
 
         // Disconnect old flash handler before connecting to the new object.
         self.clear_flash_handler();
@@ -1278,7 +1279,7 @@ impl MessageRow {
         sender_id: &str,
         body: &str,
         formatted_body: &str,
-        timestamp: u64,
+        formatted_ts: &str,
         highlight_names: &[String],
         force_highlight: bool,
         rolodex_ids: &std::collections::HashSet<String>,
@@ -1377,8 +1378,8 @@ impl MessageRow {
             }
         }
 
-        if timestamp > 0 {
-            imp.timestamp_label.set_label(&format_timestamp(timestamp));
+        if !formatted_ts.is_empty() {
+            imp.timestamp_label.set_label(formatted_ts);
             imp.timestamp_label.set_visible(true);
         } else {
             imp.timestamp_label.set_visible(false);

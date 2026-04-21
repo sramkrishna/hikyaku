@@ -162,6 +162,9 @@ mod imp {
         /// Callback for replying — sets up the reply preview.
         pub on_reply: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         pub on_scroll_top: RefCell<Option<Box<dyn Fn()>>>,
+        /// Fired when the user scrolls back to the bottom after prepend_messages()
+        /// evicted the newest messages.  window.rs uses this to trigger a bg_refresh.
+        pub on_scroll_bottom: RefCell<Option<Box<dyn Fn()>>>,
         pub prev_batch_token: RefCell<Option<String>>,
         pub fetching_older: Cell<bool>,
         /// Names to highlight in message bodies (user's own name + friends).
@@ -223,6 +226,10 @@ mod imp {
         /// while the user is near the bottom — prevents repeated vadj.set_value()
         /// calls from breaking GTK's kinetic scroll gesture state machine.
         pub scroll_to_bottom_pending: Cell<bool>,
+        /// Set to true when prepend_messages() evicts tail (newest) messages to
+        /// maintain the store cap.  The vadjustment scroll handler uses this to
+        /// trigger a bg_refresh when the user scrolls back to the bottom.
+        pub tail_evicted: Cell<bool>,
         /// Cached row-binding context — rebuilt once per room switch by the setters
         /// (set_highlight_names, set_user_id, set_is_dm_room, set_no_media).
         /// The bind callback reads this instead of calling config::settings() per recycle.
@@ -300,6 +307,7 @@ mod imp {
                 room_unread_count: Cell::new(0),
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
+                on_scroll_bottom: RefCell::new(None),
                 prev_batch_token: RefCell::new(None),
                 fetching_older: Cell::new(false),
                 highlight_names: RefCell::new(std::rc::Rc::from([])),
@@ -339,6 +347,7 @@ mod imp {
                     .css_classes(["osd", "toolbar"])
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
+                tail_evicted: Cell::new(false),
                 cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
                 pending_appends: RefCell::new(Vec::new()),
                 append_flush_pending: Cell::new(false),
@@ -410,18 +419,31 @@ mod imp {
                 .css_classes(["mx-tinted-bg"])
                 .build();
 
-            // Backpagination: when user scrolls near the top, request older messages.
+            // Scroll handler: backpagination (top) and tail-eviction refresh (bottom).
             // Guard on current_room_id so hidden rooms don't accidentally trigger this.
             let view_weak = self.obj().downgrade();
             let guard_rid = room_id.to_string();
             sw.vadjustment().connect_value_notify(move |adj| {
-                if adj.value() >= 50.0 { return; }
                 let Some(view) = view_weak.upgrade() else { return };
                 let imp = view.imp();
                 if *imp.current_room_id.borrow() != guard_rid { return; }
-                if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
-                    imp.fetching_older.set(true);
-                    if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                // Backpagination: near the top → load older messages.
+                if adj.value() < 50.0 {
+                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
+                        imp.fetching_older.set(true);
+                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                            cb();
+                        }
+                    }
+                }
+                // Tail-refresh: user scrolled back to bottom after prepend_messages()
+                // evicted the newest messages — fire on_scroll_bottom so window.rs
+                // can trigger a bg_refresh to reload the live tail.
+                let slack = 150.0_f64;
+                let near_bottom = adj.upper() - adj.page_size() - adj.value() < slack;
+                if near_bottom && imp.tail_evicted.get() {
+                    imp.tail_evicted.set(false);
+                    if let Some(ref cb) = *imp.on_scroll_bottom.borrow() {
                         cb();
                     }
                 }
@@ -2231,6 +2253,9 @@ impl MessageView {
                     }
                 }
                 store.splice(MAX_STORE_SIZE, remove_count, &[] as &[MessageObject]);
+                // Signal that newest messages were evicted; the scroll handler
+                // will trigger a bg_refresh when the user returns to the bottom.
+                imp.tail_evicted.set(true);
             }
         }
         imp.prev_batch_token.replace(prev_batch);
@@ -2438,6 +2463,9 @@ impl MessageView {
         if let Some(ref name) = m.reply_to_sender {
             obj.set_reply_to_sender(name.clone());
         }
+        if m.timestamp > 0 {
+            obj.set_formatted_timestamp(crate::widgets::message_row::format_timestamp(m.timestamp));
+        }
         obj
     }
 
@@ -2500,6 +2528,7 @@ impl MessageView {
         imp.new_message_objs.borrow_mut().clear();
         imp.pending_appends.borrow_mut().clear();
         imp.append_flush_pending.set(false);
+        imp.tail_evicted.set(false);
         imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
@@ -2562,6 +2591,10 @@ impl MessageView {
     /// Connect a callback for when the user scrolls to the top (load older messages).
     pub fn connect_scroll_top<F: Fn() + 'static>(&self, f: F) {
         self.imp().on_scroll_top.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_scroll_bottom<F: Fn() + 'static>(&self, f: F) {
+        self.imp().on_scroll_bottom.replace(Some(Box::new(f)));
     }
 
     /// Update the room info banner with metadata (topic, tombstone, pinned).

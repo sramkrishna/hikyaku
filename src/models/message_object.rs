@@ -72,6 +72,10 @@ mod imp {
         /// GTK items_changed position-tracking for all subsequent rows).
         #[property(get, set)]
         is_first_unread: Cell<bool>,
+
+        /// Pre-formatted timestamp string, computed once in info_to_obj().
+        /// Avoids calling glib::DateTime::from_unix_local on every row bind.
+        pub(super) formatted_timestamp: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -86,6 +90,7 @@ mod imp {
 
 use glib::Object;
 use gtk::glib;
+use gtk::subclass::prelude::ObjectSubclassIsExt;
 
 glib::wrapper! {
     pub struct MessageObject(ObjectSubclass<imp::MessageObject>);
@@ -117,5 +122,13 @@ impl MessageObject {
             .property("reactions-json", reactions_json)
             .property("media-json", media_json)
             .build()
+    }
+
+    pub fn formatted_timestamp(&self) -> String {
+        self.imp().formatted_timestamp.borrow().clone()
+    }
+
+    pub fn set_formatted_timestamp(&self, s: String) {
+        self.imp().formatted_timestamp.replace(s);
     }
 }

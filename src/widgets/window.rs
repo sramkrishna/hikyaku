@@ -1208,6 +1208,22 @@ impl MxWindow {
             }
         });
 
+        // Tail-refresh: user scrolled back to bottom after backpagination evicted
+        // the newest messages.  Re-select the current room to trigger bg_refresh.
+        let cmd_tx = command_tx.clone();
+        let window_weak = window.downgrade();
+        imp.message_view.connect_scroll_bottom(move || {
+            let Some(win) = window_weak.upgrade() else { return };
+            let room_id = win.imp().current_room_id.borrow().clone();
+            let Some(room_id) = room_id else { return };
+            let known_unread = win.imp().room_list_view.imp().room_registry.borrow()
+                .get(&room_id).map(|o| o.unread_count()).unwrap_or(0);
+            let tx = cmd_tx.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::SelectRoom { room_id, known_unread }).await;
+            });
+        });
+
         // Seek-cancelled: the live store was never modified (GtkStack page switch),
         // so no refresh is needed — live messages are already intact.
 
