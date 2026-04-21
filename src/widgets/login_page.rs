@@ -1359,8 +1359,9 @@ mod imp {
             let entry = self.recover_key_entry_row.clone();
             let on_recover = self.on_recover_with_key.clone();
             recover_btn.connect_clicked(move |_| {
-                let key = entry.text().to_string();
-                if key.is_empty() { return; }
+                let raw = entry.text().to_string();
+                if raw.is_empty() { return; }
+                let key = crate::widgets::verification_dialog::normalize_recovery_key(&raw);
                 if let Some(ref cb) = *on_recover.borrow() {
                     cb(key);
                 }

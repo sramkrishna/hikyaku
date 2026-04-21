@@ -8,6 +8,33 @@ use gtk::glib;
 use async_channel::Sender;
 use crate::matrix::MatrixCommand;
 
+/// Normalize a recovery key or passphrase before sending to the SDK.
+///
+/// Recovery keys are base58-encoded words separated by spaces or dashes
+/// (e.g. "EsAC xxxx xxxx" or "EsAC-xxxx-xxxx").  The base58 alphabet
+/// excludes I/O/l/0; scanners and some fonts confuse these with 1/0/1/0.
+/// Passphrases (which may contain punctuation) are returned as-is after
+/// trimming and whitespace-collapse.
+pub fn normalize_recovery_key(raw: &str) -> String {
+    let raw = raw.trim();
+    // Collapse whitespace and convert dashes to spaces so key formats like
+    // "EsAC-xxxx-xxxx" and "EsAC xxxx xxxx" are treated identically.
+    let normalized: String = raw
+        .chars()
+        .map(|c| if c == '-' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Only apply base58 lookalike fixes when every character is
+    // alphanumeric or a space — this distinguishes keys from passphrases.
+    if normalized.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric()) {
+        normalized.replace('I', "1").replace('O', "0").replace('l', "1")
+    } else {
+        normalized
+    }
+}
+
 /// Show a "waiting for other device" dialog after the user clicks Verify.
 /// Returns the dialog so we can dismiss it when emojis arrive.
 pub fn show_waiting_dialog(
@@ -91,20 +118,7 @@ pub fn show_recovery_key_dialog(
             let raw = entry.text().to_string();
             let raw = raw.trim();
             if !raw.is_empty() {
-                // Collapse whitespace (handles copy-paste with extra spaces/newlines).
-                let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-                // If every character is alphanumeric or a space, treat as a recovery
-                // key and fix base58 lookalikes (I→1, O→0, l→1) that scanners and
-                // fonts commonly confuse.  Passphrases containing punctuation pass
-                // through unchanged.
-                let key = if collapsed.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric()) {
-                    collapsed
-                        .replace('I', "1")
-                        .replace('O', "0")
-                        .replace('l', "1")
-                } else {
-                    collapsed
-                };
+                let key = normalize_recovery_key(raw);
                 let tx = tx.clone();
                 glib::spawn_future_local(async move {
                     let _ = tx
