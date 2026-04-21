@@ -9,6 +9,9 @@ pub struct RowContext {
     pub my_user_id: String,
     pub is_dm: bool,
     pub no_media: bool,
+    /// Set of Matrix user IDs in the rolodex — pre-built once per room switch so
+    /// bind_message_object can do an O(1) lookup instead of scanning GSettings.
+    pub rolodex_ids: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl Default for RowContext {
@@ -18,6 +21,7 @@ impl Default for RowContext {
             my_user_id: String::new(),
             is_dm: false,
             no_media: false,
+            rolodex_ids: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -1190,7 +1194,7 @@ impl MessageRow {
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, timestamp, highlight_names, force_highlight);
+        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, timestamp, highlight_names, force_highlight, &ctx.rolodex_ids);
 
         // Disconnect old flash handler before connecting to the new object.
         self.clear_flash_handler();
@@ -1277,6 +1281,7 @@ impl MessageRow {
         timestamp: u64,
         highlight_names: &[String],
         force_highlight: bool,
+        rolodex_ids: &std::collections::HashSet<String>,
     ) {
         let imp = self.imp();
 
@@ -1293,11 +1298,11 @@ impl MessageRow {
 
         // Rolodex contact indicator: subtle glow on sender name.
         if !sender_id.is_empty() {
-            let in_rolodex = crate::config::settings().rolodex.iter().any(|entry| {
-                entry.split_once('|').map(|(_, uid)| uid.trim()) == Some(sender_id)
-            });
-            if in_rolodex { imp.sender_label.add_css_class("rolodex-contact"); }
-            else { imp.sender_label.remove_css_class("rolodex-contact"); }
+            if rolodex_ids.contains(sender_id) {
+                imp.sender_label.add_css_class("rolodex-contact");
+            } else {
+                imp.sender_label.remove_css_class("rolodex-contact");
+            }
         }
 
         // Pre-lowercase names once for both the check and the highlight loop.

@@ -1571,11 +1571,17 @@ impl MessageView {
     /// Cloning is O(1): highlight_names is an Rc (pointer copy).
     fn row_context(&self) -> crate::widgets::MessageRowContext {
         let imp = self.imp();
+        let rolodex_ids: std::collections::HashSet<String> = crate::config::settings()
+            .rolodex
+            .iter()
+            .filter_map(|entry| entry.split_once('|').map(|(_, uid)| uid.trim().to_string()))
+            .collect();
         crate::widgets::MessageRowContext {
             highlight_names: imp.highlight_names.borrow().clone(), // Rc clone = pointer copy
             my_user_id: imp.user_id.borrow().clone(),
             is_dm: imp.is_dm_room.get(),
             no_media: imp.is_no_media.get(),
+            rolodex_ids: std::rc::Rc::new(rolodex_ids),
         }
     }
 
@@ -2861,18 +2867,20 @@ impl MessageView {
         imp.list_store().append(&obj);
 
         // Evict oldest messages from the front to maintain the cap.
-        // This covers the near-bottom case where the skip above doesn't fire.
-        // Mirrors the tail-eviction in prepend_messages(); echoes are guarded.
+        // Only scan as many items as we need to evict (target = n - MAX_STORE_SIZE),
+        // not all N items — the old O(N) full scan fired on every incoming message.
         {
             let store = imp.list_store();
             let n = store.n_items();
             if n > MAX_STORE_SIZE {
-                let ids: Vec<String> = (0..n)
-                    .filter_map(|i| store.item(i).and_downcast::<MessageObject>()
-                        .map(|o| o.event_id()))
-                    .collect();
-                let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-                let evict = front_evict_count(&id_refs, MAX_STORE_SIZE as usize) as u32;
+                let target = n - MAX_STORE_SIZE;
+                let mut evict: u32 = 0;
+                for i in 0..target {
+                    match store.item(i).and_downcast::<MessageObject>() {
+                        Some(o) if !o.event_id().is_empty() => evict += 1,
+                        _ => break,
+                    }
+                }
                 if evict > 0 {
                     {
                         let mut idx = imp.event_index.borrow_mut();
