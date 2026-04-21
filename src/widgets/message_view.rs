@@ -1999,6 +1999,7 @@ impl MessageView {
                 let list_store = imp.list_store();
                 let mut any_at_end = false;
                 let my_id = imp.user_id.borrow().clone();
+                let today = glib::DateTime::now_local().ok();
 
                 // Pass 1: echo patches — update existing GObjects in place, no new rows.
                 // Kept separate so patch_echo_event_id can freely borrow event_index
@@ -2034,7 +2035,7 @@ impl MessageView {
                         "set_messages incremental: inserting event_id={} (no echo found)",
                         m.event_id
                     );
-                    let obj = Self::info_to_obj(m);
+                    let obj = Self::info_to_obj(m, today.as_ref());
                     let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
                     if pos >= orig_n {
                         end_appends.push(obj);
@@ -2108,7 +2109,8 @@ impl MessageView {
         }
 
         let _t1 = std::time::Instant::now();
-        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+        let today = glib::DateTime::now_local().ok();
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
         let _t2 = std::time::Instant::now();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         use std::sync::atomic::Ordering;
@@ -2228,7 +2230,8 @@ impl MessageView {
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
         const MAX_STORE_SIZE: u32 = 400;
         let imp = self.imp();
-        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+        let today = glib::DateTime::now_local().ok();
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
         imp.list_store().splice(0, 0, &objs);
         // Add new objects to the event_index.
         {
@@ -2301,7 +2304,8 @@ impl MessageView {
     ) {
         let imp = self.imp();
 
-        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m)).collect();
+        let today = glib::DateTime::now_local().ok();
+        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
 
         // Populate the dedicated seek_store (never touches the live store).
         let n_old = imp.seek_store.n_items();
@@ -2452,7 +2456,7 @@ impl MessageView {
         None
     }
 
-    fn info_to_obj(m: &crate::matrix::MessageInfo) -> MessageObject {
+    fn info_to_obj(m: &crate::matrix::MessageInfo, today: Option<&glib::DateTime>) -> MessageObject {
         let media_json = m.media.as_ref()
             .and_then(|media| serde_json::to_string(media).ok())
             .unwrap_or_default();
@@ -2481,7 +2485,8 @@ impl MessageView {
             obj.set_reply_to_sender(name.clone());
         }
         if m.timestamp > 0 {
-            obj.set_formatted_timestamp(crate::widgets::message_row::format_timestamp(m.timestamp));
+            obj.set_formatted_timestamp(
+                crate::widgets::message_row::format_timestamp_with_today(m.timestamp, today));
         }
         obj
     }
@@ -2932,7 +2937,7 @@ impl MessageView {
             return;
         }
         tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, body_preview(&msg.body));
-        let obj = Self::info_to_obj(msg);
+        let obj = Self::info_to_obj(msg, glib::DateTime::now_local().ok().as_ref());
         let eid = obj.event_id();
         if !eid.is_empty() {
             // Pre-insert into event_index immediately so subsequent dedup checks

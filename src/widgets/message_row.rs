@@ -657,24 +657,28 @@ fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
 /// Format a Unix timestamp (seconds) into a human-readable string.
 /// Shows "HH:MM" for today, "Yesterday HH:MM", or "Mon DD HH:MM" for older.
 pub(crate) fn format_timestamp(ts: u64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let today = glib::DateTime::now_local().ok();
+    format_timestamp_with_today(ts, today.as_ref())
+}
 
-    let event_time = UNIX_EPOCH + Duration::from_secs(ts);
-    let now = SystemTime::now();
+/// Like `format_timestamp` but accepts a pre-computed `today` so callers
+/// processing a batch can call `glib::DateTime::now_local()` exactly once.
+pub(crate) fn format_timestamp_with_today(ts: u64, today: Option<&glib::DateTime>) -> String {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     let Ok(dt) = glib::DateTime::from_unix_local(ts as i64) else {
         return String::new();
     };
 
-    let Ok(today) = glib::DateTime::now_local() else {
+    let Some(today) = today else {
         return dt.format("%H:%M").map(|s: glib::GString| s.to_string()).unwrap_or_default();
     };
 
-    let secs_ago = now.duration_since(event_time).unwrap_or_default().as_secs();
+    let event_time = UNIX_EPOCH + Duration::from_secs(ts);
+    let secs_ago = SystemTime::now().duration_since(event_time).unwrap_or_default().as_secs();
     let same_day = dt.year() == today.year()
         && dt.day_of_year() == today.day_of_year();
 
-    // Select format string via computed time range — no if-else chain.
     let fmt = match () {
         _ if same_day => "%H:%M",
         _ if secs_ago < 86400 * 2 => "Yesterday %H:%M",
