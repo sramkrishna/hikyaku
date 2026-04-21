@@ -829,82 +829,6 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Create a text label with the standard message body styling.
-fn make_text_label(markup: &str) -> gtk::Label {
-    let lbl = gtk::Label::builder()
-        .halign(gtk::Align::Start)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .xalign(0.0)
-        .selectable(true)
-        .hexpand(true)
-        .css_classes(["mx-message-body"])
-        .build();
-    lbl.set_markup(markup);
-
-    // Intercept matrix.to / matrix: links — navigate in-app instead of opening a browser.
-    lbl.connect_activate_link(|_lbl, uri| {
-        if let Some(matrix_id) = parse_matrix_uri(uri) {
-            if let Some(app) = gio::Application::default() {
-                if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
-                    if let Some(window) = gtk_app.active_window() {
-                        if let Some(win) = window.downcast_ref::<crate::widgets::MxWindow>() {
-                            win.handle_matrix_link(&matrix_id);
-                            return glib::Propagation::Stop;
-                        }
-                    }
-                }
-            }
-        }
-        glib::Propagation::Proceed
-    });
-
-    lbl
-}
-
-/// Create a GtkSourceView widget for a syntax-highlighted code block.
-fn make_code_view(code: &str, lang: &str) -> gtk::Widget {
-    use gtk::prelude::*;
-    use sourceview5::prelude::*;
-
-    let lm = sourceview5::LanguageManager::default();
-
-    // Look up language by its ID (e.g. "rust", "javascript", "python3").
-    // Fall back to guessing via a fake filename when the ID doesn't match directly.
-    let lang_obj = if lang.is_empty() {
-        None
-    } else {
-        lm.language(lang).or_else(|| {
-            // Code fences use names like "js" → try guessing from extension.
-            let fake_name = format!("code.{lang}");
-            lm.guess_language(Some(fake_name.as_str()), None)
-        })
-    };
-
-    let buffer = sourceview5::Buffer::builder()
-        .highlight_syntax(true)
-        .build();
-
-    buffer.set_language(lang_obj.as_ref());
-
-    // Pick a style scheme based on dark/light mode.
-    let is_dark = adw::StyleManager::default().is_dark();
-    let scheme_name = if is_dark { "oblivion" } else { "classic" };
-    let scheme = sourceview5::StyleSchemeManager::default().scheme(scheme_name);
-    buffer.set_style_scheme(scheme.as_ref());
-
-    // Set text after language + scheme are configured so the initial
-    // tokenisation uses the correct rules.
-    buffer.set_text(code);
-
-    let view = sourceview5::View::with_buffer(&buffer);
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_show_line_numbers(false);
-    view.set_monospace(true);
-    view.add_css_class("code-block");
-    view.upcast::<gtk::Widget>()
-}
 
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
@@ -1341,22 +1265,6 @@ impl MessageRow {
                     imp.body_label.set_markup(&rendered_markup);
                 }
                 imp.body_label.set_visible(true);
-            } else if !formatted_body.is_empty() {
-                // Code-block path — rendered_markup is empty for <pre> messages;
-                // build body_box widgets dynamically (rare, so cost is acceptable).
-                imp.body_label.set_visible(false);
-                clear_body_box(&imp.body_box);
-                imp.body_box.set_visible(true);
-                for seg in crate::markdown::html_to_segments(formatted_body) {
-                    match seg {
-                        crate::markdown::Segment::Text(markup) => {
-                            imp.body_box.append(&make_text_label(&markup));
-                        }
-                        crate::markdown::Segment::Code { content, lang } => {
-                            imp.body_box.append(&make_code_view(&content, &lang));
-                        }
-                    }
-                }
             } else {
                 // Fallback for objects created outside info_to_obj (e.g. echoes).
                 let escaped = glib::markup_escape_text(body).to_string();

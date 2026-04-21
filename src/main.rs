@@ -19,7 +19,6 @@ mod widgets;
 
 use gtk::prelude::*;
 
-extern crate sourceview5;
 
 /// Performance regression tests for O(1) data-structure paths.
 ///

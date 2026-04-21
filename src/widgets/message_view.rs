@@ -3189,14 +3189,15 @@ pub(crate) fn prerender_body(body: &str, formatted_body: &str) -> (String, u64) 
         hash = hash.wrapping_mul(FNV_PRIME) ^ b as u64;
     }
 
-    let markup = if !formatted_body.is_empty() && !formatted_body.contains("<pre") {
+    let markup = if !formatted_body.is_empty() {
+        // html_to_pango handles all HTML including <pre>/<code> blocks,
+        // converting them to <tt>…</tt> inline Pango markup.  This means
+        // rendered_markup is always non-empty for HTML messages, so bind
+        // never falls through to the GtkSourceView dynamic-widget path.
         crate::markdown::html_to_pango(formatted_body)
-    } else if formatted_body.is_empty() {
+    } else {
         let escaped = gtk::glib::markup_escape_text(body).to_string();
         crate::markdown::linkify_urls(&escaped)
-    } else {
-        // Code blocks — rendered dynamically in bind via body_box.
-        String::new()
     };
     (markup, hash)
 }
@@ -3556,9 +3557,10 @@ mod tests {
     }
 
     #[test]
-    fn prerender_code_block_returns_empty_markup() {
+    fn prerender_code_block_returns_tt_markup() {
         let (markup, hash) = prerender_body("code", "<pre><code>x = 1</code></pre>");
-        assert!(markup.is_empty(), "code blocks should return empty markup (rendered via body_box)");
+        assert!(!markup.is_empty(), "code blocks should produce <tt> Pango markup");
+        assert!(markup.contains("x = 1"), "markup should include code content");
         assert_ne!(hash, 0);
     }
 
