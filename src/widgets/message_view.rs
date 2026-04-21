@@ -1953,6 +1953,24 @@ impl MessageView {
                 imp.prev_batch_token.replace(prev_batch);
             }
 
+            // UTD → decrypted patch: when bg_refresh returns a real body for a
+            // message that is currently shown as "🔒 Unable to decrypt", update it
+            // in-place.  This is the only path that heals live-sync UTD events
+            // after their session key arrives — the normal sync handler never
+            // re-fires for already-displayed events, so without this pass those
+            // messages stay locked forever.
+            const UTD_BODY: &str = "\u{1f512} Unable to decrypt message";
+            for m in messages.iter().filter(|m| !m.event_id.is_empty() && m.body != UTD_BODY) {
+                let currently_utd = imp.event_index.borrow()
+                    .get(&m.event_id)
+                    .map(|obj| obj.body() == UTD_BODY)
+                    .unwrap_or(false);
+                if currently_utd {
+                    tracing::info!("set_messages: healing UTD for event_id={}", m.event_id);
+                    self.update_message_body(&m.event_id, &m.body, m.formatted_body.as_deref());
+                }
+            }
+
             // Collect new messages (not yet in the displayed list).
             let new_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
                 .filter(|m| !m.event_id.is_empty()

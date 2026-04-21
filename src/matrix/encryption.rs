@@ -305,7 +305,18 @@ pub(super) fn spawn_keys_watcher(
         let Some(mut stream) = keys_client.encryption().room_keys_received_stream().await else {
             return;
         };
-        while let Some(Ok(infos)) = stream.next().await {
+        loop {
+            let infos = match stream.next().await {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
+                    tracing::warn!("room_keys_received_stream error (continuing): {e}");
+                    continue;
+                }
+                None => {
+                    tracing::warn!("room_keys_received_stream ended unexpectedly");
+                    break;
+                }
+            };
             if infos.is_empty() {
                 continue;
             }
@@ -328,4 +339,5 @@ pub(super) fn spawn_keys_watcher(
             let _ = event_tx.send(MatrixEvent::RoomKeysReceived { room_ids }).await;
         }
     });
+
 }
