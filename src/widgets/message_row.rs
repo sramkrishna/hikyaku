@@ -125,8 +125,9 @@ mod imp {
         /// Compared against MessageObject::body_hash() — O(1) u64 comparison with
         /// no allocation. When equal, set_markup() is skipped on rebind.
         pub last_body_hash: std::cell::Cell<u64>,
-        /// Cache key for the last rendered reactions JSON.
-        pub last_reactions_key: std::cell::RefCell<String>,
+        /// FNV-1a hash of the last rendered reactions JSON.
+        /// Compared against MessageObject::reactions_hash() — O(1) with no allocation.
+        pub last_reactions_hash: std::cell::Cell<u64>,
         /// Signal handler IDs for notify connections on the currently bound
         /// MessageObject. Disconnected on unbind to prevent stale handlers
         /// accumulating as rows are recycled by the ListView factory.
@@ -615,6 +616,19 @@ use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
+/// Pre-render the sender label markup string for use in MessageObject.
+/// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load
+/// time so bind() never calls nick_color/markup_escape_text/format! per row.
+pub(crate) fn prerender_sender_markup(sender: &str, sender_id: &str) -> String {
+    if sender_id.is_empty() {
+        sender.to_string()
+    } else {
+        let color = nick_color(sender_id);
+        let escaped = gtk::glib::markup_escape_text(sender);
+        format!("<span foreground=\"{color}\">{escaped}</span>")
+    }
+}
+
 /// Derive a stable display color from a Matrix user ID.
 /// Result is cached so each unique user ID is computed only once per session.
 fn nick_color(user_id: &str) -> String {
@@ -716,7 +730,7 @@ pub fn strip_reply_fallback(body: &str) -> String {
 
 /// Extract an image/gif URL from message body text, if present.
 /// Converts Giphy page URLs to direct media URLs.
-fn extract_image_url(body: &str) -> Option<String> {
+pub(crate) fn extract_image_url(body: &str) -> Option<String> {
     let body_trimmed = body.trim();
     for word in body_trimmed.split_whitespace() {
         if !(word.starts_with("https://") || word.starts_with("http://")) {
@@ -985,14 +999,6 @@ impl MessageRow {
         msg: &crate::models::MessageObject,
         ctx: &crate::widgets::MessageRowContext,
     ) {
-        let sender = msg.sender();
-        let body = msg.body();
-        let formatted_body = msg.formatted_body();
-        let timestamp = msg.timestamp();
-        let formatted_ts = msg.formatted_timestamp();
-        let reply_to = msg.reply_to();
-        let thread_root = msg.thread_root();
-        let reactions_json = msg.reactions_json();
         let imp = self.imp();
         let highlight_names = &ctx.highlight_names;
         let my_user_id = ctx.my_user_id.as_str();
@@ -1000,14 +1006,14 @@ impl MessageRow {
         let show_media = !ctx.no_media;
 
         // System event row — join/leave/invite/kick/ban inline text.
-        // Use pre-allocated system_event_label to avoid widget construction on scroll.
+        // body is read only here so we defer the clone of other properties.
         if msg.is_system_event() {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
             imp.body_label.set_visible(false);
             imp.body_box.set_visible(false);
             imp.divider_label.set_visible(false);
-            imp.system_event_label.set_text(&body);
+            imp.system_event_label.set_text(&msg.body());
             imp.system_event_label.set_visible(true);
             imp.reply_box.set_visible(false);
             imp.thread_icon.set_visible(false);
@@ -1022,8 +1028,17 @@ impl MessageRow {
         self.remove_css_class("message-system-event");
         imp.system_event_label.set_visible(false);
 
+        // Defer property clones until after early returns.
+        let sender = msg.sender();
+        let body = msg.body();
+        let formatted_body = msg.formatted_body();
+        let timestamp = msg.timestamp();
+        let formatted_ts = msg.formatted_timestamp();
+        let reply_to = msg.reply_to();
+        let thread_root = msg.thread_root();
+        let sender_id = msg.sender_id();  // read once — used in 3 places below
+
         // Divider row — "New messages" separator, not a real message.
-        // Use pre-allocated divider_label to avoid widget construction on scroll.
         if sender.is_empty() && msg.event_id().is_empty() && body.contains("──") {
             imp.sender_label.set_visible(false);
             imp.timestamp_label.set_visible(false);
@@ -1046,31 +1061,18 @@ impl MessageRow {
         imp.timestamp_label.set_visible(true);
         imp.action_bar.set_visible(true);
 
-        // Store current message data for action buttons.
+        // Store current message data for action buttons (click handlers read these).
         imp.event_id.replace(msg.event_id());
         imp.sender_text.replace(sender.clone());
-        imp.sender_id_text.replace(msg.sender_id());
+        imp.sender_id_text.replace(sender_id.clone());
         imp.body_text.replace(body.clone());
         imp.reply_to.replace(reply_to.clone());
         imp.timestamp_val.replace(timestamp);
 
-        // Reply indicator — show who they're replying to.
+        // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
+        let reply_label = msg.reply_label();
         if !reply_to.is_empty() {
-            let reply_sender_name = msg.reply_to_sender();
-            let label = if !reply_sender_name.is_empty() {
-                format!("Replying to {reply_sender_name}")
-            } else {
-                // Fallback: try to extract from body quote format.
-                body.lines()
-                    .find(|l| l.starts_with("> <@"))
-                    .and_then(|l| l.strip_prefix("> <"))
-                    .and_then(|l| l.split('>').next())
-                    .and_then(|uid| uid.strip_prefix('@'))
-                    .and_then(|uid| uid.split(':').next())
-                    .map(|local| format!("Replying to {local}"))
-                    .unwrap_or_else(|| "Reply".to_string())
-            };
-            imp.reply_label.set_label(&label);
+            imp.reply_label.set_label(&reply_label);
             imp.reply_box.set_visible(true);
         } else {
             imp.reply_box.set_visible(false);
@@ -1080,11 +1082,7 @@ impl MessageRow {
         imp.thread_icon.set_visible(!thread_root.is_empty());
 
         // Show edit/delete only on own messages.
-        let msg_sender_id = msg.sender_id();
-        let is_own = !my_user_id.is_empty() && msg_sender_id == my_user_id;
-        if !msg_sender_id.is_empty() {
-            tracing::debug!("Edit check: sender_id='{}' my_id='{}' is_own={}", msg_sender_id, my_user_id, is_own);
-        }
+        let is_own = !my_user_id.is_empty() && sender_id == my_user_id;
         if let Some(ref btn) = *imp.edit_button.borrow() {
             btn.set_visible(is_own);
         }
@@ -1096,111 +1094,86 @@ impl MessageRow {
             btn.set_visible(!is_own && !is_dm_room);
         }
 
-        // Media attachment — skip entirely when the room has media previews disabled.
-        let media_json = msg.media_json();
+        // Media attachment — all display strings pre-computed in info_to_obj.
         if !show_media {
             imp.media_button.set_visible(false);
-        } else if !media_json.is_empty() {
-            if let Ok(media) = serde_json::from_str::<crate::matrix::MediaInfo>(&media_json) {
-                use std::sync::LazyLock;
-                static MEDIA_ICONS: LazyLock<std::collections::HashMap<&'static str, &'static str>> =
-                    LazyLock::new(|| {
-                        [
-                            ("Image", "image-x-generic-symbolic"),
-                            ("Video", "video-x-generic-symbolic"),
-                            ("Audio", "audio-x-generic-symbolic"),
-                            ("File", "text-x-generic-symbolic"),
-                        ].into_iter().collect()
-                    });
-                let kind_str = match media.kind {
-                    crate::matrix::MediaKind::Image => "Image",
-                    crate::matrix::MediaKind::Video => "Video",
-                    crate::matrix::MediaKind::Audio => "Audio",
-                    crate::matrix::MediaKind::File => "File",
-                };
-                let icon = MEDIA_ICONS.get(kind_str).unwrap_or(&"text-x-generic-symbolic");
-                imp.media_icon.set_icon_name(Some(icon));
-                let size_str = media.size
-                    .map(|s| {
-                        if s > 1_048_576 { format!(" ({:.1} MB)", s as f64 / 1_048_576.0) }
-                        else if s > 1024 { format!(" ({:.0} KB)", s as f64 / 1024.0) }
-                        else { format!(" ({s} B)") }
-                    })
-                    .unwrap_or_default();
-                imp.media_label.set_label(&format!("{}{size_str}", media.filename));
-                imp.media_button.update_property(&[gtk::accessible::Property::Label(
-                    &format!("{kind_str}: {}{size_str}", media.filename)
-                )]);
-                imp.media_button.set_visible(true);
-
-                imp.media_url.replace(media.url.clone());
-                imp.media_filename.replace(media.filename.clone());
-                imp.media_source_json.replace(media.source_json.clone());
-            } else {
-                imp.media_button.set_visible(false);
-            }
         } else {
-            // Check if body contains an image/gif URL — show as media placeholder.
-            if let Some(url) = extract_image_url(&body) {
-                imp.media_icon.set_icon_name(Some("image-x-generic-symbolic"));
-                let display = if url.contains("giphy.com") {
-                    "GIF".to_string()
-                } else {
-                    url.split('/').last().unwrap_or("image").to_string()
-                };
-                imp.media_label.set_label(&display);
+            let media_icon = msg.media_icon_name();
+            if !media_icon.is_empty() {
+                // Structured attachment (image, video, audio, file).
+                imp.media_icon.set_icon_name(Some(&media_icon));
+                imp.media_label.set_label(&msg.media_display_label());
+                imp.media_button.update_property(&[gtk::accessible::Property::Label(
+                    &msg.media_a11y_label()
+                )]);
+                imp.media_url.replace(msg.media_url_str());
+                imp.media_filename.replace(msg.media_filename_str());
+                imp.media_source_json.replace(msg.media_source_json_str());
                 imp.media_button.set_visible(true);
-                imp.media_url.replace(url.clone());
-                imp.media_filename.replace(display);
             } else {
-                imp.media_button.set_visible(false);
+                // Plain-text message — check pre-extracted image URL.
+                let image_url = msg.image_url();
+                if !image_url.is_empty() {
+                    imp.media_icon.set_icon_name(Some("image-x-generic-symbolic"));
+                    let display = if image_url.contains("giphy.com") {
+                        "GIF".to_string()
+                    } else {
+                        image_url.split('/').last().unwrap_or("image").to_string()
+                    };
+                    imp.media_label.set_label(&display);
+                    imp.media_url.replace(image_url);
+                    imp.media_filename.replace(display);
+                    imp.media_button.set_visible(true);
+                } else {
+                    imp.media_button.set_visible(false);
+                }
             }
         }
 
-        // Reactions — skip full rebuild if unchanged since last bind.
-        if *imp.last_reactions_key.borrow() != reactions_json {
-            imp.last_reactions_key.replace(reactions_json.clone());
+        // Reactions — O(1) hash check, full rebuild only when reactions changed.
+        let reactions_hash = msg.reactions_hash();
+        if imp.last_reactions_hash.get() != reactions_hash {
+            imp.last_reactions_hash.set(reactions_hash);
             while let Some(child) = imp.reactions_box.first_child() {
                 imp.reactions_box.remove(&child);
             }
-        if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(&reactions_json) {
-            if !reactions.is_empty() {
-                for (emoji, count, names) in &reactions {
-                    let label = if *count > 1 {
-                        format!("{emoji} {count}")
-                    } else {
-                        emoji.clone()
-                    };
-                    // Tooltip shows who reacted.
-                    let tooltip = names.join(", ");
-                    // Accessible label gives screen readers a meaningful description
-                    // instead of just the raw emoji + count string.
-                    let a11y_label = if *count > 1 {
-                        format!("{count} reactions: {emoji}. From: {tooltip}")
-                    } else {
-                        format!("Reaction: {emoji}. From: {tooltip}")
-                    };
-                    let pill = gtk::Label::builder()
-                        .label(&label)
-                        .tooltip_text(&tooltip)
-                        .css_classes(["reaction-pill"])
-                        .build();
-                    pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
-                    imp.reactions_box.append(&pill);
+            if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
+                &msg.reactions_json()
+            ) {
+                if !reactions.is_empty() {
+                    for (emoji, count, names) in &reactions {
+                        let label = if *count > 1 {
+                            format!("{emoji} {count}")
+                        } else {
+                            emoji.clone()
+                        };
+                        let tooltip = names.join(", ");
+                        let a11y_label = if *count > 1 {
+                            format!("{count} reactions: {emoji}. From: {tooltip}")
+                        } else {
+                            format!("Reaction: {emoji}. From: {tooltip}")
+                        };
+                        let pill = gtk::Label::builder()
+                            .label(&label)
+                            .tooltip_text(&tooltip)
+                            .css_classes(["reaction-pill"])
+                            .build();
+                        pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
+                        imp.reactions_box.append(&pill);
+                    }
+                    imp.reactions_box.set_visible(true);
+                } else {
+                    imp.reactions_box.set_visible(false);
                 }
-                imp.reactions_box.set_visible(true);
             } else {
                 imp.reactions_box.set_visible(false);
             }
-        } else {
-            imp.reactions_box.set_visible(false);
         }
-        } // end reactions cache guard
 
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(msg, &sender, &msg.sender_id(), &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+        self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
 
         // Disconnect old flash handler before connecting to the new object.
         self.clear_flash_handler();
@@ -1292,15 +1265,16 @@ impl MessageRow {
     ) {
         let imp = self.imp();
 
-        // Sender label — always colorize by user ID for visual disambiguation.
-        // Color is supplementary (never the sole identifier): the text name is
-        // always present, so this is safe for color-blind users and screen readers.
-        if !sender_id.is_empty() {
-            let color = nick_color(sender_id);
-            let escaped = glib::markup_escape_text(sender);
-            imp.sender_label.set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
-        } else {
+        // Sender label — use pre-computed markup (nick_color + markup_escape_text
+        // + format! all happened once in info_to_obj, never again on scroll bind).
+        let sender_markup = msg.sender_markup();
+        if sender_id.is_empty() {
             imp.sender_label.set_label(sender);
+        } else if sender_markup.is_empty() {
+            // Fallback for objects not created via info_to_obj.
+            imp.sender_label.set_label(sender);
+        } else {
+            imp.sender_label.set_markup(&sender_markup);
         }
 
         // Rolodex contact indicator: subtle glow on sender name.

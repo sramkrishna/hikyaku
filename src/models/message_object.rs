@@ -86,6 +86,31 @@ mod imp {
         /// in MessageRow so bind can skip set_markup() when the row is recycled
         /// for a message it already rendered.
         pub(super) body_hash: Cell<u64>,
+
+        /// Pre-rendered sender label markup: `<span foreground="#rrggbb">Name</span>`.
+        /// Computed once in info_to_obj() from sender + sender_id so bind() never
+        /// calls nick_color / markup_escape_text / format! per row.
+        pub(super) sender_markup: RefCell<String>,
+
+        /// FNV-1a hash of reactions_json.  Updated whenever reactions change so
+        /// bind() can skip the O(len) string comparison with an O(1) u64 check.
+        pub(super) reactions_hash: Cell<u64>,
+
+        /// Pre-extracted image/gif URL from the message body (empty if none).
+        /// Avoids re-running extract_image_url() O(body) scan on every bind.
+        pub(super) image_url: RefCell<String>,
+
+        /// Pre-computed reply indicator label: "Replying to Name" or "Reply".
+        /// Empty when the message is not a reply.  Avoids format! + body scan on bind.
+        pub(super) reply_label: RefCell<String>,
+
+        // Pre-computed media display strings — all empty for non-media messages.
+        pub(super) media_icon_name: RefCell<String>,
+        pub(super) media_display_label: RefCell<String>,
+        pub(super) media_a11y_label: RefCell<String>,
+        pub(super) media_url_str: RefCell<String>,
+        pub(super) media_filename_str: RefCell<String>,
+        pub(super) media_source_json_str: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -100,6 +125,7 @@ mod imp {
 
 use glib::Object;
 use gtk::glib;
+use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 
 glib::wrapper! {
@@ -157,4 +183,63 @@ impl MessageObject {
     pub fn set_body_hash(&self, h: u64) {
         self.imp().body_hash.set(h);
     }
+
+    pub fn sender_markup(&self) -> String {
+        self.imp().sender_markup.borrow().clone()
+    }
+
+    pub fn set_sender_markup(&self, s: String) {
+        self.imp().sender_markup.replace(s);
+    }
+
+    pub fn reactions_hash(&self) -> u64 {
+        self.imp().reactions_hash.get()
+    }
+
+    pub fn set_reactions_hash(&self, h: u64) {
+        self.imp().reactions_hash.set(h);
+    }
+
+    /// Update reactions_json and its hash together.  Always use this instead of
+    /// set_reactions_json() so the hash stays in sync.
+    pub fn update_reactions_json(&self, json: String) {
+        let h = fnv1a_str(&json);
+        self.set_reactions_json(json);
+        self.imp().reactions_hash.set(h);
+    }
+
+    pub fn image_url(&self) -> String {
+        self.imp().image_url.borrow().clone()
+    }
+
+    pub fn set_image_url(&self, s: String) {
+        self.imp().image_url.replace(s);
+    }
+
+    pub fn reply_label(&self) -> String {
+        self.imp().reply_label.borrow().clone()
+    }
+
+    pub fn set_reply_label(&self, s: String) {
+        self.imp().reply_label.replace(s);
+    }
+
+    pub fn media_icon_name(&self) -> String { self.imp().media_icon_name.borrow().clone() }
+    pub fn set_media_icon_name(&self, s: String) { self.imp().media_icon_name.replace(s); }
+    pub fn media_display_label(&self) -> String { self.imp().media_display_label.borrow().clone() }
+    pub fn set_media_display_label(&self, s: String) { self.imp().media_display_label.replace(s); }
+    pub fn media_a11y_label(&self) -> String { self.imp().media_a11y_label.borrow().clone() }
+    pub fn set_media_a11y_label(&self, s: String) { self.imp().media_a11y_label.replace(s); }
+    pub fn media_url_str(&self) -> String { self.imp().media_url_str.borrow().clone() }
+    pub fn set_media_url_str(&self, s: String) { self.imp().media_url_str.replace(s); }
+    pub fn media_filename_str(&self) -> String { self.imp().media_filename_str.borrow().clone() }
+    pub fn set_media_filename_str(&self, s: String) { self.imp().media_filename_str.replace(s); }
+    pub fn media_source_json_str(&self) -> String { self.imp().media_source_json_str.borrow().clone() }
+    pub fn set_media_source_json_str(&self, s: String) { self.imp().media_source_json_str.replace(s); }
+}
+
+fn fnv1a_str(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    s.bytes().fold(FNV_OFFSET, |h, b| h.wrapping_mul(FNV_PRIME) ^ b as u64)
 }

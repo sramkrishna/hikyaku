@@ -1795,7 +1795,7 @@ impl MessageView {
                 }
                 None => reactions.push((emoji.clone(), 1, vec!["You".to_string()])),
             }
-            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+            msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
     }
 
@@ -1821,7 +1821,7 @@ impl MessageView {
                 }
                 None => reactions.push((emoji, 1, vec![sender])),
             }
-            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+            msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
     }
 
@@ -1838,7 +1838,7 @@ impl MessageView {
                 if reactions[i].1 <= 1 { reactions.remove(i); }
                 else { reactions[i].1 -= 1; }
             }
-            msg.set_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+            msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
         });
     }
 
@@ -1857,11 +1857,13 @@ impl MessageView {
         let new_body = new_body.to_string();
         let new_formatted = formatted.unwrap_or("").to_string();
         let (markup, hash) = prerender_body(&new_body, &new_formatted);
+        let image_url = crate::widgets::message_row::extract_image_url(&new_body).unwrap_or_default();
         self.update_message_in_place(event_id, |msg| {
             msg.set_body(new_body.clone());
             msg.set_formatted_body(new_formatted.clone());
             msg.set_rendered_markup(markup.clone());
             msg.set_body_hash(hash);
+            msg.set_image_url(image_url.clone());
         });
     }
 
@@ -2471,6 +2473,7 @@ impl MessageView {
             m.body.clone()
         };
         let formatted_body = m.formatted_body.as_deref().unwrap_or("");
+        let reactions_json = serde_json::to_string(&m.reactions).unwrap_or_default();
         let obj = MessageObject::new(
             &m.sender,
             &m.sender_id,
@@ -2485,17 +2488,36 @@ impl MessageView {
         );
         obj.set_is_highlight(m.is_highlight);
         obj.set_is_system_event(m.is_system_event);
-        if let Some(ref name) = m.reply_to_sender {
-            obj.set_reply_to_sender(name.clone());
+        let reply_to_sender = m.reply_to_sender.as_deref().unwrap_or("");
+        if !reply_to_sender.is_empty() {
+            obj.set_reply_to_sender(reply_to_sender.to_string());
         }
         if m.timestamp > 0 {
             obj.set_formatted_timestamp(
                 crate::widgets::message_row::format_timestamp_with_today(m.timestamp, today));
         }
-        // Pre-compute rendered markup and body hash so bind() is O(1) string work.
+        // Pre-compute all per-bind display values once at load time.
         let (markup, hash) = prerender_body(&body, formatted_body);
         obj.set_rendered_markup(markup);
         obj.set_body_hash(hash);
+        obj.set_sender_markup(crate::widgets::message_row::prerender_sender_markup(&m.sender, &m.sender_id));
+        obj.set_reactions_hash(fnv1a_str(&reactions_json));
+        obj.set_image_url(
+            crate::widgets::message_row::extract_image_url(&body)
+                .unwrap_or_default()
+        );
+        obj.set_reply_label(prerender_reply_label(
+            m.reply_to.is_some(), reply_to_sender, &body
+        ));
+        if let Some(ref media) = m.media {
+            let (icon, label, a11y) = prerender_media_display(media);
+            obj.set_media_icon_name(icon);
+            obj.set_media_display_label(label);
+            obj.set_media_a11y_label(a11y);
+            obj.set_media_url_str(media.url.clone());
+            obj.set_media_filename_str(media.filename.clone());
+            obj.set_media_source_json_str(media.source_json.clone());
+        }
         obj
     }
 
@@ -2788,6 +2810,8 @@ impl MessageView {
         let (markup, hash) = prerender_body(body, "");
         divider.set_rendered_markup(markup);
         divider.set_body_hash(hash);
+        divider.set_sender_markup(String::new());
+        divider.set_reactions_hash(fnv1a_str("[]"));
         divider
     }
 
@@ -3177,6 +3201,60 @@ pub(crate) fn prerender_body(body: &str, formatted_body: &str) -> (String, u64) 
     (markup, hash)
 }
 
+/// FNV-1a hash of a string — allocation-free O(n).
+pub(crate) fn fnv1a_str(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    s.bytes().fold(FNV_OFFSET, |h, b| h.wrapping_mul(FNV_PRIME) ^ b as u64)
+}
+
+/// Pre-compute the reply indicator label string for a MessageObject.
+/// Returns "Replying to Name", a local-part fallback, or empty for non-replies.
+pub(crate) fn prerender_reply_label(is_reply: bool, reply_sender: &str, body: &str) -> String {
+    if !is_reply { return String::new(); }
+    if !reply_sender.is_empty() {
+        return format!("Replying to {reply_sender}");
+    }
+    // Fallback: parse "> <@local:server> body" Matrix reply quote in the body.
+    body.lines()
+        .find(|l| l.starts_with("> <@"))
+        .and_then(|l| l.strip_prefix("> <"))
+        .and_then(|l| l.split('>').next())
+        .and_then(|uid| uid.strip_prefix('@'))
+        .and_then(|uid| uid.split(':').next())
+        .map(|local| format!("Replying to {local}"))
+        .unwrap_or_else(|| "Reply".to_string())
+}
+
+/// Pre-compute media button display strings (icon name, label, a11y label).
+/// Returns ("", "", "") for messages without attachments.
+pub(crate) fn prerender_media_display(
+    media: &crate::matrix::MediaInfo,
+) -> (String, String, String) {
+    let kind_str = match media.kind {
+        crate::matrix::MediaKind::Image => "Image",
+        crate::matrix::MediaKind::Video => "Video",
+        crate::matrix::MediaKind::Audio => "Audio",
+        crate::matrix::MediaKind::File  => "File",
+    };
+    let icon = match media.kind {
+        crate::matrix::MediaKind::Image => "image-x-generic-symbolic",
+        crate::matrix::MediaKind::Video => "video-x-generic-symbolic",
+        crate::matrix::MediaKind::Audio => "audio-x-generic-symbolic",
+        crate::matrix::MediaKind::File  => "text-x-generic-symbolic",
+    };
+    let size_str = media.size
+        .map(|s| {
+            if s > 1_048_576 { format!(" ({:.1} MB)", s as f64 / 1_048_576.0) }
+            else if s > 1024  { format!(" ({:.0} KB)", s as f64 / 1024.0) }
+            else               { format!(" ({s} B)") }
+        })
+        .unwrap_or_default();
+    let label   = format!("{}{size_str}", media.filename);
+    let a11y    = format!("{kind_str}: {}{size_str}", media.filename);
+    (icon.to_string(), label, a11y)
+}
+
 /// Format the unread banner title for `n` new messages.
 pub(crate) fn unread_label(n: u32) -> String {
     match n {
@@ -3458,7 +3536,7 @@ mod tests {
     use super::{
         compute_divider_pos, divider_decision, divider_should_mark, front_evict_count,
         incremental_prev_batch, is_echo_duplicate, sorted_insert_pos_in, unread_label,
-        effective_unread_count, prerender_body,
+        effective_unread_count, prerender_body, prerender_reply_label, fnv1a_str,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
 
@@ -3504,6 +3582,31 @@ mod tests {
     ///
     /// `expected_divider_pos` is the index of the first new message (i.e. the
     /// position a divider inserted *before* it would separate read from new).
+    #[test]
+    fn reply_label_with_known_sender() {
+        assert_eq!(prerender_reply_label(true, "Alice", ""), "Replying to Alice");
+    }
+
+    #[test]
+    fn reply_label_empty_when_not_reply() {
+        assert_eq!(prerender_reply_label(false, "Alice", "body"), "");
+    }
+
+    #[test]
+    fn reply_label_fallback_from_body() {
+        let body = "> <@alice:matrix.org> original message\nthe reply";
+        let label = prerender_reply_label(true, "", body);
+        assert_eq!(label, "Replying to alice");
+    }
+
+    #[test]
+    fn fnv1a_str_is_stable() {
+        let h1 = fnv1a_str("hello");
+        let h2 = fnv1a_str("hello");
+        assert_eq!(h1, h2);
+        assert_ne!(fnv1a_str("hello"), fnv1a_str("world"));
+    }
+
     fn make_timeline(
         total: usize,
         read_count: usize,
