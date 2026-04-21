@@ -133,6 +133,9 @@ mod imp {
 
     type MemEntry = (Vec<MessageInfo>, Option<String>, RoomMeta);
 
+    /// Cached member list: (display_names, avatar_urls).
+    pub(super) type MemberEntry = (Vec<(String, String)>, Vec<(String, String)>);
+
     pub struct RoomCache {
         /// In-memory timeline: room_id → (messages, prev_batch_token, RoomMeta).
         /// Lock is held only for brief HashMap ops — never across .await points.
@@ -140,6 +143,10 @@ mod imp {
         /// When each room's data was last fetched from the server (prefetch OR
         /// bg_refresh).  Checked by SelectRoom to avoid redundant full refreshes.
         pub(super) refreshed_at: Mutex<HashMap<String, std::time::Instant>>,
+        /// Member list cache: room_id → (display_names, avatar_urls).
+        /// NOT cleared by invalidate_room — member lists change rarely compared
+        /// to message events, so we keep them across cache invalidations.
+        pub(super) members: Mutex<HashMap<String, MemberEntry>>,
         /// Disk store — per-room JSON files, no shared mutex.
         pub(super) disk: TimelineStore,
     }
@@ -149,6 +156,7 @@ mod imp {
             Self {
                 memory: Mutex::new(HashMap::new()),
                 refreshed_at: Mutex::new(HashMap::new()),
+                members: Mutex::new(HashMap::new()),
                 disk: TimelineStore::new(),
             }
         }
@@ -322,31 +330,24 @@ impl RoomCache {
     }
 
     /// Return cached members + avatars if a full fetch was done this session.
+    /// Survives cache invalidations — stored separately from the timeline entry.
     pub fn get_cached_members(
         &self,
         room_id: &str,
     ) -> Option<(Vec<(String, String)>, Vec<(String, String)>)> {
-        let memory = self.imp().memory.lock().unwrap();
-        memory
-            .get(room_id)
-            .filter(|(_, _, m)| m.members_fetched)
-            .map(|(_, _, m)| (m.members.clone(), m.member_avatars.clone()))
+        self.imp().members.lock().unwrap().get(room_id).cloned()
     }
 
-    /// Store a fetched member list into the room's memory cache entry.
-    /// No-ops if no memory entry exists for the room yet.
+    /// Store a fetched member list.  Stored in a map independent of the
+    /// timeline cache so invalidate_room() does not discard it.
     pub fn cache_members(
         &self,
         room_id: &str,
         members: Vec<(String, String)>,
         member_avatars: Vec<(String, String)>,
     ) {
-        let mut memory = self.imp().memory.lock().unwrap();
-        if let Some((_, _, meta)) = memory.get_mut(room_id) {
-            meta.members = members;
-            meta.member_avatars = member_avatars;
-            meta.members_fetched = true;
-        }
+        self.imp().members.lock().unwrap()
+            .insert(room_id.to_string(), (members, member_avatars));
     }
 
     /// Remove a room from both memory and disk.

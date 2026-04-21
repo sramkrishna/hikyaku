@@ -2198,23 +2198,22 @@ impl MessageView {
             false
         };
 
-        // Re-attach the model after the first-load splice.  clear() already
-        // attached the store synchronously, but set_model(None) above detached
-        // it for the splice; re-attach so GTK reads all items in one shot.
-        if first_load {
-            let no_sel = gtk::NoSelection::new(Some(imp.list_store()));
-            imp.list_view().set_model(Some(&no_sel));
-        }
         // Ensure "messages" is visible (handles placeholder→messages transition)
         // and hide the loading overlay.
         imp.view_stack.set_visible_child_name("messages");
         imp.room_loading_overlay.set_visible(false);
 
-        // Only auto-scroll on the first load.  Subsequent bg_refresh calls
-        // leave the viewport where the user left it.
         if first_load {
+            // Re-attach the model and scroll in one idle so set_messages returns
+            // immediately without blocking the GTK thread.  set_model(Some)
+            // triggers height estimation for all visible rows (~129ms for 80+
+            // variable-height rows); deferring it keeps the GTK frame budget.
+            let store = imp.list_store().clone();
+            let lv = imp.list_view();
             let view_weak = self.downgrade();
             glib::idle_add_local_once(move || {
+                let no_sel = gtk::NoSelection::new(Some(store));
+                lv.set_model(Some(&no_sel));
                 let Some(view) = view_weak.upgrade() else { return };
                 if divider_inserted {
                     view.scroll_to_event("__unread_divider__");
