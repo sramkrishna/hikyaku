@@ -223,6 +223,10 @@ mod imp {
         /// while the user is near the bottom — prevents repeated vadj.set_value()
         /// calls from breaking GTK's kinetic scroll gesture state machine.
         pub scroll_to_bottom_pending: Cell<bool>,
+        /// Cached row-binding context — rebuilt once per room switch by the setters
+        /// (set_highlight_names, set_user_id, set_is_dm_room, set_no_media).
+        /// The bind callback reads this instead of calling config::settings() per recycle.
+        pub cached_row_ctx: RefCell<crate::widgets::MessageRowContext>,
     }
 
     impl Default for MessageView {
@@ -328,6 +332,7 @@ mod imp {
                     .css_classes(["osd", "toolbar"])
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
+                cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
             }
         }
     }
@@ -596,7 +601,7 @@ mod imp {
 
                 let view = obj_weak.upgrade();
                 let ctx = view.as_ref()
-                    .map(|v| v.row_context())
+                    .map(|v| v.imp().cached_row_ctx.borrow().clone())
                     .unwrap_or_default();
                 let _tb = std::time::Instant::now();
                 row.bind_message_object(&msg_obj, &ctx);
@@ -1517,6 +1522,7 @@ impl MessageView {
     pub fn set_highlight_names(&self, names: &[&str]) {
         let rc: std::rc::Rc<[String]> = names.iter().map(|s| s.to_string()).collect();
         self.imp().highlight_names.replace(rc);
+        self.rebuild_row_context_cache();
     }
 
     /// Add a name to highlight.  Replaces the Rc with a new one containing the added name.
@@ -1525,6 +1531,7 @@ impl MessageView {
         let mut v: Vec<String> = imp.highlight_names.borrow().iter().cloned().collect();
         v.push(name.to_string());
         imp.highlight_names.replace(v.into());
+        self.rebuild_row_context_cache();
     }
 
     pub fn connect_send_message<F: Fn(String, Option<String>, Option<(String, String)>, Option<String>, Vec<String>) + 'static>(&self, f: F) {
@@ -1557,14 +1564,24 @@ impl MessageView {
 
     pub fn set_user_id(&self, user_id: &str) {
         self.imp().user_id.replace(user_id.to_string());
+        self.rebuild_row_context_cache();
     }
 
     pub fn set_is_dm_room(&self, is_dm: bool) {
         self.imp().is_dm_room.set(is_dm);
+        self.rebuild_row_context_cache();
     }
 
     pub fn set_no_media(&self, no_media: bool) {
         self.imp().is_no_media.set(no_media);
+        self.rebuild_row_context_cache();
+    }
+
+    /// Rebuild cached_row_ctx from current imp state.  Called by each setter so
+    /// the bind callback never has to touch GSettings.
+    fn rebuild_row_context_cache(&self) {
+        let ctx = self.row_context();
+        self.imp().cached_row_ctx.replace(ctx);
     }
 
     /// Build the per-timeline context for row binding.
