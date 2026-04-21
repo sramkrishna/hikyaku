@@ -1885,7 +1885,7 @@ impl MessageView {
             (imp.list_store(), imp.list_view())
         };
         let Some(i) = store.find(&msg) else { return false };
-        list_view.scroll_to(i, gtk::ListScrollFlags::FOCUS, None);
+        list_view.scroll_to(i, gtk::ListScrollFlags::NONE, None);
         // Trigger flash via GObject property — the notify::is-flashing handler
         // in bind_message_object applies the CSS class reactively, no widget walk.
         msg.set_is_flashing(true);

@@ -1850,13 +1850,17 @@ impl MxWindow {
                                     });
                                 }
                             }
-                            // Check if this room is a DM by looking at the registry.
-                            let is_dm = {
-                                let reg = room_list_view.imp().room_registry.borrow();
-                                reg.get(&room_id).map(|o| o.kind() == crate::matrix::RoomKind::DirectMessage).unwrap_or(false)
-                            };
-                            message_view.set_is_dm_room(is_dm);
-                            message_view.set_no_media(room_list_view.resolve_no_media(&room_id));
+                            // DM status and no-media flag don't change during a bg_refresh —
+                            // skip the DConf reads rebuild_row_context_cache() triggers for
+                            // these setters.  Only re-check on explicit room selection.
+                            if !is_background {
+                                let is_dm = {
+                                    let reg = room_list_view.imp().room_registry.borrow();
+                                    reg.get(&room_id).map(|o| o.kind() == crate::matrix::RoomKind::DirectMessage).unwrap_or(false)
+                                };
+                                message_view.set_is_dm_room(is_dm);
+                                message_view.set_no_media(room_list_view.resolve_no_media(&room_id));
+                            }
                             message_view.set_room_meta(&room_meta);
                             // Update bookmark button icon.
                             if let Some(btn) = window.imp().bookmark_button.get() {
