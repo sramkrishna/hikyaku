@@ -1856,9 +1856,12 @@ impl MessageView {
     pub fn update_message_body(&self, event_id: &str, new_body: &str, formatted: Option<&str>) {
         let new_body = new_body.to_string();
         let new_formatted = formatted.unwrap_or("").to_string();
+        let (markup, hash) = prerender_body(&new_body, &new_formatted);
         self.update_message_in_place(event_id, |msg| {
             msg.set_body(new_body.clone());
             msg.set_formatted_body(new_formatted.clone());
+            msg.set_rendered_markup(markup.clone());
+            msg.set_body_hash(hash);
         });
     }
 
@@ -2467,11 +2470,12 @@ impl MessageView {
         } else {
             m.body.clone()
         };
+        let formatted_body = m.formatted_body.as_deref().unwrap_or("");
         let obj = MessageObject::new(
             &m.sender,
             &m.sender_id,
             &body,
-            m.formatted_body.as_deref().unwrap_or(""),
+            formatted_body,
             m.timestamp,
             &m.event_id,
             m.reply_to.as_deref().unwrap_or(""),
@@ -2488,6 +2492,10 @@ impl MessageView {
             obj.set_formatted_timestamp(
                 crate::widgets::message_row::format_timestamp_with_today(m.timestamp, today));
         }
+        // Pre-compute rendered markup and body hash so bind() is O(1) string work.
+        let (markup, hash) = prerender_body(&body, formatted_body);
+        obj.set_rendered_markup(markup);
+        obj.set_body_hash(hash);
         obj
     }
 
@@ -2763,10 +2771,11 @@ impl MessageView {
 
     /// Build a "New messages" divider MessageObject with the sentinel event_id.
     fn make_divider_obj() -> MessageObject {
+        let body = "── New messages ──";
         let divider = MessageObject::new(
             "",
             "",
-            "── New messages ──",
+            body,
             "",
             0,
             "__unread_divider__",
@@ -2776,6 +2785,9 @@ impl MessageView {
             "",
         );
         divider.set_is_highlight(true);
+        let (markup, hash) = prerender_body(body, "");
+        divider.set_rendered_markup(markup);
+        divider.set_body_hash(hash);
         divider
     }
 
@@ -3135,6 +3147,36 @@ impl MessageView {
     }
 }
 
+/// Pre-render a message body into Pango markup and compute a body hash for
+/// O(1) cache checks in the bind callback.  Called once per MessageObject
+/// construction so the expensive work is paid at load time, not on every scroll.
+///
+/// Returns `(markup, hash)`:
+/// - `markup`: ready-to-pass-to-set_markup() string, empty for code-block messages
+///   (those still need dynamic body_box widget construction in bind).
+/// - `hash`: FNV-1a hash of (body, formatted_body) — used as cache key in
+///   MessageRow.last_body_hash to skip set_markup() when rebinding the same msg.
+pub(crate) fn prerender_body(body: &str, formatted_body: &str) -> (String, u64) {
+    // FNV-1a hash — allocation-free O(n) on input strings.
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for b in body.bytes().chain(std::iter::once(0)).chain(formatted_body.bytes()) {
+        hash = hash.wrapping_mul(FNV_PRIME) ^ b as u64;
+    }
+
+    let markup = if !formatted_body.is_empty() && !formatted_body.contains("<pre") {
+        crate::markdown::html_to_pango(formatted_body)
+    } else if formatted_body.is_empty() {
+        let escaped = gtk::glib::markup_escape_text(body).to_string();
+        crate::markdown::linkify_urls(&escaped)
+    } else {
+        // Code blocks — rendered dynamically in bind via body_box.
+        String::new()
+    };
+    (markup, hash)
+}
+
 /// Format the unread banner title for `n` new messages.
 pub(crate) fn unread_label(n: u32) -> String {
     match n {
@@ -3416,9 +3458,45 @@ mod tests {
     use super::{
         compute_divider_pos, divider_decision, divider_should_mark, front_evict_count,
         incremental_prev_batch, is_echo_duplicate, sorted_insert_pos_in, unread_label,
-        effective_unread_count,
+        effective_unread_count, prerender_body,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
     };
+
+    #[test]
+    fn prerender_plain_text_linkifies() {
+        let (markup, hash) = prerender_body("check https://example.com for info", "");
+        assert!(markup.contains("<a href="), "plain text should have linkified URL");
+        assert_ne!(hash, 0, "hash should be non-zero");
+    }
+
+    #[test]
+    fn prerender_html_converts_to_pango() {
+        let (markup, hash) = prerender_body("hello", "<b>hello</b>");
+        assert!(markup.contains("<b>") || markup.contains("bold") || !markup.is_empty(),
+            "HTML should produce non-empty pango markup");
+        assert_ne!(hash, 0);
+    }
+
+    #[test]
+    fn prerender_code_block_returns_empty_markup() {
+        let (markup, hash) = prerender_body("code", "<pre><code>x = 1</code></pre>");
+        assert!(markup.is_empty(), "code blocks should return empty markup (rendered via body_box)");
+        assert_ne!(hash, 0);
+    }
+
+    #[test]
+    fn prerender_hash_differs_for_different_bodies() {
+        let (_, h1) = prerender_body("hello world", "");
+        let (_, h2) = prerender_body("goodbye world", "");
+        assert_ne!(h1, h2, "different bodies must produce different hashes");
+    }
+
+    #[test]
+    fn prerender_hash_differs_for_body_vs_formatted() {
+        let (_, h1) = prerender_body("hello", "");
+        let (_, h2) = prerender_body("hello", "<b>hello</b>");
+        assert_ne!(h1, h2, "body vs formatted_body should produce different hashes");
+    }
 
     /// Build a timeline split at `read_count`: the first `read_count` events are
     /// read, the rest are new.  Returns `(all_ids, fully_read_id, unread_count,

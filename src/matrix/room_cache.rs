@@ -493,11 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_members_no_op_without_memory_entry() {
+    fn cache_members_independent_of_memory_entry() {
         let cache = RoomCache::new();
-        // cache_members on an unknown room should not panic or create an entry.
-        cache.cache_members("!unknown:s", vec![], vec![]);
-        assert!(cache.get_cached_members("!unknown:s").is_none());
+        // cache_members works even for rooms not in the memory/timeline cache.
+        // The member cache is a separate HashMap that survives invalidate_room().
+        cache.cache_members("!unknown:s", vec![("@a:s".to_string(), "A".to_string())], vec![]);
+        let result = cache.get_cached_members("!unknown:s");
+        assert!(result.is_some(), "member cache should store without a memory entry");
+        let (members, _) = result.unwrap();
+        assert_eq!(members[0].0, "@a:s");
     }
 
     #[test]

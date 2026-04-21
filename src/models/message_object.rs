@@ -76,6 +76,16 @@ mod imp {
         /// Pre-formatted timestamp string, computed once in info_to_obj().
         /// Avoids calling glib::DateTime::from_unix_local on every row bind.
         pub(super) formatted_timestamp: RefCell<String>,
+
+        /// Pre-rendered Pango markup for the message body, computed once in
+        /// info_to_obj() and reused on every scroll bind.  Empty for code-block
+        /// messages which still need dynamic body_box construction.
+        pub(super) rendered_markup: RefCell<String>,
+
+        /// FNV-1a hash of (body, formatted_body), used as a cheap O(1) cache key
+        /// in MessageRow so bind can skip set_markup() when the row is recycled
+        /// for a message it already rendered.
+        pub(super) body_hash: Cell<u64>,
     }
 
     #[glib::object_subclass]
@@ -130,5 +140,21 @@ impl MessageObject {
 
     pub fn set_formatted_timestamp(&self, s: String) {
         self.imp().formatted_timestamp.replace(s);
+    }
+
+    pub fn rendered_markup(&self) -> String {
+        self.imp().rendered_markup.borrow().clone()
+    }
+
+    pub fn set_rendered_markup(&self, s: String) {
+        self.imp().rendered_markup.replace(s);
+    }
+
+    pub fn body_hash(&self) -> u64 {
+        self.imp().body_hash.get()
+    }
+
+    pub fn set_body_hash(&self, h: u64) {
+        self.imp().body_hash.set(h);
     }
 }

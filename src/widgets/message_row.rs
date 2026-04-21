@@ -121,9 +121,10 @@ mod imp {
         pub action_bar: gtk::Box,
         pub reply_button: gtk::Button,
         pub react_button: gtk::Button,
-        /// Cache key for the last rendered body: "{body}\0{formatted_body}".
-        /// When unchanged, body widget recreation is skipped on rebind.
-        pub last_body_key: std::cell::RefCell<String>,
+        /// FNV-1a hash of the last rendered (body, formatted_body).
+        /// Compared against MessageObject::body_hash() — O(1) u64 comparison with
+        /// no allocation. When equal, set_markup() is skipped on rebind.
+        pub last_body_hash: std::cell::Cell<u64>,
         /// Cache key for the last rendered reactions JSON.
         pub last_reactions_key: std::cell::RefCell<String>,
         /// Signal handler IDs for notify connections on the currently bound
@@ -1199,7 +1200,7 @@ impl MessageRow {
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(&sender, &msg.sender_id(), &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+        self.render_body(msg, &sender, &msg.sender_id(), &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
 
         // Disconnect old flash handler before connecting to the new object.
         self.clear_flash_handler();
@@ -1279,6 +1280,7 @@ impl MessageRow {
 
     fn render_body(
         &self,
+        msg: &crate::models::MessageObject,
         sender: &str,
         sender_id: &str,
         body: &str,
@@ -1310,55 +1312,41 @@ impl MessageRow {
             }
         }
 
-        // Pre-lowercase names once for both the check and the highlight loop.
-        let highlight_lower: Vec<String> = highlight_names.iter()
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_lowercase())
-            .collect();
-        let body_lower = body.to_lowercase();
-        let has_highlight = force_highlight
-            || highlight_lower.iter().any(|n| body_lower.contains(n.as_str()));
+        // O(1) cache check — body_hash is an FNV-1a digest of (body, formatted_body)
+        // computed once at MessageObject construction.  Saves all markup processing
+        // when a row is recycled for a message it previously rendered.
+        let body_hash = msg.body_hash();
+        if imp.last_body_hash.get() != body_hash {
+            imp.last_body_hash.set(body_hash);
 
-        if has_highlight { self.add_css_class("mention-row"); }
-        else { self.remove_css_class("mention-row"); }
+            // Highlight detection — only runs when body changed.
+            let highlight_lower: Vec<String> = highlight_names.iter()
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_lowercase())
+                .collect();
+            let body_lower = body.to_lowercase();
+            let has_highlight = force_highlight
+                || highlight_lower.iter().any(|n| body_lower.contains(n.as_str()));
 
-        // Skip body update if content is unchanged since last bind.
-        // Reactions are handled separately; only body + formatted_body matter here.
-        let body_key = format!("{body}\0{formatted_body}");
-        if *imp.last_body_key.borrow() != body_key {
-            imp.last_body_key.replace(body_key);
+            if has_highlight { self.add_css_class("mention-row"); }
+            else { self.remove_css_class("mention-row"); }
 
-            if !formatted_body.is_empty() {
-                if formatted_body.contains("<pre") {
-                    // Contains code blocks — use body_box for syntax-highlighted views.
-                    imp.body_label.set_visible(false);
-                    clear_body_box(&imp.body_box);
-                    imp.body_box.set_visible(true);
-                    for seg in crate::markdown::html_to_segments(formatted_body) {
-                        match seg {
-                            crate::markdown::Segment::Text(markup) => {
-                                imp.body_box.append(&make_text_label(&markup));
-                            }
-                            crate::markdown::Segment::Code { content, lang } => {
-                                imp.body_box.append(&make_code_view(&content, &lang));
-                            }
-                        }
-                    }
-                } else {
-                    // Simple HTML (bold, italic, links, etc.) — convert to Pango markup
-                    // and use the pre-allocated body_label. Avoids all widget construction
-                    // per bind, which is the main source of scroll lag.
-                    imp.body_box.set_visible(false);
-                    clear_body_box(&imp.body_box);
-                    imp.body_label.set_markup(&crate::markdown::html_to_pango(formatted_body));
-                    imp.body_label.set_visible(true);
-                }
-            } else {
-                // Plain-text path — update the pre-allocated body_label in-place.
-                // This avoids constructing a new GtkLabel (with its internal
-                // GtkTextView for selectability) on every room switch.
-                let mut escaped = glib::markup_escape_text(body).to_string();
-                if has_highlight {
+            let rendered_markup = msg.rendered_markup();
+
+            if !rendered_markup.is_empty() {
+                // Fast path: use pre-computed Pango markup (HTML→pango or
+                // plain-text escape+linkify), computed once at load time.
+                imp.body_box.set_visible(false);
+                clear_body_box(&imp.body_box);
+                if has_highlight && !formatted_body.is_empty() {
+                    // HTML message with mention — use pre-rendered markup as-is
+                    // (per-word bolding on HTML bodies is skipped to avoid
+                    // injecting <b> inside existing Pango/anchor tags).
+                    imp.body_label.set_markup(&rendered_markup);
+                } else if has_highlight && !highlight_lower.is_empty() {
+                    // Plain-text mention — apply per-word bold on the original
+                    // escaped text then linkify, same as before.
+                    let mut escaped = glib::markup_escape_text(body).to_string();
                     for name_lower in &highlight_lower {
                         let escaped_lower = escaped.to_lowercase();
                         let mut result = String::new();
@@ -1374,7 +1362,30 @@ impl MessageRow {
                         result.push_str(&escaped[pos..]);
                         escaped = result;
                     }
+                    imp.body_label.set_markup(&linkify_urls(&escaped));
+                } else {
+                    imp.body_label.set_markup(&rendered_markup);
                 }
+                imp.body_label.set_visible(true);
+            } else if !formatted_body.is_empty() {
+                // Code-block path — rendered_markup is empty for <pre> messages;
+                // build body_box widgets dynamically (rare, so cost is acceptable).
+                imp.body_label.set_visible(false);
+                clear_body_box(&imp.body_box);
+                imp.body_box.set_visible(true);
+                for seg in crate::markdown::html_to_segments(formatted_body) {
+                    match seg {
+                        crate::markdown::Segment::Text(markup) => {
+                            imp.body_box.append(&make_text_label(&markup));
+                        }
+                        crate::markdown::Segment::Code { content, lang } => {
+                            imp.body_box.append(&make_code_view(&content, &lang));
+                        }
+                    }
+                }
+            } else {
+                // Fallback for objects created outside info_to_obj (e.g. echoes).
+                let escaped = glib::markup_escape_text(body).to_string();
                 imp.body_box.set_visible(false);
                 clear_body_box(&imp.body_box);
                 imp.body_label.set_markup(&linkify_urls(&escaped));
