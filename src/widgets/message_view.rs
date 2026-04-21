@@ -227,6 +227,13 @@ mod imp {
         /// (set_highlight_names, set_user_id, set_is_dm_room, set_no_media).
         /// The bind callback reads this instead of calling config::settings() per recycle.
         pub cached_row_ctx: RefCell<crate::widgets::MessageRowContext>,
+        /// Pending objects from append_message() calls waiting to be flushed to
+        /// the list_store in a single splice.  Multiple NewMessage events that arrive
+        /// in a burst (e.g. after a sync reconnect) accumulate here so GTK sees one
+        /// items_changed signal instead of N separate ones.
+        pub pending_appends: RefCell<Vec<crate::models::MessageObject>>,
+        /// True while a flush idle is already queued for pending_appends.
+        pub append_flush_pending: Cell<bool>,
     }
 
     impl Default for MessageView {
@@ -333,6 +340,8 @@ mod imp {
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
                 cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
+                pending_appends: RefCell::new(Vec::new()),
+                append_flush_pending: Cell::new(false),
             }
         }
     }
@@ -2489,6 +2498,8 @@ impl MessageView {
         // ── Reset non-persisted per-room state ───────────────────────────────
         imp.bookmarked_ids.borrow_mut().clear();
         imp.new_message_objs.borrow_mut().clear();
+        imp.pending_appends.borrow_mut().clear();
+        imp.append_flush_pending.set(false);
         imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
@@ -2874,49 +2885,68 @@ impl MessageView {
         let obj = Self::info_to_obj(msg);
         let eid = obj.event_id();
         if !eid.is_empty() {
+            // Pre-insert into event_index immediately so subsequent dedup checks
+            // within the same burst (before the flush idle fires) work correctly.
             self.imp().event_index.borrow_mut().insert(eid, obj.clone());
         }
         if mark_as_new {
             obj.set_is_new_message(true);
             self.imp().new_message_objs.borrow_mut().push(obj.clone());
         }
+        // Defer the list_store mutation to an idle so bursts of NewMessage events
+        // (e.g. 8 messages after a sync reconnect) produce one items_changed signal
+        // instead of N separate ones.
         let imp = self.imp();
-        imp.list_store().append(&obj);
-
-        // Evict oldest messages from the front to maintain the cap.
-        // Only scan as many items as we need to evict (target = n - MAX_STORE_SIZE),
-        // not all N items — the old O(N) full scan fired on every incoming message.
-        {
-            let store = imp.list_store();
-            let n = store.n_items();
-            if n > MAX_STORE_SIZE {
-                let target = n - MAX_STORE_SIZE;
-                let mut evict: u32 = 0;
-                for i in 0..target {
-                    match store.item(i).and_downcast::<MessageObject>() {
-                        Some(o) if !o.event_id().is_empty() => evict += 1,
-                        _ => break,
-                    }
+        imp.pending_appends.borrow_mut().push(obj);
+        if !imp.append_flush_pending.get() {
+            imp.append_flush_pending.set(true);
+            let obj_weak = self.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(view) = obj_weak.upgrade() {
+                    view.flush_pending_appends();
                 }
-                if evict > 0 {
-                    {
-                        let mut idx = imp.event_index.borrow_mut();
-                        for i in 0..evict {
-                            if let Some(o) = store.item(i).and_downcast::<MessageObject>() {
-                                idx.remove(&o.event_id());
-                            }
-                        }
-                    }
-                    store.splice(0, evict, &[] as &[MessageObject]);
-                    tracing::debug!(
-                        "append_message: evicted {} from front, store={}", evict, n - evict
-                    );
+            });
+        }
+    }
+
+    /// Flush all pending appends to the list_store in a single splice call.
+    /// Called from the idle scheduled by append_message().
+    fn flush_pending_appends(&self) {
+        const MAX_STORE_SIZE: u32 = 400;
+        let imp = self.imp();
+        imp.append_flush_pending.set(false);
+        let objs: Vec<MessageObject> = imp.pending_appends.borrow_mut().drain(..).collect();
+        if objs.is_empty() {
+            return;
+        }
+        let store = imp.list_store();
+        let n = store.n_items();
+        // Single splice appends all queued objects — one items_changed signal.
+        store.splice(n, 0, &objs);
+        // Evict oldest messages from the front to maintain the cap.
+        let new_n = store.n_items();
+        if new_n > MAX_STORE_SIZE {
+            let target = new_n - MAX_STORE_SIZE;
+            let mut evict: u32 = 0;
+            for i in 0..target {
+                match store.item(i).and_downcast::<MessageObject>() {
+                    Some(o) if !o.event_id().is_empty() => evict += 1,
+                    _ => break,
                 }
             }
+            if evict > 0 {
+                {
+                    let mut idx = imp.event_index.borrow_mut();
+                    for i in 0..evict {
+                        if let Some(o) = store.item(i).and_downcast::<MessageObject>() {
+                            idx.remove(&o.event_id());
+                        }
+                    }
+                }
+                store.splice(0, evict, &[] as &[MessageObject]);
+                tracing::debug!("flush_pending_appends: evicted {} from front, store={}", evict, new_n - evict);
+            }
         }
-
-        // Only drag the viewport to the bottom when the user is already there.
-        // If they are scrolled up reading history, new messages append silently.
         if self.is_near_bottom() {
             self.scroll_to_bottom();
         }
