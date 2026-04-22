@@ -1168,22 +1168,45 @@ mod imp {
                         .collect();
 
                 let members = imp.room_members.borrow();
-                // Empty prefix (@-alone) → show all members. Otherwise binary
-                // search for O(log n + k) prefix matching, with rolodex first.
+                // Empty prefix (@-alone) → show all members. Otherwise match
+                // in two phases: prefix first (O(log n + k) via binary
+                // search) then substring over the rest (linear) to fill
+                // remaining capacity. This preserves "starts-with wins"
+                // ordering so typing @ali still surfaces alice first, while
+                // also finding mali and kailani when prefix alone misses.
                 let prefix_lower = prefix.to_lowercase();
                 let rolodex_matches: Vec<(String, String, String)> = rolodex_raw.into_iter()
-                    .filter(|(lower, _, _)| prefix.is_empty() || lower.starts_with(&prefix_lower))
+                    .filter(|(lower, _, _)| prefix.is_empty() || lower.contains(&prefix_lower))
                     .take(5)
                     .collect();
                 let room_matches: Vec<&(String, String, String)> = if prefix.is_empty() {
                     members.iter().take(10).collect()
                 } else {
+                    const MATCH_CAP: usize = 10;
                     let start = members.partition_point(|(lower, _, _)| lower.as_str() < prefix_lower.as_str());
-                    members[start..]
+                    let mut collected: Vec<&(String, String, String)> = members[start..]
                         .iter()
                         .take_while(|(lower, _, _)| lower.starts_with(&prefix_lower))
-                        .take(10)
-                        .collect()
+                        .take(MATCH_CAP)
+                        .collect();
+                    if collected.len() < MATCH_CAP {
+                        let seen: std::collections::HashSet<String> = collected
+                            .iter()
+                            .map(|(_, _, uid)| uid.clone())
+                            .collect();
+                        let needed = MATCH_CAP - collected.len();
+                        let extras: Vec<&(String, String, String)> = members
+                            .iter()
+                            .filter(|(lower, _, uid)| {
+                                !seen.contains(uid)
+                                    && !lower.starts_with(prefix_lower.as_str())
+                                    && lower.contains(prefix_lower.as_str())
+                            })
+                            .take(needed)
+                            .collect();
+                        collected.extend(extras);
+                    }
+                    collected
                 };
                 // Combine: rolodex first, then room members not already in rolodex.
                 let rolodex_ids: std::collections::HashSet<String> =
