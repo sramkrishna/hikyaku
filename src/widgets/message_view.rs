@@ -201,6 +201,11 @@ mod imp {
         /// Room members for nick completion: (lowercase_name, display_name, user_id).
         /// Sorted by lowercase_name for binary search prefix matching.
         pub room_members: RefCell<Vec<(String, String, String)>>,
+        /// user_id → avatar mxc URL for members of the current room.
+        /// Populated in set_room_meta from meta.member_avatars. Used by
+        /// the nick-picker popover to enqueue FetchAvatar commands for
+        /// members whose avatar image hasn't been downloaded yet.
+        pub member_avatar_mxc: RefCell<HashMap<String, String>>,
         /// Nick completion popover.
         pub nick_popover: gtk::Popover,
         pub nick_list: gtk::ListBox,
@@ -343,6 +348,7 @@ mod imp {
                 highlight_names: RefCell::new(std::rc::Rc::from([])),
                 user_id: RefCell::new(String::new()),
                 room_members: RefCell::new(Vec::new()),
+                member_avatar_mxc: RefCell::new(HashMap::new()),
                 nick_popover: {
                     let popover = gtk::Popover::new();
                     popover.set_autohide(false);
@@ -939,27 +945,29 @@ mod imp {
             self.nick_popover.set_position(gtk::PositionType::Top);
 
             // When a nick is selected from the list, insert it.
-            // Row layout (new): ListBoxRow[widget_name=uid] → Box → [
-            //   Label[css:body, visible]  ← display name (used for insert)
-            //   Label[css:dim-label+caption, visible] ← @mxid (disambiguator)
+            // Row layout: ListBoxRow[widget_name=uid] → hbox → [
+            //   adw::Avatar,
+            //   vbox → [
+            //     Label[css:body]       ← display name (used for insert),
+            //     Label[css:dim-label+caption] ← @mxid (disambiguator),
+            //   ],
             // ]
             let view_for_row = obj.downgrade();
             self.nick_list.connect_row_activated(move |_, row| {
                 let Some(view) = view_for_row.upgrade() else { return; };
                 let imp = view.imp();
-                // The uid is on the ListBoxRow's widget_name. The display
-                // name is the first Label child inside the row's Box.
                 let uid = row.widget_name().to_string();
                 let Some(nick) = row
                     .child()
+                    .and_then(|c| c.downcast::<gtk::Box>().ok())      // hbox
+                    .and_then(|b| b.last_child())                     // vbox (after avatar)
                     .and_then(|c| c.downcast::<gtk::Box>().ok())
-                    .and_then(|b| b.first_child())
+                    .and_then(|b| b.first_child())                    // name Label
                     .and_then(|c| c.downcast::<gtk::Label>().ok())
                     .map(|l| l.text().to_string())
                 else { return; };
                 let buf = imp.input_view.buffer();
                 let text = buf_text(&buf);
-                // Replace from the last '@' — keeps the '@' prefix.
                 if let Some(at_pos) = text.rfind('@') {
                     let before = &text[..at_pos];
                     let new_text = format!("{before}@{nick} ");
@@ -1062,11 +1070,11 @@ mod imp {
                         .or_else(|| imp.nick_list.row_at_index(0));
                     if let Some(row) = row {
                         imp.nick_list.select_row(Some(&row));
-                        // Row layout is ListBoxRow → Box → [name, @mxid]
-                        // (see the row-construction site). Walk into the
-                        // Box to reach the name Label.
+                        // Walk ListBoxRow → hbox → vbox (last child) → name Label.
                         if let Some(label) = row
                             .child()
+                            .and_then(|c| c.downcast::<gtk::Box>().ok())
+                            .and_then(|b| b.last_child())
                             .and_then(|c| c.downcast::<gtk::Box>().ok())
                             .and_then(|b| b.first_child())
                             .and_then(|c| c.downcast::<gtk::Label>().ok())
@@ -1258,17 +1266,54 @@ mod imp {
                 while let Some(row) = imp.nick_list.first_child() {
                     imp.nick_list.remove(&row);
                 }
+                // Walk up to the enclosing MxWindow for avatar-cache reads
+                // and command_tx (to enqueue FetchAvatar for unknown
+                // members). Widget::ancestor returns Option<Widget> which
+                // is downcastable; Widget::root returns an opaque Root
+                // trait object that does not expose our subclass.
+                use gtk::prelude::*;
+                let window = view_for_tab
+                    .ancestor(crate::widgets::MxWindow::static_type())
+                    .and_then(|w| w.downcast::<crate::widgets::MxWindow>().ok());
+                let mxc_map = imp.member_avatar_mxc.borrow();
                 for (_, name, uid) in &matches {
-                    // Two-line row: display name (primary) + @mxid (dimmed).
-                    // The mxid disambiguates two members who share a display
-                    // name — initials-on-colour alone can't because the
-                    // adw::Avatar colour hash is derived from text and two
-                    // "Alice"s hash identically. Showing the mxid is the
-                    // reliable zero-download disambiguator.
-                    let row_box = gtk::Box::builder()
+                    // 24px avatar + vertical [display_name, @mxid] layout.
+                    // The avatar uses the cached on-disk path if the window
+                    // has one (populated by MatrixEvent::AvatarReady). If
+                    // we know the mxc but not the local path, enqueue a
+                    // FetchAvatar command — the row will update on next
+                    // popover open with the real image.
+                    let avatar = adw::Avatar::builder()
+                        .size(24)
+                        .text(name.as_str())
+                        .show_initials(true)
+                        .build();
+                    if let Some(ref win) = window {
+                        let cache = win.imp().avatar_cache.borrow();
+                        if let Some(path) = cache.get(uid) {
+                            if !path.is_empty() {
+                                if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
+                                    avatar.set_custom_image(Some(&tex));
+                                }
+                            }
+                        } else if let Some(mxc) = mxc_map.get(uid) {
+                            // Fire FetchAvatar so the next popover open
+                            // picks up the downloaded image from the cache.
+                            if let Some(tx) = win.imp().command_tx.get().cloned() {
+                                let user_id = uid.clone();
+                                let mxc = mxc.clone();
+                                glib::spawn_future_local(async move {
+                                    let _ = tx.send(crate::matrix::MatrixCommand::FetchAvatar {
+                                        user_id, mxc_url: mxc,
+                                    }).await;
+                                });
+                            }
+                        }
+                    }
+
+                    let text_box = gtk::Box::builder()
                         .orientation(gtk::Orientation::Vertical)
-                        .margin_start(8).margin_end(8)
-                        .margin_top(4).margin_bottom(4)
+                        .spacing(0)
                         .build();
                     let name_label = gtk::Label::builder()
                         .label(name.as_str())
@@ -1280,8 +1325,17 @@ mod imp {
                         .halign(gtk::Align::Start)
                         .css_classes(["dim-label", "caption"])
                         .build();
-                    row_box.append(&name_label);
-                    row_box.append(&mxid_label);
+                    text_box.append(&name_label);
+                    text_box.append(&mxid_label);
+
+                    let row_box = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(8)
+                        .margin_start(8).margin_end(8)
+                        .margin_top(4).margin_bottom(4)
+                        .build();
+                    row_box.append(&avatar);
+                    row_box.append(&text_box);
 
                     let list_row = gtk::ListBoxRow::builder()
                         .activatable(true)
@@ -1292,11 +1346,15 @@ mod imp {
                     list_row.set_widget_name(uid.as_str());
                     imp.nick_list.append(&list_row);
                 }
+                drop(mxc_map);
                 // Select first and preview.
                 if let Some(first) = imp.nick_list.row_at_index(0) {
                     imp.nick_list.select_row(Some(&first));
+                    // Walk ListBoxRow → hbox → vbox (last child) → name Label.
                     if let Some(name_label) = first
                         .child()
+                        .and_then(|c| c.downcast::<gtk::Box>().ok())
+                        .and_then(|b| b.last_child())
                         .and_then(|c| c.downcast::<gtk::Box>().ok())
                         .and_then(|b| b.first_child())
                         .and_then(|c| c.downcast::<gtk::Label>().ok())
@@ -2991,6 +3049,16 @@ impl MessageView {
                 .collect();
             members.sort_by(|a, b| a.0.cmp(&b.0));
             imp.room_members.replace(members);
+            // Stash mxc URLs for each member so the nick popover can look
+            // them up and fire FetchAvatar on demand.
+            let mut mxc_map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(meta.member_avatars.len());
+            for (uid, mxc) in &meta.member_avatars {
+                if !mxc.is_empty() {
+                    mxc_map.insert(uid.clone(), mxc.clone());
+                }
+            }
+            imp.member_avatar_mxc.replace(mxc_map);
         }
 
         // Update fully_read marker and unread count. messages_loaded is
