@@ -3190,6 +3190,17 @@ impl MessageView {
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let _g = crate::perf::scope_gt("patch_echo_event_id", 200);
         let imp = self.imp();
+        // Normalise the incoming body by stripping any Matrix reply fallback
+        // ("> <@sender> quoted\n\nreal body"). The stored body on the local
+        // echo MessageObject was stripped in info_to_obj; the server echo
+        // still carries the fallback lines for reply messages. Without this
+        // normalisation, reply echoes never match and the user sees their
+        // local echo row + the server copy as two distinct rows (observed
+        // intermittently across rooms — bug repro correlates with replies).
+        // strip_reply_fallback is a no-op on bodies that don't start with
+        // "> ", so this is cheap for the common non-reply case.
+        let normalized = crate::widgets::message_row::strip_reply_fallback(echo_body);
+        let echo_body: &str = &normalized;
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         tracing::debug!("patch_echo_event_id: searching n={} for body={:?} event_id={}", n, body_preview(echo_body), event_id);
         // Local echo search — echos have empty event_id and are near the end.
