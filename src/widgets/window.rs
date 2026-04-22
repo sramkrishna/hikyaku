@@ -5149,7 +5149,7 @@ impl MxWindow {
             .application_name(crate::config::APP_NAME)
             .application_icon(crate::config::APP_ID)
             .developer_name("Hikyaku Contributors")
-            .version("0.1.0")
+            .version(env!("CARGO_PKG_VERSION"))
             .comments("A Matrix client built with Rust and libadwaita, designed around activity awareness.")
             .website("https://gitlab.gnome.org/ramkrishna/hikyaku")
             .license_type(gtk::License::Gpl30)

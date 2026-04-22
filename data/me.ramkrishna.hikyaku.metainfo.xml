@@ -46,6 +46,19 @@
   </content_rating>
 
   <releases>
+    <release version="0.2.0" date="2026-04-22">
+      <description>
+        <p>Major performance overhaul.</p>
+        <ul>
+          <li>Peak memory reduced from ~4 GB to ~70 MB by sharing one EmojiChooser across all message rows instead of one per row, and by evicting cold per-room widget trees via an LRU cache.</li>
+          <li>Room entry and scroll: HTML→Pango conversion rewritten to byte-based scanning, cutting the worst per-message parse from ~38 ms to under 200 µs.</li>
+          <li>Smooth scrolling: GSK renderer pinned to Vulkan, removing per-frame offscreen fallback for GskTransformNode / GskMaskNode / GskContainerNode on affected drivers.</li>
+          <li>Room list: decoded avatar textures are now cached, so scrolling the sidebar no longer re-decodes images per row.</li>
+          <li>Reaction pills are pooled per row and reused across rebinds instead of being destroyed and recreated.</li>
+          <li>Added a scope-guard timing helper (src/perf.rs) and comprehensive instrumentation across the bind, room-entry, and focus-activation hot paths.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-04-07">
       <description>
         <p>Initial release of Hikyaku.</p>
