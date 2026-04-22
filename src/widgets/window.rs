@@ -4170,7 +4170,7 @@ impl MxWindow {
         let tx = imp.command_tx.get().unwrap().clone();
 
         let entry = gtk::Entry::builder()
-            .placeholder_text("@user:server")
+            .placeholder_text("@user:server — or just user")
             .hexpand(true)
             .build();
         let start_btn = gtk::Button::builder()
@@ -4202,10 +4202,62 @@ impl MxWindow {
         imp.room_list_view.prepend(&revealer);
         entry.grab_focus();
 
+        // Known servers for the completion popover. Order puts the user's
+        // own homeserver first (most common target), then a curated
+        // fallback list covering big community servers. A future refinement
+        // (#14 phase 2) can extend this with servers actually observed in
+        // joined-room members, but the fallback alone already unblocks the
+        // common case of typing just a localpart.
+        let known_servers: Vec<String> = {
+            let uid = imp.user_id.borrow();
+            let mut servers: Vec<String> = Vec::new();
+            if let Some(own) = uid.splitn(2, ':').nth(1) {
+                if !own.is_empty() {
+                    servers.push(own.to_string());
+                }
+            }
+            for fallback in [
+                "matrix.org",
+                "gnome.org",
+                "kde.org",
+                "mozilla.org",
+                "fedora.im",
+                "element.io",
+                "tchncs.de",
+            ] {
+                if !servers.iter().any(|s| s == fallback) {
+                    servers.push(fallback.to_string());
+                }
+            }
+            servers
+        };
+
+        // Completion popover with a ListBox of "@local:server" rows.
+        let completion_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["boxed-list"])
+            .build();
+        let completion_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .max_content_height(240)
+            .propagate_natural_height(true)
+            .child(&completion_list)
+            .build();
+        let completion_popover = gtk::Popover::builder()
+            .child(&completion_scroll)
+            .has_arrow(false)
+            .autohide(false)
+            .build();
+        completion_popover.set_parent(&entry);
+        completion_popover.set_position(gtk::PositionType::Bottom);
+
         let dismiss = {
             let win_weak = self.downgrade();
             let revealer = revealer.clone();
+            let popover = completion_popover.clone();
             move || {
+                popover.popdown();
+                popover.unparent();
                 revealer.set_reveal_child(false);
                 if let Some(win) = win_weak.upgrade() {
                     win.imp().inline_bar_active.set(false);
@@ -4221,18 +4273,82 @@ impl MxWindow {
             }
         };
 
-        let tx2 = tx.clone();
-        let entry2 = entry.clone();
-        let dismiss2 = dismiss.clone();
-        let do_start = move || {
-            let text = entry2.text().to_string();
-            if text.is_empty() { return; }
-            let tx = tx2.clone();
-            let dismiss = dismiss2.clone();
+        // Helper to submit a completed user id.
+        let tx_submit = tx.clone();
+        let dismiss_submit = dismiss.clone();
+        let submit_user_id = move |user_id: String| {
+            if user_id.is_empty() { return; }
+            let tx = tx_submit.clone();
+            let dismiss = dismiss_submit.clone();
             glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::CreateDm { user_id: text }).await;
+                let _ = tx.send(MatrixCommand::CreateDm { user_id }).await;
                 dismiss();
             });
+        };
+
+        // Rebuild the completion list on text-changed. If the text already
+        // contains a ':' we treat it as a full user id and hide the popover
+        // (the user knows what they want). If it's empty, hide. Otherwise
+        // list @localpart:server for each known server.
+        let popover_for_changed = completion_popover.clone();
+        let list_for_changed = completion_list.clone();
+        let servers_for_changed = known_servers.clone();
+        let submit_from_list = submit_user_id.clone();
+        entry.connect_changed(move |e| {
+            let raw = e.text().to_string();
+            let trimmed = raw.trim_start_matches('@').to_string();
+            if trimmed.is_empty() || trimmed.contains(':') {
+                popover_for_changed.popdown();
+                return;
+            }
+            // Clear existing rows.
+            while let Some(child) = list_for_changed.first_child() {
+                list_for_changed.remove(&child);
+            }
+            for server in &servers_for_changed {
+                let full = format!("@{trimmed}:{server}");
+                let row = gtk::ListBoxRow::builder()
+                    .activatable(true)
+                    .build();
+                let label = gtk::Label::builder()
+                    .label(&full)
+                    .halign(gtk::Align::Start)
+                    .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
+                    .build();
+                row.set_child(Some(&label));
+                let full_clone = full.clone();
+                let submit = submit_from_list.clone();
+                let popover = popover_for_changed.clone();
+                row.connect_activate(move |_| {
+                    popover.popdown();
+                    submit(full_clone.clone());
+                });
+                list_for_changed.append(&row);
+            }
+            // Select the first row so Arrow-Down / Enter behave naturally.
+            if let Some(first) = list_for_changed.row_at_index(0) {
+                list_for_changed.select_row(Some(&first));
+            }
+            popover_for_changed.popup();
+        });
+
+        // Submit from the Message button or raw Enter without a list pick.
+        let entry_for_start = entry.clone();
+        let submit_for_start = submit_user_id.clone();
+        let list_for_start = completion_list.clone();
+        let do_start = move || {
+            let text = entry_for_start.text().to_string();
+            if text.is_empty() { return; }
+            // If the text lacks ':' try the highlighted completion row first.
+            if !text.contains(':') {
+                if let Some(selected) = list_for_start.selected_row() {
+                    if let Some(label) = selected.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                        submit_for_start(label.label().to_string());
+                        return;
+                    }
+                }
+            }
+            submit_for_start(text);
         };
 
         let start_fn = do_start.clone();
