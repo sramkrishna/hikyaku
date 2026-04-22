@@ -639,12 +639,16 @@ fn apply_new_message_css(color: &str) {
 }
 
 /// Apply font settings via a CSS provider on the default display.
+/// Targets both `.mx-message-body` (the message text) and
+/// `.mx-message-sender` (the nick above it) so the Appearance preference
+/// scales the whole message block together rather than just the body.
 fn apply_font_css(settings: &AppearanceSettings) {
+    let selectors = ".mx-message-body, .mx-message-sender";
     let css = if settings.font_family.is_empty() {
-        format!(".mx-message-body {{ font-size: {}pt; }}", settings.font_size)
+        format!("{selectors} {{ font-size: {}pt; }}", settings.font_size)
     } else {
         format!(
-            ".mx-message-body {{ font-family: \"{}\"; font-size: {}pt; }}",
+            "{selectors} {{ font-family: \"{}\"; font-size: {}pt; }}",
             settings.font_family, settings.font_size
         )
     };

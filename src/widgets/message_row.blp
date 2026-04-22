@@ -63,7 +63,11 @@ template $MxMessageRow : Gtk.Box {
 
       Gtk.Label sender_label {
         halign: start;
-        styles ["caption-heading"]
+        // mx-message-sender is a selector hook for user-configurable font
+        // scaling (see show_preferences → .mx-message-body and
+        // .mx-message-sender rule in window.rs). caption-heading kept for
+        // the default visual weight.
+        styles ["caption-heading", "mx-message-sender"]
       }
 
       // Thread indicator.
