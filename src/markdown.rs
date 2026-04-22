@@ -332,7 +332,16 @@ pub(crate) fn escape_text(s: &str) -> String {
 /// Convert bare http/https URLs in already-escaped Pango markup text into
 /// `<a href="…">…</a>` links.  Input must already be XML-escaped (& → &amp;
 /// etc.) so that URL characters are intact but no literal `<`/`>` remain.
+///
+/// Also linkifies Matrix room aliases (`#name:server.tld`). Room aliases
+/// are rendered with text-only pill styling (the Pango `mx-room-pill` class
+/// picks up CSS) and become clickable matrix.to links handled by the
+/// existing `parse_matrix_uri` / `handle_matrix_link` pipeline.
 pub(crate) fn linkify_urls(text: &str) -> String {
+    linkify_aliases(&linkify_http(text))
+}
+
+fn linkify_http(text: &str) -> String {
     let mut result = String::with_capacity(text.len() + 64);
     let mut rest = text;
     while let Some(start) = rest.find("http") {
@@ -353,6 +362,100 @@ pub(crate) fn linkify_urls(text: &str) -> String {
         rest = &candidate[url_end..];
     }
     result.push_str(rest);
+    result
+}
+
+/// Detect Matrix room aliases (#name:server.tld) in Pango-escaped text and
+/// wrap them in anchor tags. Linkification pass runs AFTER `linkify_http`
+/// so aliases already inside `<a>` tags (web links happening to contain a
+/// `#`) are skipped — we scan outside-of-tag text by tracking depth.
+///
+/// Match rules:
+///   * `#` not preceded by an alphanumeric (avoids `bug#123` style IDs)
+///   * followed by one or more `[A-Za-z0-9_.-]` (the localpart)
+///   * a `:` separator
+///   * a server name with at least one `.` (guards against `#foo:bar`)
+///   * server name stops at whitespace, `/`, `<`, `>`, or end of string
+fn linkify_aliases(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len() + 32);
+    let mut i = 0;
+    let mut in_tag = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'<' {
+            in_tag = true;
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'>' {
+            in_tag = false;
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+        if in_tag || b != b'#' {
+            // push this byte verbatim; we're copying ASCII directly and
+            // any multi-byte UTF-8 content flows through unmodified via
+            // pushing raw bytes … but push_str from the slice is simpler
+            // and handles multi-byte correctly.
+            let start = i;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == b'<' || c == b'>' { break; }
+                if !in_tag && c == b'#' { break; }
+                i += 1;
+            }
+            result.push_str(&text[start..i]);
+            continue;
+        }
+        // b == b'#' and not in a tag. Check preceding char isn't alnum.
+        let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if !prev_ok {
+            result.push('#');
+            i += 1;
+            continue;
+        }
+        // Scan localpart.
+        let local_start = i + 1;
+        let mut j = local_start;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j == local_start || j >= bytes.len() || bytes[j] != b':' {
+            result.push('#');
+            i += 1;
+            continue;
+        }
+        // Scan server name (must contain a dot; stops at whitespace/end).
+        let server_start = j + 1;
+        let mut k = server_start;
+        let mut saw_dot = false;
+        while k < bytes.len() {
+            let c = bytes[k];
+            if c.is_ascii_whitespace() || c == b'<' || c == b'>' || c == b'/' { break; }
+            if c == b'.' { saw_dot = true; }
+            k += 1;
+        }
+        if !saw_dot || k == server_start {
+            result.push('#');
+            i += 1;
+            continue;
+        }
+        let alias = &text[i..k]; // #local:server
+        // Percent-encode the '#' for the matrix.to fragment.
+        let href = format!("https://matrix.to/#/%23{}", &text[local_start..k]);
+        result.push_str(&format!(
+            "<a href=\"{href}\">{alias}</a>",
+        ));
+        i = k;
+    }
     result
 }
 
@@ -425,4 +528,33 @@ mod tests {
         let out = linkify_urls("not a link: httpx://foo");
         assert!(!out.contains("<a"), "httpx:// should not be linkified");
     }
+
+    #[test]
+    fn test_linkify_room_alias() {
+        let out = linkify_urls("see #outreachy:gnome.org for info");
+        assert!(out.contains("<a href=\"https://matrix.to/#/%23outreachy:gnome.org\">#outreachy:gnome.org</a>"),
+            "got {out}");
+    }
+
+    #[test]
+    fn test_linkify_room_alias_no_bare_hashes() {
+        // Bug tags (#123) and word-suffix hashes (foo#bar) must NOT linkify.
+        let out = linkify_urls("see bug#123 and foo#bar for details");
+        assert!(!out.contains("<a"), "bug#123 should not match: {out}");
+    }
+
+    #[test]
+    fn test_linkify_room_alias_requires_dotted_server() {
+        // A server name without a dot is not a real alias.
+        let out = linkify_urls("meet at #lunch:today please");
+        assert!(!out.contains("<a"), "single-label server should not match: {out}");
+    }
+
+    #[test]
+    fn test_linkify_room_alias_and_url_together() {
+        let out = linkify_urls("see #room:example.org or https://example.org/doc");
+        assert!(out.contains("<a href=\"https://matrix.to/#/%23room:example.org\">"));
+        assert!(out.contains("<a href=\"https://example.org/doc\">"));
+    }
+
 }
