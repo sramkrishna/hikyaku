@@ -36,26 +36,27 @@ This is a GTK4 `GtkListView` infrastructure cost that cannot be avoided with the
 - `bind_message_object` callbacks: <2ms each, ~30ms total per room switch
 - `list_store.splice(0, n, &objs)`: 300–1000ms — **all GTK infrastructure overhead**
 
-**Architectural alternatives that avoid full-replace splice:**
+**Current architecture (implemented in `src/widgets/message_view.rs`):**
 
-1. **Per-room ListStore + GtkStack** (recommended for chat apps):
-   - Keep a `HashMap<RoomId, gio::ListStore>` plus one `gtk::ListView` per room
-   - Wrap all ListViews in a `gtk::Stack`; on room switch call `stack.set_visible_child(room_list_view)`
-   - First visit to a room still does an initial splice (one-time cost)
-   - Returning to a room is O(1) — no splice, no rebind, GTK just shows the existing widget tree
-   - Memory cost: ~15 pool widgets per room × n_rooms (acceptable for desktop apps with <100 rooms)
+The message view uses **per-room ListStore + GtkStack** so room switches don't splice:
 
-2. **Incremental append** (for the common case of new messages at end):
-   - When new messages arrive for the currently visible room, `list_store.append(&obj)` per message
-   - Only use full-replace splice for room switches
-   - Amortizes the cost: only visible when first entering a room
+- `list_store_cache: HashMap<RoomId, gio::ListStore>` — one store per room, cached for the session
+- `room_view_cache: HashMap<RoomId, (ScrolledWindow, ListView)>` — one per-room ListView, created once
+- All per-room ScrolledWindows live in `room_view_stack: gtk::Stack`
+- Room switch = `room_view_stack.set_visible_child_name(room_id)` — O(1), no splice, no rebind
+- **First visit** to a room does one unavoidable `splice(0, n, &objs)` in `set_messages` — detaches the model before the splice (`set_model(None)`) and re-attaches in `idle_add_local_once` so it doesn't block the frame
+- **Incremental updates** (new messages, echoes): end-appends are batched into a single `splice(orig_n, 0, &batch)`; gap-fills (older timestamps) splice high-to-low. Never full-replace after first_load
+- **Property updates** (edits, reactions, UTD heals): mutate GObject properties in place via `update_message_body` — no splice at all
 
-3. **GtkListBox instead of GtkListView** (for small item counts):
-   - No virtual scrolling, all items always in DOM
-   - Simpler model-change handling, potentially faster for n<50
-   - Loses factory pattern; use `bind_model` with a widget-creation callback
+Profile evidence (2026-04-21, 287s capture, 468k samples): splice totals ~0.41% of process time, concentrated in first-visit + pagination paths. Room switching itself is effectively free.
 
-**Do not try to fix the splice by optimizing bind callbacks** — we confirmed our bind contributes <10% of the total splice time. The bottleneck is GTK.
+**Rules that follow from this architecture:**
+
+- Never introduce a new `splice(0, n, ...)` full-replace — use incremental append, gap-fill, or in-place property mutation
+- Never create widgets during `set_messages`/bind — widgets live in the Stack and are reused
+- If a new code path needs to replace a room's content (e.g., space switch, clearing encrypted messages), reuse the existing first-load detach/re-attach pattern; don't invent a parallel one
+
+**Do not try to fix splice cost by optimizing bind callbacks** — we confirmed bind is <10% of splice time. The bottleneck is GTK's `items_changed` infrastructure.
 
 ### 3. GtkListView factory: pre-allocate widgets in the template
 
@@ -167,6 +168,80 @@ sysprof-cat hikyaku.syscap > output.txt
 ```
 
 `sysprof-cat` output is large and takes time to appear. Search for your function names in `output.txt` to find hot call chains. GTK symbols appear unresolved without debug packages — focus on your own Rust frames.
+
+**Redact before sharing.** `sysprof` captures the process environment including `ANTHROPIC_API_KEY` and similar secrets. Scrub before attaching to issues or pastes:
+
+```sh
+sed -i "s/ANTHROPIC_API_KEY=sk-ant-[A-Za-z0-9_-]*/ANTHROPIC_API_KEY=REDACTED/g" output.txt
+```
+
+## Rust-side scoped timing
+
+`src/perf.rs` provides a scope-guard timer that logs to `tracing` on drop if the elapsed time exceeds a threshold. Every line is tagged `perf=<name>` so a single grep pulls the full heat map out of a log.
+
+```rust
+pub fn bind_message_object(&self, ...) {
+    let _g = crate::perf::scope("bind_message_object");   // default threshold 500µs
+    let _g = crate::perf::scope_gt("info_to_obj", 200);   // custom threshold
+    let _g = crate::perf::scope_with("splice", room_id);  // add a context tag
+    // ...work...
+}
+```
+
+Run with `RUST_LOG=hikyaku=info` to see the logs. Capture and inspect:
+
+```sh
+RUST_LOG=hikyaku=info ./target/debug/hikyaku 2>&1 | tee ~/hikyaku.log
+grep 'perf=' ~/hikyaku.log | sort | uniq -c | sort -rn | head -30
+```
+
+Thresholds are chosen to suppress noise; set to `0` temporarily to force every scope to log. Instrument new functions when a flow fails to explain a user-visible pause — if a 6-second pause has zero `perf=` lines inside it, the slow function is still uninstrumented.
+
+## GSK renderer choice
+
+`main.rs` pins `GSK_RENDERER=vulkan` when the user hasn't set it. The default selection (observed as `ngl` on Fedora + Mesa Intel) reported `Unsupported node 'GskTransformNode' / Offscreening node ...` for `GskTransformNode`, `GskMaskNode`, and `GskContainerNode` — every frame fell back to per-node offscreen texture compositing, which capped the 120 Hz display at ~60 Hz effective and produced 125 ms stalls. Vulkan handles those nodes natively. Validate with `GDK_DEBUG=frames` — the `Unsupported node` spam should be gone. User override via `GSK_RENDERER=...` in the environment always wins.
+
+## GTK-side instrumentation (the other half of the stack)
+
+Rust `perf=` timing covers everything above the GTK FFI boundary. For layout / render / paint pauses, use GTK's built-in debug flags:
+
+- `GTK_DEBUG=layout` — logs every allocation / reposition. Heavy output but pinpoints layout storms.
+- `GTK_DEBUG=tree` — widget tree dump; useful after a memory-bloat suspicion to see how many widgets are alive.
+- `GTK_DEBUG=interactive` — opens the GtkInspector. Its *Recorder* tab captures GskRenderNode trees per frame; its *Statistics* tab shows widget counts and CSS timings.
+- `GSK_DEBUG=full-redraw` — flashes the full window red whenever the renderer decides to repaint everything (not just damage). Expected on focus-in after long idle; unexpected anywhere else.
+- `GSK_DEBUG=fallback` — logs every time GSK falls back from GPU to CPU rendering. Indicates a driver / node compatibility problem eating frames.
+- `GDK_DEBUG=frames` — per-frame timing from GDK, including compositor round-trip latency.
+
+Combine with the Rust logs to correlate: a 6-second pause with zero `perf=` lines AND a `GSK_DEBUG=full-redraw` flash means the pause is in GTK's render path, not our code.
+
+```sh
+GTK_DEBUG=interactive GSK_DEBUG=full-redraw,fallback \
+  GDK_DEBUG=frames RUST_LOG=hikyaku=info \
+  ./target/debug/hikyaku 2>&1 | tee ~/hikyaku-full.log
+```
+
+## Coverage-map discipline
+
+Every new hot path should be instrumented at introduction. When a regression shows a pause that no `perf=` line can account for, the gap is the bug — find the uninstrumented function on the path and wrap it before hypothesising. "The logs say it's fast" is only meaningful for paths that are actually instrumented.
+
+## Other profilers — when to reach for them
+
+sysprof + `perf=` logs cover most CPU questions. Reach for these when they don't:
+
+| Tool | Answers | When to use |
+|------|---------|-------------|
+| `cargo install cargo-valgrind` → `cargo valgrind run` | Exact CPU cycles, cache misses, uninitialised reads | A reproducible hot loop where sysprof samples aren't granular enough. Valgrind is ~20× slower so reproduce on a small case. |
+| `valgrind --tool=callgrind` + `kcachegrind` | Call graph with exact inclusive/exclusive counts | Same as cargo-valgrind but with a visual call-graph explorer. |
+| `valgrind --tool=massif` | Peak heap usage over time, per-function | Confirming the "per-room MessageRow bloat" hypothesis — expect large allocations under `MessageView::ensure_room_view`. |
+| `heaptrack ./target/debug/hikyaku` + `heaptrack_gui` | Every allocation, leak candidates, top allocators, peak usage | The one to reach for on "6-second focus pause after idle" — if we're holding 500 MB of widgets, that's swap pressure. |
+| `hyperfine './target/release/hikyaku --one-shot X'` | Wall-clock comparison across N runs with warmup | Before/after benchmarks of startup or a scripted operation. Not useful for interactive perf. |
+| `tokio-console` (requires tokio_unstable) | Pending tasks, blocked tasks, long-running futures | If a matrix tokio future is blocking a send-side channel — suspected on long `bg_refresh` tails. |
+
+Run with `--release` when the question is "how fast for the user". Run debug with frame pointers when the question is "where in the code does the time go". Don't mix the two.
+
+## Process-isolation option (heavy tool)
+
+For CPU-heavy parsing (HTML→Pango conversion, markdown rendering, regex-heavy linkification), moving work to a sidecar via D-Bus is a known GTK pattern. We don't need this today — the per-scope timings are sub-millisecond after the recent fixes — but if a future profile shows a parser exceeding 10ms on the GTK thread despite idle-deferral, the sidecar pattern (spawn once, request/response over D-Bus) is the standard escape hatch. Don't reach for it before proving the parser is genuinely the bottleneck.
 
 ---
 

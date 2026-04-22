@@ -44,8 +44,13 @@ mod imp {
         pub on_reply: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String, String)>>>>,
         /// Callback: reaction emoji picked → (event_id, emoji).
         pub on_react: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
-        /// Emoji chooser for reactions (created once per row).
-        pub react_chooser: gtk::EmojiChooser,
+        /// Callback: request the shared emoji chooser → (event_id, button).
+        /// Fires when the row's react button is clicked; MessageView owns a
+        /// single EmojiChooser and reparents it onto `button` for the popup.
+        /// This avoids allocating ~1.5GB of per-row chooser widget trees
+        /// (see heaptrack evidence: populate_emoji_chooser dominates).
+        pub on_show_react_picker:
+            std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, gtk::Button)>>>>,
         /// Callback: edit clicked → (event_id, body).
         pub on_edit: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Callback: delete clicked → (event_id).
@@ -128,6 +133,10 @@ mod imp {
         /// FNV-1a hash of the last rendered reactions JSON.
         /// Compared against MessageObject::reactions_hash() — O(1) with no allocation.
         pub last_reactions_hash: std::cell::Cell<u64>,
+        /// Pool of reaction pill labels reused across rebinds. Hide unused ones
+        /// instead of removing + recreating them. Widget construction is the
+        /// costly path per CLAUDE.md §3, so we pay the allocation once.
+        pub reaction_pills: std::cell::RefCell<Vec<gtk::Label>>,
         /// Signal handler IDs for notify connections on the currently bound
         /// MessageObject. Disconnected on unbind to prevent stale handlers
         /// accumulating as rows are recycled by the ListView factory.
@@ -486,24 +495,27 @@ mod imp {
             self.thread_icon.add_controller(thread_click);
             self.thread_icon.set_cursor_from_name(Some("pointer"));
 
-            // React button — use a MenuButton with the EmojiChooser as popover.
-            let react_menu_btn = gtk::MenuButton::builder()
+            // React button — plain Button; on click we ask MessageView to
+            // reparent its single shared EmojiChooser onto this button and
+            // pop it up. Previous architecture built one EmojiChooser per
+            // MessageRow and each populated a full emoji widget tree (~1.5GB
+            // aggregate per heaptrack Top-Down view).
+            let react_btn = gtk::Button::builder()
                 .icon_name("face-smile-symbolic")
                 .tooltip_text("React")
-                .popover(&self.react_chooser)
                 .build();
-            react_menu_btn.add_css_class("flat");
-            react_menu_btn.add_css_class("circular");
-            // Replace the plain button with the menu button in the action bar.
+            react_btn.add_css_class("flat");
+            react_btn.add_css_class("circular");
             self.action_bar.remove(&self.react_button);
-            self.action_bar.append(&react_menu_btn);
+            self.action_bar.append(&react_btn);
 
             let event_id = self.event_id.clone();
-            let on_react_ref = self.on_react.clone();
-            self.react_chooser.connect_emoji_picked(move |_chooser, emoji| {
+            let on_show_picker = self.on_show_react_picker.clone();
+            react_btn.connect_clicked(move |btn| {
                 let eid = event_id.borrow().clone();
-                if let Some(ref cb) = *on_react_ref.borrow() {
-                    cb(eid, emoji.to_string());
+                if eid.is_empty() { return; }
+                if let Some(ref cb) = *on_show_picker.borrow() {
+                    cb(eid, btn.clone());
                 }
             });
 
@@ -849,6 +861,10 @@ impl MessageRow {
         self.imp().on_react.borrow_mut().replace(Box::new(f));
     }
 
+    pub fn set_on_show_react_picker<F: Fn(String, gtk::Button) + 'static>(&self, f: F) {
+        self.imp().on_show_react_picker.borrow_mut().replace(Box::new(f));
+    }
+
     pub fn set_on_edit<F: Fn(String, String) + 'static>(&self, f: F) {
         self.imp().on_edit.borrow_mut().replace(Box::new(f));
     }
@@ -923,6 +939,7 @@ impl MessageRow {
         msg: &crate::models::MessageObject,
         ctx: &crate::widgets::MessageRowContext,
     ) {
+        let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
         let highlight_names = &ctx.highlight_names;
         let my_user_id = ctx.my_user_id.as_str();
@@ -1055,43 +1072,50 @@ impl MessageRow {
         }
 
         // Reactions — O(1) hash check, full rebuild only when reactions changed.
+        // Rebuild reuses pooled gtk::Label widgets in-place (see reaction_pills
+        // in imp) rather than constructing new ones; GTK widget allocation is
+        // the expensive path, so we grow the pool only when a row needs more
+        // pills than any previous bind demanded.
         let reactions_hash = msg.reactions_hash();
         if imp.last_reactions_hash.get() != reactions_hash {
+            let _g = crate::perf::scope("bind::reactions_rebuild");
             imp.last_reactions_hash.set(reactions_hash);
-            while let Some(child) = imp.reactions_box.first_child() {
-                imp.reactions_box.remove(&child);
-            }
-            if let Ok(reactions) = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
+            let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
                 &msg.reactions_json()
-            ) {
-                if !reactions.is_empty() {
-                    for (emoji, count, names) in &reactions {
-                        let label = if *count > 1 {
-                            format!("{emoji} {count}")
-                        } else {
-                            emoji.clone()
-                        };
-                        let tooltip = names.join(", ");
-                        let a11y_label = if *count > 1 {
-                            format!("{count} reactions: {emoji}. From: {tooltip}")
-                        } else {
-                            format!("Reaction: {emoji}. From: {tooltip}")
-                        };
-                        let pill = gtk::Label::builder()
-                            .label(&label)
-                            .tooltip_text(&tooltip)
-                            .css_classes(["reaction-pill"])
-                            .build();
-                        pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
-                        imp.reactions_box.append(&pill);
-                    }
-                    imp.reactions_box.set_visible(true);
-                } else {
-                    imp.reactions_box.set_visible(false);
-                }
-            } else {
-                imp.reactions_box.set_visible(false);
+            ).unwrap_or_default();
+
+            let mut pills = imp.reaction_pills.borrow_mut();
+            let need = reactions.len();
+            while pills.len() < need {
+                let pill = gtk::Label::builder()
+                    .css_classes(["reaction-pill"])
+                    .build();
+                imp.reactions_box.append(&pill);
+                pills.push(pill);
             }
+
+            for (i, (emoji, count, names)) in reactions.iter().enumerate() {
+                let label = if *count > 1 {
+                    format!("{emoji} {count}")
+                } else {
+                    emoji.clone()
+                };
+                let tooltip = names.join(", ");
+                let a11y_label = if *count > 1 {
+                    format!("{count} reactions: {emoji}. From: {tooltip}")
+                } else {
+                    format!("Reaction: {emoji}. From: {tooltip}")
+                };
+                let pill = &pills[i];
+                pill.set_label(&label);
+                pill.set_tooltip_text(Some(&tooltip));
+                pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
+                pill.set_visible(true);
+            }
+            for pill in pills.iter().skip(need) {
+                pill.set_visible(false);
+            }
+            imp.reactions_box.set_visible(need > 0);
         }
 
         // Delegate to text rendering with highlights.
@@ -1187,6 +1211,7 @@ impl MessageRow {
         force_highlight: bool,
         rolodex_ids: &std::collections::HashSet<String>,
     ) {
+        let _g = crate::perf::scope("render_body");
         let imp = self.imp();
 
         // Sender label — use pre-computed markup (nick_color + markup_escape_text

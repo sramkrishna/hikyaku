@@ -37,11 +37,27 @@ mod imp {
     #[template(file = "src/widgets/message_view.blp")]
     pub struct MessageView {
         // ── Per-room ListView + GtkStack (O(1) room switch) ──────────────────
+        /// Single shared EmojiChooser for reaction picking, lazily created on
+        /// the first reaction-button click. Reparented onto whichever row's
+        /// react Button requested it. Before this was per-row; heaptrack
+        /// showed populate_emoji_chooser accounted for 1.5GB peak across
+        /// 60M allocations because every MessageRow built its own tree.
+        pub react_chooser: std::cell::OnceCell<gtk::EmojiChooser>,
+        /// Event id currently targeted by react_chooser. Stored in a cell
+        /// because the chooser has one persistent emoji-picked handler that
+        /// reads this at fire time — avoids disconnect/reconnect per show.
+        pub react_target_event_id: RefCell<String>,
         /// Stack containing one ScrolledWindow per visited room.
         /// set_visible_child_name(room_id) on switch — no items_changed, no splice.
         pub room_view_stack: std::cell::OnceCell<gtk::Stack>,
         /// room_id → (ScrolledWindow, ListView) — widget tree kept alive.
         pub room_view_cache: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::ListView)>>,
+        /// MRU ordering for room_view_cache. Front = most recently visited.
+        /// Cold entries at the back are evicted when the cache exceeds
+        /// MAX_CACHED_ROOMS, dropping their ListView + ListStore + per-room
+        /// saved state. Without this, every visited room retains ~O(pool_size)
+        /// GObject widget tree forever — heap grows linearly with rooms seen.
+        pub recent_rooms: RefCell<std::collections::VecDeque<String>>,
         /// Shared factory — one instance, reused for every per-room ListView.
         pub factory: std::cell::OnceCell<gtk::SignalListItemFactory>,
         /// Dedicated store for the seek context window — never the live store.
@@ -246,8 +262,11 @@ mod imp {
     impl Default for MessageView {
         fn default() -> Self {
             Self {
+                react_chooser: std::cell::OnceCell::new(),
+                react_target_event_id: RefCell::new(String::new()),
                 room_view_stack: std::cell::OnceCell::new(),
                 room_view_cache: RefCell::new(HashMap::new()),
+                recent_rooms: RefCell::new(std::collections::VecDeque::new()),
                 factory: std::cell::OnceCell::new(),
                 seek_store: gio::ListStore::new::<crate::models::MessageObject>(),
                 room_list_placeholder: Default::default(),
@@ -456,6 +475,46 @@ mod imp {
             self.room_view_cache.borrow_mut()
                 .insert(room_id.to_string(), (sw, lv));
         }
+
+        /// Record a room as most-recently-used and evict cold entries.
+        ///
+        /// Each retained (ScrolledWindow, ListView, ListStore, saved
+        /// scroll/event_index/loaded-flag) for an unvisited room costs
+        /// ~O(pool_size) live gtk::Label + widget tree allocations that GTK
+        /// never reclaims. Heaptrack showed linear 4GB growth over 4 min as a
+        /// result. Cap at MAX_CACHED_ROOMS and drop the LRU.
+        pub fn touch_recent_room(&self, room_id: &str) {
+            // Cap retained per-room widget trees. Originally tightened to 2
+            // when heaptrack showed 4GB peak; after the shared-EmojiChooser
+            // fix (populate_emoji_chooser dropped from 1.5GB to ~0), peak is
+            // ~70MB and the cap can be relaxed for fast return visits.
+            // Each evicted room triggers one first_load splice on return —
+            // measured at ~40µs, so eviction is cheap to reverse.
+            const MAX_CACHED_ROOMS: usize = 8;
+            let mut recent = self.recent_rooms.borrow_mut();
+            recent.retain(|r| r != room_id);
+            recent.push_front(room_id.to_string());
+            while recent.len() > MAX_CACHED_ROOMS {
+                let Some(evicted) = recent.pop_back() else { break };
+                self.evict_room_widgets(&evicted);
+            }
+        }
+
+        /// Drop a cold room's widget tree and associated caches.
+        /// The next visit to this room will re-create the ListView from
+        /// scratch (one-time cost; first_load splice already measures ~40µs).
+        fn evict_room_widgets(&self, room_id: &str) {
+            if let Some((sw, _lv)) = self.room_view_cache.borrow_mut().remove(room_id) {
+                if let Some(stack) = self.room_view_stack.get() {
+                    stack.remove(&sw);
+                }
+            }
+            self.list_store_cache.borrow_mut().remove(room_id);
+            self.saved_event_indices.borrow_mut().remove(room_id);
+            self.saved_messages_loaded.borrow_mut().remove(room_id);
+            self.saved_scroll_frac.borrow_mut().remove(room_id);
+            tracing::info!("evicted cold room widgets: room={room_id}");
+        }
     }
 
     #[glib::object_subclass]
@@ -539,6 +598,13 @@ mod imp {
                                 let borrow = v.imp().on_react.borrow();
                                 borrow.as_ref().unwrap()(eid, emoji);
                             }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_show_react_picker(move |eid, btn| {
+                        if let Some(v) = view_weak.upgrade() {
+                            v.show_react_chooser_at(&btn, eid);
                         }
                     });
 
@@ -1672,6 +1738,7 @@ impl MessageView {
     /// Load bookmarked event IDs for `room_id` from the store into the in-memory set.
     /// Call after `set_messages` so rows are highlighted on the first bind pass.
     pub fn load_bookmarks(&self, room_id: &str) {
+        let _g = crate::perf::scope("load_bookmarks");
         let entries = crate::bookmarks::BOOKMARK_STORE.load();
         let ids: std::collections::HashSet<String> = entries.into_iter()
             .filter(|e| e.room_id == room_id)
@@ -1913,6 +1980,36 @@ impl MessageView {
         if let Some(i) = imp.list_store().find(&msg) {
             imp.list_store().remove(i);
         }
+    }
+
+    /// Reparent the single shared react EmojiChooser onto a row's react
+    /// button and pop it up. Called by MessageRow when its react button is
+    /// clicked; ownership of the chooser lives here so only one emoji widget
+    /// tree is ever built for the entire MessageView.
+    pub fn show_react_chooser_at(&self, btn: &gtk::Button, event_id: String) {
+        let imp = self.imp();
+        *imp.react_target_event_id.borrow_mut() = event_id;
+        let chooser = imp.react_chooser.get_or_init(|| {
+            let c = gtk::EmojiChooser::new();
+            let view_weak = self.downgrade();
+            c.connect_emoji_picked(move |_, emoji| {
+                let Some(view) = view_weak.upgrade() else { return };
+                let imp = view.imp();
+                let eid = imp.react_target_event_id.borrow().clone();
+                if eid.is_empty() { return; }
+                let has_cb = imp.on_react.borrow().is_some();
+                if has_cb {
+                    let borrow = imp.on_react.borrow();
+                    borrow.as_ref().unwrap()(eid, emoji.to_string());
+                }
+            });
+            c
+        });
+        if chooser.parent().is_some() {
+            chooser.unparent();
+        }
+        chooser.set_parent(btn);
+        chooser.popup();
     }
 
     /// Enter reply mode — show preview and store the target event ID.
@@ -2462,6 +2559,7 @@ impl MessageView {
     }
 
     fn info_to_obj(m: &crate::matrix::MessageInfo, today: Option<&glib::DateTime>) -> MessageObject {
+        let _g = crate::perf::scope_gt("info_to_obj", 200);
         let media_json = m.media.as_ref()
             .and_then(|media| serde_json::to_string(media).ok())
             .unwrap_or_default();
@@ -2560,6 +2658,12 @@ impl MessageView {
         // Create per-room ListView+ScrolledWindow on first visit (O(1) setup).
         // On return visits ensure_room_view is a no-op.
         imp.ensure_room_view(room_id);
+        // Mark this room as most-recently-used and evict the coldest entries
+        // from the per-room widget cache. Without this, every visited room
+        // keeps its MessageRow pool (gtk::Labels, gestures, CSS styles) alive
+        // forever; heap grows linearly with rooms-visited. Must run after
+        // ensure_room_view so the incoming room is not itself evicted.
+        imp.touch_recent_room(room_id);
         let list_store = imp.ensure_room_store(room_id);
         *imp.cur_list_store.borrow_mut() = list_store;
         *imp.current_room_id.borrow_mut() = room_id.to_string();
@@ -2607,10 +2711,9 @@ impl MessageView {
         imp.typing_label.set_visible(false);
 
         // ── Switch to this room's ListView — O(1), no items_changed ──────────
-        // ensure_room_view creates the per-room widgets once; on return visits
-        // room_view_stack.set_visible_child_name() just unhides the existing tree.
+        // ensure_room_view (called above) created the per-room widgets on first
+        // visit; set_visible_child_name just unhides the existing tree.
         // No set_model(), no splice, no GTK layout work on room switch.
-        imp.ensure_room_view(room_id);
         imp.room_view_stack.get().unwrap().set_visible_child_name(room_id);
 
         // Always show "messages" so the ListView gets a real size allocation —
@@ -2651,6 +2754,7 @@ impl MessageView {
 
     /// Update the room info banner with metadata (topic, tombstone, pinned).
     pub fn set_room_meta(&self, meta: &crate::matrix::RoomMeta) {
+        let _g = crate::perf::scope("set_room_meta");
         let imp = self.imp();
         let mut show_banner = false;
 
@@ -3047,6 +3151,7 @@ impl MessageView {
     /// Searches backwards for a MessageObject with empty event_id and matching body.
     /// Returns true if an echo was found and patched, false otherwise.
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
+        let _g = crate::perf::scope_gt("patch_echo_event_id", 200);
         let imp = self.imp();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
         tracing::debug!("patch_echo_event_id: searching n={} for body={:?} event_id={}", n, body_preview(echo_body), event_id);
@@ -3181,6 +3286,7 @@ impl MessageView {
 /// - `hash`: FNV-1a hash of (body, formatted_body) — used as cache key in
 ///   MessageRow.last_body_hash to skip set_markup() when rebinding the same msg.
 pub(crate) fn prerender_body(body: &str, formatted_body: &str) -> (String, u64) {
+    let _g = crate::perf::scope_gt("prerender_body", 200);
     // FNV-1a hash — allocation-free O(n) on input strings.
     const FNV_OFFSET: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;

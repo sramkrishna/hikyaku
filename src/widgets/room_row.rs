@@ -77,6 +77,35 @@ glib::wrapper! {
         @implements gtk::Accessible, gtk::Buildable, gtk::Orientable;
 }
 
+thread_local! {
+    /// Decoded-avatar cache: path → Texture. Avoids synchronous re-decode +
+    /// GPU upload on every row rebind (scroll recycles rows, notify::avatar-path
+    /// fires on every refresh). Keyed by absolute file path, so when the SDK
+    /// rewrites the avatar file, the path changes and the stale entry is never
+    /// hit again (it just lingers in memory — bounded by total avatars).
+    static AVATAR_TEXTURE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, gtk::gdk::Texture>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn load_avatar_texture(path: &str) -> Option<gtk::gdk::Texture> {
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(t) = AVATAR_TEXTURE_CACHE.with(|c| c.borrow().get(path).cloned()) {
+        return Some(t);
+    }
+    match gtk::gdk::Texture::from_filename(path) {
+        Ok(texture) => {
+            AVATAR_TEXTURE_CACHE.with(|c| {
+                c.borrow_mut().insert(path.to_string(), texture.clone())
+            });
+            Some(texture)
+        }
+        Err(_) => None,
+    }
+}
+
 impl RoomRow {
     pub fn new() -> Self {
         glib::Object::builder().build()
@@ -131,18 +160,22 @@ impl RoomRow {
         imp.avatar.set_visible(true);
         imp.avatar.set_text(Some(&room.name()));
 
-        // Load avatar asynchronously — defer to an idle callback so that
-        // decoding N avatar images on bind doesn't block the tab switch.
+        // Avatar: cache hits set immediately (no file I/O, no decode). Cache
+        // misses defer to idle so decode+GPU-upload doesn't block the rebind.
         let path = room.avatar_path();
-        imp.avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
-        if !path.is_empty() {
-            let row_weak = self.downgrade();
-            glib::idle_add_local_once(move || {
-                let Some(row) = row_weak.upgrade() else { return };
-                if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                    row.imp().avatar.set_custom_image(Some(&texture));
-                }
-            });
+        if let Some(texture) = AVATAR_TEXTURE_CACHE.with(|c| c.borrow().get(&path).cloned()) {
+            imp.avatar.set_custom_image(Some(&texture));
+        } else {
+            imp.avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
+            if !path.is_empty() {
+                let row_weak = self.downgrade();
+                glib::idle_add_local_once(move || {
+                    let Some(row) = row_weak.upgrade() else { return };
+                    if let Some(texture) = load_avatar_texture(&path) {
+                        row.imp().avatar.set_custom_image(Some(&texture));
+                    }
+                });
+            }
         }
 
         imp.lock_icon.set_visible(room.is_encrypted());
@@ -222,10 +255,8 @@ impl RoomRow {
         let id = room.connect_notify_local(Some("avatar-path"), move |obj, _| {
             let Some(row) = row_weak.upgrade() else { return };
             let path = obj.avatar_path();
-            if !path.is_empty() {
-                if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                    row.imp().avatar.set_custom_image(Some(&texture));
-                }
+            if let Some(texture) = load_avatar_texture(&path) {
+                row.imp().avatar.set_custom_image(Some(&texture));
             }
         });
         imp.signal_ids.borrow_mut().push(id);

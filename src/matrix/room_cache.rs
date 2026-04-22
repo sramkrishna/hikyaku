@@ -201,6 +201,7 @@ impl RoomCache {
         &self,
         room_id: &str,
     ) -> Option<(Vec<MessageInfo>, Option<String>, RoomMeta)> {
+        let _g = crate::perf::scope_gt("get_memory", 1_000);
         self.imp().memory.lock().unwrap().get(room_id).cloned()
     }
 

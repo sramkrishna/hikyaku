@@ -11,6 +11,7 @@ mod intelligence;
 mod local_unread;
 mod markdown;
 mod matrix;
+mod perf;
 mod spell_check;
 mod models;
 mod plugins;
@@ -403,6 +404,17 @@ fn main() {
                 std::env::set_var("GSETTINGS_SCHEMA_DIR", dir);
             }
         }
+    }
+
+    // Pin GSK to the Vulkan renderer. With the default renderer selection
+    // (observed as ngl on Fedora + Mesa Intel), GDK_DEBUG=frames spammed
+    // "Unsupported node 'GskTransformNode' / Offscreening node ..." for
+    // GskTransformNode, GskMaskNode, and GskContainerNode — scroll dropped
+    // to 60Hz effective on a 120Hz display with occasional 125ms stalls.
+    // Explicit vulkan removes the offscreen-fallback path and restores
+    // smooth scroll. User override always wins (checked env first).
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        std::env::set_var("GSK_RENDERER", "vulkan");
     }
 
     // Initialize structured logging. Override with RUST_LOG env var, e.g.

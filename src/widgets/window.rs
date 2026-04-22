@@ -1541,9 +1541,17 @@ impl MxWindow {
         let msg_view_focus = imp.message_view.clone();
         let focus_cmd_tx = command_tx.clone();
         window.connect_is_active_notify(move |win| {
-            if win.is_active() {
+            let _active_t0 = std::time::Instant::now();
+            let active = win.is_active();
+            if active {
+                let mut phase_unread = std::time::Duration::ZERO;
+                let mut phase_drain = std::time::Duration::ZERO;
+                let mut phase_flash = std::time::Duration::ZERO;
+                let mut drain_n: usize = 0;
+
                 let count = win.imp().unseen_while_unfocused.get();
                 if count > 0 {
+                    let t = std::time::Instant::now();
                     win.imp().unseen_while_unfocused.set(0);
                     // Clear the badge and remove divider lines.
                     if let Some(rid) = win.imp().current_room_id.borrow().clone() {
@@ -1551,18 +1559,19 @@ impl MxWindow {
                         win.imp().local_unread.mark_read(&rid);
                     }
                     msg_view_focus.remove_dividers();
+                    phase_unread = t.elapsed();
                 }
                 // Drain any bg_refresh deferred by the idle (hover, not focus).
                 let rid = win.imp().current_room_id.borrow().clone();
                 if let Some(ref rid) = rid {
                     let pending = win.imp().pending_bg_refresh.borrow_mut().remove(rid);
                     if let Some((msgs, token)) = pending {
-                        let _t = std::time::Instant::now();
+                        drain_n = msgs.len();
+                        let t = std::time::Instant::now();
                         msg_view_focus.set_messages(&msgs, token);
-                        tracing::info!(
-                            "is_active drain set_messages took {:?} (room={rid})", _t.elapsed()
-                        );
+                        phase_drain = t.elapsed();
                         if let Some(eid) = win.imp().pending_flash_event_id.take() {
+                            let tf = std::time::Instant::now();
                             let mv_ref = msg_view_focus.clone();
                             let rid_clone = rid.clone();
                             let tx = focus_cmd_tx.clone();
@@ -1576,9 +1585,16 @@ impl MxWindow {
                                     }).await;
                                 });
                             }
+                            phase_flash = tf.elapsed();
                         }
                     }
                 }
+                tracing::info!(
+                    "is_active_notify(active=true) total={:?} unread={:?} drain={:?} (n={drain_n}) flash={:?}",
+                    _active_t0.elapsed(), phase_unread, phase_drain, phase_flash
+                );
+            } else {
+                tracing::info!("is_active_notify(active=false) total={:?}", _active_t0.elapsed());
             }
         });
 

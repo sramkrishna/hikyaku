@@ -9,6 +9,13 @@ callgraph.txt
 output.txt
 output2.txt
 rust_out
+# sysprof-cat output (large; may contain env secrets like ANTHROPIC_API_KEY)
+hikyaku-profile*.txt
+# heaptrack captures (large compressed binary dumps)
+heaptrack.*.gz
+heaptrack.*.zst
+# Ad-hoc screenshots / images dropped in repo root during investigation
+raster_image.*
 docs/
 .cargo/config.toml
 .cargo/credentials.toml
