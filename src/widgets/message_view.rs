@@ -939,29 +939,38 @@ mod imp {
             self.nick_popover.set_position(gtk::PositionType::Top);
 
             // When a nick is selected from the list, insert it.
+            // Row layout (new): ListBoxRow[widget_name=uid] → Box → [
+            //   Label[css:body, visible]  ← display name (used for insert)
+            //   Label[css:dim-label+caption, visible] ← @mxid (disambiguator)
+            // ]
             let view_for_row = obj.downgrade();
             self.nick_list.connect_row_activated(move |_, row| {
                 let Some(view) = view_for_row.upgrade() else { return; };
                 let imp = view.imp();
-                if let Some(label) = row.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
-                    let nick = label.text().to_string();
-                    // widget_name holds the user_id stored when the row was built.
-                    let uid = label.widget_name().to_string();
-                    let buf = imp.input_view.buffer();
-                    let text = buf_text(&buf);
-                    // Replace from the last '@' — keeps the '@' prefix.
-                    if let Some(at_pos) = text.rfind('@') {
-                        let before = &text[..at_pos];
-                        let new_text = format!("{before}@{nick} ");
-                        buf.set_text(&new_text);
-                        buf.place_cursor(&buf.end_iter());
-                    }
-                    if !uid.is_empty() {
-                        imp.pending_mentions.borrow_mut().insert(nick, uid);
-                    }
-                    imp.nick_popover.popdown();
-                    imp.input_view.grab_focus();
+                // The uid is on the ListBoxRow's widget_name. The display
+                // name is the first Label child inside the row's Box.
+                let uid = row.widget_name().to_string();
+                let Some(nick) = row
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::Box>().ok())
+                    .and_then(|b| b.first_child())
+                    .and_then(|c| c.downcast::<gtk::Label>().ok())
+                    .map(|l| l.text().to_string())
+                else { return; };
+                let buf = imp.input_view.buffer();
+                let text = buf_text(&buf);
+                // Replace from the last '@' — keeps the '@' prefix.
+                if let Some(at_pos) = text.rfind('@') {
+                    let before = &text[..at_pos];
+                    let new_text = format!("{before}@{nick} ");
+                    buf.set_text(&new_text);
+                    buf.place_cursor(&buf.end_iter());
                 }
+                if !uid.is_empty() {
+                    imp.pending_mentions.borrow_mut().insert(nick, uid);
+                }
+                imp.nick_popover.popdown();
+                imp.input_view.grab_focus();
             });
 
             // Tab/Arrow nick completion.
@@ -1053,7 +1062,15 @@ mod imp {
                         .or_else(|| imp.nick_list.row_at_index(0));
                     if let Some(row) = row {
                         imp.nick_list.select_row(Some(&row));
-                        if let Some(label) = row.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                        // Row layout is ListBoxRow → Box → [name, @mxid]
+                        // (see the row-construction site). Walk into the
+                        // Box to reach the name Label.
+                        if let Some(label) = row
+                            .child()
+                            .and_then(|c| c.downcast::<gtk::Box>().ok())
+                            .and_then(|b| b.first_child())
+                            .and_then(|c| c.downcast::<gtk::Label>().ok())
+                        {
                             let nick = label.text().to_string();
                             let buf = imp.input_view.buffer();
                             let text = buf_text(&buf);
@@ -1242,23 +1259,49 @@ mod imp {
                     imp.nick_list.remove(&row);
                 }
                 for (_, name, uid) in &matches {
-                    let label = gtk::Label::builder()
+                    // Two-line row: display name (primary) + @mxid (dimmed).
+                    // The mxid disambiguates two members who share a display
+                    // name — initials-on-colour alone can't because the
+                    // adw::Avatar colour hash is derived from text and two
+                    // "Alice"s hash identically. Showing the mxid is the
+                    // reliable zero-download disambiguator.
+                    let row_box = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Vertical)
+                        .margin_start(8).margin_end(8)
+                        .margin_top(4).margin_bottom(4)
+                        .build();
+                    let name_label = gtk::Label::builder()
                         .label(name.as_str())
                         .halign(gtk::Align::Start)
-                        .margin_start(8)
-                        .margin_end(8)
-                        .margin_top(4)
-                        .margin_bottom(4)
+                        .css_classes(["body"])
                         .build();
-                    // Store user_id in widget_name so connect_row_activated can retrieve it.
-                    label.set_widget_name(uid.as_str());
-                    imp.nick_list.append(&label);
+                    let mxid_label = gtk::Label::builder()
+                        .label(uid.as_str())
+                        .halign(gtk::Align::Start)
+                        .css_classes(["dim-label", "caption"])
+                        .build();
+                    row_box.append(&name_label);
+                    row_box.append(&mxid_label);
+
+                    let list_row = gtk::ListBoxRow::builder()
+                        .activatable(true)
+                        .child(&row_box)
+                        .build();
+                    // uid lives on the ListBoxRow so the activation handler
+                    // can retrieve it without walking into the Box.
+                    list_row.set_widget_name(uid.as_str());
+                    imp.nick_list.append(&list_row);
                 }
                 // Select first and preview.
                 if let Some(first) = imp.nick_list.row_at_index(0) {
                     imp.nick_list.select_row(Some(&first));
-                    if let Some(label) = first.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
-                        let nick = label.text().to_string();
+                    if let Some(name_label) = first
+                        .child()
+                        .and_then(|c| c.downcast::<gtk::Box>().ok())
+                        .and_then(|b| b.first_child())
+                        .and_then(|c| c.downcast::<gtk::Label>().ok())
+                    {
+                        let nick = name_label.text().to_string();
                         let before = &text[..insert_pos];
                         let preview = format!("{before}@{nick}{text_after}");
                         buf.set_text(&preview);
