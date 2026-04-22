@@ -217,12 +217,26 @@ mod imp {
             bookmark_button.add_css_class("circular");
             self.bookmark_button.replace(Some(bookmark_button.clone()));
 
+            // Copy: writes the stored plain-text body to the system
+            // clipboard. Separate from making body_label selectable,
+            // which would backfill a GtkTextView per row and regress
+            // scroll perf (see CLAUDE.md §1). Clipboard path reads the
+            // cached body_text Rc<RefCell<String>> — no allocation on
+            // scroll, cost paid only on explicit user click.
+            let copy_button = gtk::Button::builder()
+                .icon_name("edit-copy-symbolic")
+                .tooltip_text("Copy message")
+                .build();
+            copy_button.add_css_class("flat");
+            copy_button.add_css_class("circular");
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
             self.action_bar.append(&dm_button);
             self.action_bar.append(&self.react_button);
             self.action_bar.append(&bookmark_button);
+            self.action_bar.append(&copy_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
             self.edit_button.replace(Some(edit_button.clone()));
@@ -535,6 +549,14 @@ mod imp {
                 if let Some(ref cb) = *on_edit.borrow() {
                     cb(eid, body);
                 }
+            });
+
+            // Copy button — write body_text to the system clipboard.
+            let body_text = self.body_text.clone();
+            copy_button.connect_clicked(move |btn| {
+                let body = body_text.borrow().clone();
+                if body.is_empty() { return; }
+                btn.display().clipboard().set_text(&body);
             });
 
             // Delete button — redact the message.
