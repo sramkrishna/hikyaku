@@ -230,6 +230,20 @@ mod imp {
             copy_button.add_css_class("flat");
             copy_button.add_css_class("circular");
 
+            // Select: flips body_label.set_selectable(true) on demand so
+            // the user can drag-select a specific phrase or URL. The
+            // selectable flag backfills a GtkTextView (~10-20ms per row),
+            // so we pay that cost only for the single row the user
+            // activated. On focus-out of the body label, flip back to
+            // false so no row in the factory pool stays selectable after
+            // the user has moved on.
+            let select_button = gtk::Button::builder()
+                .icon_name("edit-select-all-symbolic")
+                .tooltip_text("Select text in message")
+                .build();
+            select_button.add_css_class("flat");
+            select_button.add_css_class("circular");
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
@@ -237,6 +251,7 @@ mod imp {
             self.action_bar.append(&self.react_button);
             self.action_bar.append(&bookmark_button);
             self.action_bar.append(&copy_button);
+            self.action_bar.append(&select_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
             self.edit_button.replace(Some(edit_button.clone()));
@@ -558,6 +573,25 @@ mod imp {
                 if body.is_empty() { return; }
                 btn.display().clipboard().set_text(&body);
             });
+
+            // Select-text button — flip body_label selectable on demand,
+            // grab focus so drag-selection starts immediately.
+            let body_label = self.body_label.clone();
+            select_button.connect_clicked(move |_| {
+                body_label.set_selectable(true);
+                body_label.grab_focus();
+            });
+
+            // When the body label loses focus (user clicked away or
+            // pressed Escape) flip selectable back off. This keeps the
+            // GtkTextView backing store cost out of the scroll path for
+            // every row except the one the user is actively selecting in.
+            let focus_ctrl = gtk::EventControllerFocus::new();
+            let body_label_leave = self.body_label.clone();
+            focus_ctrl.connect_leave(move |_| {
+                body_label_leave.set_selectable(false);
+            });
+            self.body_label.add_controller(focus_ctrl);
 
             // Delete button — redact the message.
             let event_id = self.event_id.clone();
@@ -969,6 +1003,12 @@ impl MessageRow {
     ) {
         let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
+        // Reset the on-demand selectable flag if it somehow leaked from
+        // a prior bind (focus-leave on body_label normally handles this,
+        // but a new message arriving into the same row while the label
+        // still has focus would otherwise keep the GtkTextView backing
+        // store alive on every recycled row).
+        imp.body_label.set_selectable(false);
         let highlight_names = &ctx.highlight_names;
         let my_user_id = ctx.my_user_id.as_str();
         let is_dm_room = ctx.is_dm;
