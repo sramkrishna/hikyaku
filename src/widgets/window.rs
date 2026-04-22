@@ -1809,10 +1809,15 @@ impl MxWindow {
                                     rlv2.set_room_unread_counts(room_id, unread, highlights);
                                 });
                                 // Keep favourite rooms in the bookmarks overview in sync.
+                                // Tombstoned rooms are excluded: they're archived upgrades,
+                                // produce same-name duplicates next to the replacement room,
+                                // and some homeservers propagate tag changes across the
+                                // upgrade link — the user sees "remove one, both disappear"
+                                // which is neither predictable nor useful.
                                 {
                                     let registry = rlv2.imp().room_registry.borrow();
                                     let mut favs: Vec<crate::models::RoomObject> = rooms.iter()
-                                        .filter(|r| r.is_favourite)
+                                        .filter(|r| r.is_favourite && !r.is_tombstoned)
                                         .filter_map(|r| registry.get(&r.room_id).cloned())
                                         .collect();
                                     favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
@@ -3297,10 +3302,13 @@ impl MxWindow {
                 imp.bookmarks_overview.reload_messages();
                 imp.bookmarks_overview.clear_search();
                 // Rebuild favourite room cards with current registry objects.
+                // See comment on the other set_favourite_rooms call site: tombstoned
+                // rooms are excluded so same-name duplicates don't appear next to
+                // their replacement.
                 let registry = imp.room_list_view.imp().room_registry.borrow();
                 let cached = imp.room_list_view.imp().cached_rooms.borrow();
                 let mut favs: Vec<crate::models::RoomObject> = cached.iter()
-                    .filter(|r| r.is_favourite)
+                    .filter(|r| r.is_favourite && !r.is_tombstoned)
                     .filter_map(|r| registry.get(&r.room_id).cloned())
                     .collect();
                 favs.sort_by(|a, b| b.last_activity_ts().cmp(&a.last_activity_ts()));
@@ -4377,8 +4385,14 @@ impl MxWindow {
         };
 
         let (dialog_title, placeholder) = match &scoped_space {
-            Some((_, name)) => (format!("Rooms in {name}"), "Filter rooms…"),
-            None            => ("Join a Room or Space".to_string(), "Search rooms and spaces, or paste a matrix.to link…"),
+            Some((_, name)) => (
+                format!("Rooms in {name}"),
+                "Filter rooms, or paste a room ID / matrix.to link + Enter…",
+            ),
+            None => (
+                "Join a Room or Space".to_string(),
+                "Search rooms and spaces, or paste a matrix.to link + Enter…",
+            ),
         };
 
         let dialog = adw::Dialog::builder()
@@ -4396,6 +4410,36 @@ impl MxWindow {
             .build();
         header.set_title_widget(Some(&search_entry));
         toolbar.add_top_bar(&header);
+
+        // Direct-join path: when the user types a room ID / alias / matrix.to
+        // link into the search bar and presses Enter, trigger a join rather
+        // than client-side filtering an empty result set. This is what the
+        // placeholder advertises ("paste a matrix.to link"). Without this,
+        // tombstone replacement rooms created after the last directory fetch
+        // are impossible to reach from the + dialog — the server-indexed
+        // public directory doesn't know about them yet, so filtering finds
+        // nothing and there is no other affordance.
+        {
+            let tx = tx.clone();
+            let dialog_weak = dialog.downgrade();
+            search_entry.connect_activate(move |se| {
+                let raw = se.text().to_string();
+                let Some(canonical) = parse_matrix_link_or_id(&raw) else {
+                    return;
+                };
+                let tx = tx.clone();
+                let dialog_weak = dialog_weak.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::JoinRoom {
+                        room_id_or_alias: canonical,
+                        via_servers: vec![],
+                    }).await;
+                    if let Some(d) = dialog_weak.upgrade() {
+                        d.close();
+                    }
+                });
+            });
+        }
 
         let content_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

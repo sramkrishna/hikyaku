@@ -14,6 +14,7 @@ pub use login_page::LoginPage;
 pub use room_list_view::RoomListView;
 pub use message_view::MessageView;
 pub use message_row::RowContext as MessageRowContext;
+pub(crate) use message_row::parse_matrix_uri;
 pub use bookmarks_overview::BookmarksOverview;
 pub use notification_manager::NotificationManager;
 pub use onboarding_page::OnboardingPage;

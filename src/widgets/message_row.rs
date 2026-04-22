@@ -800,7 +800,7 @@ fn clear_body_box(body_box: &gtk::Box) {
 
 /// Extract a Matrix room ID or alias from a matrix.to or matrix: URI.
 /// Returns `Some("!roomid:server")`, `Some("#alias:server")`, or `None`.
-fn parse_matrix_uri(uri: &str) -> Option<String> {
+pub(crate) fn parse_matrix_uri(uri: &str) -> Option<String> {
     // https://matrix.to/#/!roomid:server or https://matrix.to/#/#alias:server
     if let Some(rest) = uri.strip_prefix("https://matrix.to/#/") {
         // URL-decode the first component.

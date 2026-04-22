@@ -536,6 +536,30 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            // Tombstone banner link — click the replacement-room anchor to
+            // route through the window's matrix-link handler (same path
+            // used by message body links, so join / navigate state is
+            // handled uniformly).
+            self.tombstone_label.connect_activate_link(|_lbl, uri| {
+                if let Some(app) = gtk::gio::Application::default() {
+                    if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                        if let Some(window) = gtk_app.active_window() {
+                            if let Some(win) = window
+                                .downcast_ref::<crate::widgets::MxWindow>()
+                            {
+                                if let Some(matrix_id) =
+                                    crate::widgets::parse_matrix_uri(uri)
+                                {
+                                    win.handle_matrix_link(&matrix_id);
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+
             // Set up the factory and model programmatically since
             // ListView factories with custom widgets don't work in Blueprint.
             let factory = gtk::SignalListItemFactory::new();
@@ -2768,13 +2792,26 @@ impl MessageView {
         }
 
         // Tombstone — apply background to entire message view.
+        // The replacement_room is rendered as a Pango anchor so the user can
+        // click to join; label is selectable so the room id can at least be
+        // copy-pasted when the click path fails (e.g. invite-only replacement).
         if meta.is_tombstoned {
             let msg = match (&meta.replacement_room_name, &meta.replacement_room) {
-                (Some(name), _) => format!("This room has been upgraded to: {name}"),
-                (None, Some(id)) => format!("This room has been upgraded. New room: {id}"),
-                _ => "This room has been upgraded to a new room.".to_string(),
+                (Some(name), Some(id)) => format!(
+                    "This room has been upgraded to: {}",
+                    tombstone_link_markup(id, name),
+                ),
+                (None, Some(id)) => format!(
+                    "This room has been upgraded. New room: {}",
+                    tombstone_link_markup(id, id),
+                ),
+                (Some(name), None) => format!(
+                    "This room has been upgraded to: {}",
+                    glib::markup_escape_text(name),
+                ),
+                (None, None) => "This room has been upgraded to a new room.".to_string(),
             };
-            imp.tombstone_label.set_label(&msg);
+            imp.tombstone_label.set_markup(&msg);
             imp.tombstone_banner.set_visible(true);
             self.add_css_class("tombstone-view");
             show_banner = true;
@@ -3278,6 +3315,24 @@ impl MessageView {
 
 /// Pre-render a message body into Pango markup and compute a body hash for
 /// O(1) cache checks in the bind callback.  Called once per MessageObject
+/// Build a Pango anchor for a tombstone replacement room. The href is a
+/// matrix.to URL so our existing `parse_matrix_uri` / `handle_matrix_link`
+/// pipeline can route the click the same way it routes body-text room
+/// links. The visible text is the human-readable name when we have one,
+/// falling back to the room id so the user can still see and copy it.
+fn tombstone_link_markup(room_id: &str, display: &str) -> String {
+    // Percent-encode just the `!` → `%21` so the matrix.to fragment stays
+    // canonical; the rest of the id (server part after `:`) is URL-safe.
+    let href = if let Some(rest) = room_id.strip_prefix('!') {
+        format!("https://matrix.to/#/%21{rest}")
+    } else {
+        format!("https://matrix.to/#/{room_id}")
+    };
+    let href_esc = glib::markup_escape_text(&href);
+    let text_esc = glib::markup_escape_text(display);
+    format!("<a href=\"{href_esc}\">{text_esc}</a>")
+}
+
 /// construction so the expensive work is paid at load time, not on every scroll.
 ///
 /// Returns `(markup, hash)`:
