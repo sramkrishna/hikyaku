@@ -90,12 +90,29 @@ jobs:
 
       # Fetch the existing gh-pages OSTree repo so we accumulate both
       # stable and beta refs rather than overwriting one with the other.
+      #
+      # The deploy step uses force_orphan: true, which replaces gh-pages
+      # history with whatever is in repo/. If this restore silently fails
+      # when gh-pages already exists remotely, the orphan push wipes the
+      # other branch's ref — that's how "app/me.ramkrishna.hikyaku/x86_64/stable"
+      # disappeared from the remote. So: distinguish "first run, no gh-pages
+      # yet" (empty repo is OK) from "fetch failed" (must abort to avoid
+      # destroying live refs).
       - name: Restore existing OSTree repo from gh-pages
         run: |
+          set -euo pipefail
           mkdir -p repo
-          git fetch origin gh-pages 2>/dev/null || true
-          if git rev-parse origin/gh-pages >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "gh-pages exists remotely — restoring to preserve existing refs"
+            git fetch --depth=1 origin gh-pages
             git archive origin/gh-pages | tar -x -C repo/
+            if [ -z "$(ls -A repo/)" ]; then
+              echo "FATAL: gh-pages exists but restore produced empty repo/"
+              echo "Aborting so force_orphan push cannot wipe live refs."
+              exit 1
+            fi
+          else
+            echo "gh-pages does not exist remotely — first run, starting empty"
           fi
 
       - name: Import bundle into OSTree repo
