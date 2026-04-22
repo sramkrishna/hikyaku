@@ -3266,15 +3266,16 @@ impl MessageView {
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let _g = crate::perf::scope_gt("patch_echo_event_id", 200);
         let imp = self.imp();
-        // Fast path: if no unpatched echoes exist, the backwards scan below
-        // cannot possibly find a match. In a busy room receiving dozens of
-        // remote-sender messages after focus-return, this short-circuit
-        // avoids the O(list_store) walk per call. The counter is maintained
-        // by append_message (increment on echo create) and by this function
-        // (decrement on successful patch).
-        if imp.pending_echo_count.get() == 0 {
-            return false;
-        }
+        // Previously guarded with `imp.pending_echo_count.get() == 0 →
+        // return false` as a fast-path. The counter is approximate
+        // (it can drift between its expected value and reality when
+        // echoes are evicted by MAX_STORE_SIZE cap, when a message is
+        // patched via MessageSent and then NewMessage arrives with a
+        // different body variant, or when the user double-taps send)
+        // and the short-circuit caused visible duplicate own-messages.
+        // Correctness over speculative perf: always run the backwards
+        // scan here — in a typical session it exits at the first
+        // non-empty-event_id row near the tail (O(1) in practice).
         // Normalise the incoming body by stripping any Matrix reply fallback
         // ("> <@sender> quoted\n\nreal body"). The stored body on the local
         // echo MessageObject was stripped in info_to_obj; the server echo
