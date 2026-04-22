@@ -3016,7 +3016,15 @@ impl MessageView {
         let imp = self.imp();
         let my_id = imp.user_id.borrow().clone();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
-        let pos = n.saturating_sub(unread_count);
+        let nominal_pos = n.saturating_sub(unread_count);
+        // Clamp past the user's last own-message. An own-message means the
+        // user engaged with the room past that point — the divider must
+        // never appear above it. If no unread content follows the user's
+        // last own-message, don't insert a divider at all.
+        let pos = clamp_divider_past_own_messages(&imp.list_store(), nominal_pos, &my_id);
+        if pos >= n {
+            return;
+        }
         // Mark all messages after the divider position as new and track them
         // so remove_dividers can clear them in O(unread) not O(total).
         // Never mark own messages as new — the user doesn't need to be notified
@@ -3067,12 +3075,23 @@ impl MessageView {
         let Some(marker_pos) = imp.list_store().find(&marker_obj) else {
             return false;
         };
-        let insert_pos = marker_pos + 1;
+        let nominal_insert = marker_pos + 1;
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
-        if insert_pos >= n {
+        if nominal_insert >= n {
             return false; // Event is the last item — unread messages not yet loaded (case B).
         }
-        // Mark messages after the divider position as new.
+        // Clamp past the user's last own-message: the server's fully_read can
+        // lag behind the user's actual engagement (they sent messages but the
+        // 15-second read-receipt timer hadn't fired when bg_refresh landed),
+        // so a raw marker-based placement routinely puts the divider above
+        // own replies the user clearly already read. Shift the divider to
+        // after the user's last own-message. If that puts us past the end of
+        // the list, don't insert a divider — the user is caught up.
+        let insert_pos = clamp_divider_past_own_messages(&imp.list_store(), nominal_insert, &my_id);
+        if insert_pos >= n {
+            return true; // Caught-up: treat as handled, no divider needed.
+        }
+        // Mark messages after the (clamped) divider position as new.
         let mut new_objs = imp.new_message_objs.borrow_mut();
         new_objs.clear();
         for i in insert_pos..n {
@@ -3630,6 +3649,44 @@ pub(crate) fn should_mark_as_new(window_focused: bool) -> bool {
 /// highlighted as unread, whether on initial room load or incremental update.
 pub(crate) fn divider_should_mark(sender_id: &str, my_id: &str) -> bool {
     my_id.is_empty() || sender_id != my_id
+}
+
+/// Slide the "New messages" divider position past the user's last own-message.
+///
+/// The server's `m.fully_read` marker can lag behind the user's actual
+/// engagement — they've sent messages in the room but the 15-second read
+/// receipt timer hadn't fired before the next bg_refresh landed, so the
+/// server-reported fully_read_event_id points to an earlier event. Using
+/// that raw marker to place the divider puts it above the user's own
+/// replies, which is confusing: any time you see your own message above a
+/// "New messages" bar it is a bug. Treat any own-message as hard evidence
+/// that the user has read everything up to and including it.
+///
+/// Returns the clamped position. Returns `n` (past-the-end) when the user's
+/// own-message is the last message in the window — meaning they are caught
+/// up and no divider should be drawn; callers check for `>= n` and skip.
+pub(crate) fn clamp_divider_past_own_messages(
+    list_store: &gio::ListStore,
+    nominal_pos: u32,
+    my_id: &str,
+) -> u32 {
+    if my_id.is_empty() {
+        return nominal_pos;
+    }
+    let n = gio::prelude::ListModelExt::n_items(list_store);
+    // Scan backward from the end — the first own-message we hit is the
+    // user's most recent engagement. Short-circuit on the first hit since
+    // anything earlier is irrelevant to the clamp.
+    for i in (nominal_pos..n).rev() {
+        if let Some(obj) = gio::prelude::ListModelExt::item(list_store, i)
+            .and_downcast::<MessageObject>()
+        {
+            if obj.sender_id() == my_id {
+                return (i + 1).min(n);
+            }
+        }
+    }
+    nominal_pos
 }
 
 /// Pure helper: given a list of pending echo bodies (messages appended locally
