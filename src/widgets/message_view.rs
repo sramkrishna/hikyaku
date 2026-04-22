@@ -209,6 +209,17 @@ mod imp {
         /// O(1) event_id → MessageObject index. Kept in sync with list_store.
         /// Eliminates linear scans in update/scroll/remove/has_event.
         pub event_index: RefCell<HashMap<String, MessageObject>>,
+        /// Count of local-echo MessageObjects (event_id == "") currently in the
+        /// list_store. Bumps when append_message adds an echo; decrements when
+        /// patch_echo_event_id successfully replaces the empty id with a real
+        /// one. When zero, patch_echo_event_id short-circuits to O(1) instead
+        /// of doing a backwards scan — important in busy rooms where dozens of
+        /// remote-sender messages arrive and each one would otherwise trigger
+        /// a full list_store walk. Approximate: room switches reset it; stale
+        /// echoes that never get patched would cause slight drift. Acceptable
+        /// because the counter is a hint for the fast path, never for
+        /// correctness. (See issue: perf: guard patch_echo_event_id scan.)
+        pub pending_echo_count: Cell<u32>,
         /// The event_id stored in m.fully_read for this room — used for precise
         /// divider placement.  None until set_room_meta is called.
         pub fully_read_event_id: RefCell<Option<String>>,
@@ -344,6 +355,7 @@ mod imp {
                 pending_mentions: RefCell::new(std::collections::HashMap::new()),
                 nick_completion_state: RefCell::new(None),
                 event_index: RefCell::new(HashMap::new()),
+                pending_echo_count: Cell::new(0),
                 fully_read_event_id: RefCell::new(None),
                 send_history: RefCell::new(Vec::new()),
                 history_cursor: Cell::new(0),
@@ -2261,6 +2273,8 @@ impl MessageView {
         // Also clear divider_obj — the splice removed the old room's messages,
         // so any is_first_unread property on them is now stale.
         *imp.divider_obj.borrow_mut() = None;
+        // Echoes in the old list are gone; reset the guard counter.
+        imp.pending_echo_count.set(0);
         let mut idx = imp.event_index.borrow_mut();
         idx.clear();
         for obj in &objs {
@@ -2714,6 +2728,9 @@ impl MessageView {
         imp.room_unread_count.set(0);
         imp.fully_read_event_id.replace(None);
         imp.scroll_to_bottom_pending.set(false);
+        // pending_echo_count is a hint; reset on room switch so stale echoes
+        // in a swapped-away room don't keep the new room's counter elevated.
+        imp.pending_echo_count.set(0);
 
         // Clear info banners.
         imp.unread_banner.set_revealed(false);
@@ -2783,85 +2800,99 @@ impl MessageView {
         let mut show_banner = false;
 
         // Topic — treat as markdown (Matrix topic is plain text but users write markdown).
-        if !meta.topic.is_empty() {
-            imp.topic_label.set_markup(&crate::markdown::md_to_pango(&meta.topic));
-            imp.topic_label.set_visible(true);
-            show_banner = true;
-        } else {
-            imp.topic_label.set_visible(false);
+        {
+            let _t = crate::perf::scope_gt("set_room_meta::topic", 200);
+            if !meta.topic.is_empty() {
+                imp.topic_label.set_markup(&crate::markdown::md_to_pango(&meta.topic));
+                imp.topic_label.set_visible(true);
+                show_banner = true;
+            } else {
+                imp.topic_label.set_visible(false);
+            }
         }
 
         // Tombstone — apply background to entire message view.
         // The replacement_room is rendered as a Pango anchor so the user can
         // click to join; label is selectable so the room id can at least be
         // copy-pasted when the click path fails (e.g. invite-only replacement).
-        if meta.is_tombstoned {
-            let msg = match (&meta.replacement_room_name, &meta.replacement_room) {
-                (Some(name), Some(id)) => format!(
-                    "This room has been upgraded to: {}",
-                    tombstone_link_markup(id, name),
-                ),
-                (None, Some(id)) => format!(
-                    "This room has been upgraded. New room: {}",
-                    tombstone_link_markup(id, id),
-                ),
-                (Some(name), None) => format!(
-                    "This room has been upgraded to: {}",
-                    glib::markup_escape_text(name),
-                ),
-                (None, None) => "This room has been upgraded to a new room.".to_string(),
-            };
-            imp.tombstone_label.set_markup(&msg);
-            imp.tombstone_banner.set_visible(true);
-            self.add_css_class("tombstone-view");
-            show_banner = true;
-        } else {
-            imp.tombstone_banner.set_visible(false);
-            self.remove_css_class("tombstone-view");
+        {
+            let _t = crate::perf::scope_gt("set_room_meta::tombstone", 200);
+            if meta.is_tombstoned {
+                let msg = match (&meta.replacement_room_name, &meta.replacement_room) {
+                    (Some(name), Some(id)) => format!(
+                        "This room has been upgraded to: {}",
+                        tombstone_link_markup(id, name),
+                    ),
+                    (None, Some(id)) => format!(
+                        "This room has been upgraded. New room: {}",
+                        tombstone_link_markup(id, id),
+                    ),
+                    (Some(name), None) => format!(
+                        "This room has been upgraded to: {}",
+                        glib::markup_escape_text(name),
+                    ),
+                    (None, None) => "This room has been upgraded to a new room.".to_string(),
+                };
+                imp.tombstone_label.set_markup(&msg);
+                imp.tombstone_banner.set_visible(true);
+                self.add_css_class("tombstone-view");
+                show_banner = true;
+            } else {
+                imp.tombstone_banner.set_visible(false);
+                self.remove_css_class("tombstone-view");
+            }
         }
 
         // Pinned messages — remove old entries, add fresh ones with sender.
-        let pinned = &imp.pinned_box;
-        // Remove all children except the header label.
-        while let Some(child) = pinned.last_child() {
-            if child.downcast_ref::<gtk::Label>().map_or(false, |l| {
-                l.css_classes().iter().any(|c| c == "heading")
-            }) {
-                break;
+        // This section constructs gtk::Box + two gtk::Labels + parses markup
+        // per pinned message; for rooms with many pinned messages it is the
+        // dominant cost of set_room_meta. Count is logged as ctx so the log
+        // tells us "n={how many pinned messages were rebuilt}".
+        {
+            let pinned_count = meta.pinned_messages.len();
+            let _t = crate::perf::scope_with("set_room_meta::pinned", format!("n={pinned_count}"));
+            let pinned = &imp.pinned_box;
+            // Remove all children except the header label.
+            while let Some(child) = pinned.last_child() {
+                if child.downcast_ref::<gtk::Label>().map_or(false, |l| {
+                    l.css_classes().iter().any(|c| c == "heading")
+                }) {
+                    break;
+                }
+                pinned.remove(&child);
             }
-            pinned.remove(&child);
-        }
-        if !meta.pinned_messages.is_empty() {
-            for (sender, body, formatted) in &meta.pinned_messages {
-                let row = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(2)
-                    .css_classes(["pinned-message"])
-                    .build();
-                let sender_label = gtk::Label::builder()
-                    .label(&format!("{sender}:"))
-                    .halign(gtk::Align::Start)
-                    .css_classes(["caption", "heading"])
-                    .build();
-                let pango = match formatted {
-                    Some(html) => crate::markdown::html_to_pango(html),
-                    None => crate::markdown::md_to_pango(body),
-                };
-                let body_label = gtk::Label::builder()
-                    .halign(gtk::Align::Start)
-                    .wrap(true)
-                    .wrap_mode(gtk::pango::WrapMode::WordChar)
-                    .css_classes(["caption"])
-                    .build();
-                body_label.set_markup(&pango);
-                row.append(&sender_label);
-                row.append(&body_label);
-                pinned.append(&row);
+            if !meta.pinned_messages.is_empty() {
+                for (sender, body, formatted) in &meta.pinned_messages {
+                    let row = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Vertical)
+                        .spacing(2)
+                        .css_classes(["pinned-message"])
+                        .build();
+                    let sender_label = gtk::Label::builder()
+                        .label(&format!("{sender}:"))
+                        .halign(gtk::Align::Start)
+                        .css_classes(["caption", "heading"])
+                        .build();
+                    let pango = match formatted {
+                        Some(html) => crate::markdown::html_to_pango(html),
+                        None => crate::markdown::md_to_pango(body),
+                    };
+                    let body_label = gtk::Label::builder()
+                        .halign(gtk::Align::Start)
+                        .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
+                        .css_classes(["caption"])
+                        .build();
+                    body_label.set_markup(&pango);
+                    row.append(&sender_label);
+                    row.append(&body_label);
+                    pinned.append(&row);
+                }
+                pinned.set_visible(true);
+                show_banner = true;
+            } else {
+                pinned.set_visible(false);
             }
-            pinned.set_visible(true);
-            show_banner = true;
-        } else {
-            pinned.set_visible(false);
         }
 
         imp.info_banner.set_visible(show_banner);
@@ -2869,12 +2900,16 @@ impl MessageView {
 
         // Store members for nick completion, sorted by lowercase name
         // for O(log n) binary search prefix matching.
-        let mut members: Vec<(String, String, String)> = meta.members
-            .iter()
-            .map(|(uid, name)| (name.to_lowercase(), name.clone(), uid.clone()))
-            .collect();
-        members.sort_by(|a, b| a.0.cmp(&b.0));
-        imp.room_members.replace(members);
+        {
+            let member_count = meta.members.len();
+            let _t = crate::perf::scope_with("set_room_meta::members", format!("n={member_count}"));
+            let mut members: Vec<(String, String, String)> = meta.members
+                .iter()
+                .map(|(uid, name)| (name.to_lowercase(), name.clone(), uid.clone()))
+                .collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            imp.room_members.replace(members);
+        }
 
         // Update fully_read marker and unread count. messages_loaded is
         // intentionally NOT reset here — only clear() resets it on room switch
@@ -3120,6 +3155,12 @@ impl MessageView {
             // Pre-insert into event_index immediately so subsequent dedup checks
             // within the same burst (before the flush idle fires) work correctly.
             self.imp().event_index.borrow_mut().insert(eid, obj.clone());
+        } else {
+            // Local echo (empty event_id). Bump the echo counter so
+            // patch_echo_event_id's backwards scan is only taken when there
+            // is actually an unpatched echo to look for.
+            let imp = self.imp();
+            imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_add(1));
         }
         if mark_as_new {
             obj.set_is_new_message(true);
@@ -3190,6 +3231,15 @@ impl MessageView {
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let _g = crate::perf::scope_gt("patch_echo_event_id", 200);
         let imp = self.imp();
+        // Fast path: if no unpatched echoes exist, the backwards scan below
+        // cannot possibly find a match. In a busy room receiving dozens of
+        // remote-sender messages after focus-return, this short-circuit
+        // avoids the O(list_store) walk per call. The counter is maintained
+        // by append_message (increment on echo create) and by this function
+        // (decrement on successful patch).
+        if imp.pending_echo_count.get() == 0 {
+            return false;
+        }
         // Normalise the incoming body by stripping any Matrix reply fallback
         // ("> <@sender> quoted\n\nreal body"). The stored body on the local
         // echo MessageObject was stripped in info_to_obj; the server echo
@@ -3212,6 +3262,8 @@ impl MessageView {
             if msg.event_id().is_empty() && msg.body() == echo_body {
                 tracing::info!("patch_echo_event_id: patched echo at pos={} body={:?} → {}", i, body_preview(echo_body), event_id);
                 msg.set_event_id(event_id.to_string());
+                // The echo now has a real id, so decrement the guard counter.
+                imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_sub(1));
                 // Add to event_index now that it has a real ID.
                 imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
                 // Rebind the visible row so MessageRow's Rc cells get updated.

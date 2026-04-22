@@ -95,6 +95,17 @@ mod imp {
                     }
                     match Connection::open(&path) {
                         Ok(c) => {
+                            // WAL + NORMAL is load-bearing here. `mark_read`
+                            // runs on the GTK main thread from the focus
+                            // handler and the room-click path; the default
+                            // DELETE journal + synchronous=FULL combination
+                            // would add an fsync per write (single-digit
+                            // milliseconds in the best case, 100+ after a
+                            // cold wake). WAL batches via a checkpoint and
+                            // NORMAL drops the per-commit fsync, so a
+                            // mark_read call is bounded by the mutex +
+                            // memtable write rather than disk flush. See
+                            // CLAUDE.md §1 for the broader rule.
                             let _ = c.execute_batch(
                                 "PRAGMA journal_mode=WAL;
                                  PRAGMA synchronous=NORMAL;
