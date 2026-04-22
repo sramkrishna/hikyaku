@@ -369,6 +369,13 @@ pub enum MatrixEvent {
         trend: i8,
         alert: crate::plugins::community_health::AlertLevel,
     },
+    /// Result from the background markup worker — HTML formatted_body has
+    /// been converted to Pango markup. The GTK event handler routes this
+    /// through `crate::markup_worker::apply_result` which looks up the
+    /// target MessageObject via a thread-local WeakRef map keyed by `id`
+    /// and calls `set_rendered_markup`. Does not carry a GObject reference
+    /// because GObjects aren't Send.
+    MarkupRendered { id: u64, markup: String },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.

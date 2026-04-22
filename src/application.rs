@@ -59,6 +59,16 @@ mod imp {
             let (event_tx, event_rx) = async_channel::unbounded::<matrix::MatrixEvent>();
             let (command_tx, command_rx) = async_channel::unbounded::<matrix::MatrixCommand>();
 
+            // Start the background HTML→Pango worker thread. Results come
+            // back through the same event channel so the GTK event loop
+            // handler can apply them uniformly with matrix events.
+            {
+                let tx = event_tx.clone();
+                crate::markup_worker::start(move |id, markup| {
+                    let _ = tx.send_blocking(matrix::MatrixEvent::MarkupRendered { id, markup });
+                });
+            }
+
             // Spawn the background tokio thread that runs matrix-sdk.
             // Shutdown is initiated by sending MatrixCommand::Shutdown — all
             // commands before it are guaranteed to run first (no race condition).

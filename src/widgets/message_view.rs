@@ -2632,10 +2632,26 @@ impl MessageView {
             obj.set_formatted_timestamp(
                 crate::widgets::message_row::format_timestamp_with_today(m.timestamp, today));
         }
-        // Pre-compute all per-bind display values once at load time.
-        let (markup, hash) = prerender_body(&body, formatted_body);
-        obj.set_rendered_markup(markup);
+        // Pre-compute the body_hash synchronously (cheap FNV-1a over the
+        // strings) and the plain-text fallback markup. For messages with a
+        // non-empty formatted_body (Matrix HTML) we enqueue the expensive
+        // html_to_pango parse onto the background markup worker; the row
+        // shows the plain-text fallback in the interim and swaps in the
+        // rendered Pango markup via notify::rendered-markup when the
+        // worker delivers. This keeps info_to_obj bounded regardless of
+        // how pathological a single formatted_body is.
+        let hash = prerender_body_hash(&body, formatted_body);
         obj.set_body_hash(hash);
+        if formatted_body.is_empty() {
+            let escaped = gtk::glib::markup_escape_text(&body).to_string();
+            obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
+        } else {
+            // Fallback visible until the worker replies — keeps the message
+            // readable rather than empty during the parse window.
+            let escaped = gtk::glib::markup_escape_text(&body).to_string();
+            obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
+            crate::markup_worker::try_enqueue(&obj, formatted_body.to_string());
+        }
         obj.set_sender_markup(crate::widgets::message_row::prerender_sender_markup(&m.sender, &m.sender_id));
         obj.set_reactions_hash(fnv1a_str(&reactions_json));
         obj.set_image_url(
@@ -3403,6 +3419,19 @@ fn tombstone_link_markup(room_id: &str, display: &str) -> String {
 ///   (those still need dynamic body_box widget construction in bind).
 /// - `hash`: FNV-1a hash of (body, formatted_body) — used as cache key in
 ///   MessageRow.last_body_hash to skip set_markup() when rebinding the same msg.
+/// FNV-1a hash of (body, formatted_body). Used as the MessageRow bind cache
+/// key so a row recycled for the same message skips set_markup. Cheap —
+/// allocation-free O(n) on the input strings.
+pub(crate) fn prerender_body_hash(body: &str, formatted_body: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for b in body.bytes().chain(std::iter::once(0)).chain(formatted_body.bytes()) {
+        hash = hash.wrapping_mul(FNV_PRIME) ^ b as u64;
+    }
+    hash
+}
+
 pub(crate) fn prerender_body(body: &str, formatted_body: &str) -> (String, u64) {
     let _g = crate::perf::scope_gt("prerender_body", 200);
     // FNV-1a hash — allocation-free O(n) on input strings.

@@ -144,6 +144,12 @@ mod imp {
         pub new_message_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
         /// Handler for notify::is-first-unread — shows/hides the divider bar above the row.
         pub unread_divider_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        /// Handler for notify::rendered-markup — applies the Pango markup
+        /// delivered by the background markup worker after the row has
+        /// already been bound (the initial bind showed the plain-text
+        /// fallback). Disconnected in clear_flash_handler alongside the
+        /// other per-bind notify handlers.
+        pub markup_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
     }
 
     #[glib::object_subclass]
@@ -1184,6 +1190,29 @@ impl MessageRow {
             }
         });
         *self.imp().flash_handler.borrow_mut() = Some((msg.clone().upcast(), id));
+
+        // Connect handler for async markup delivery. When the background
+        // worker finishes html_to_pango and calls set_rendered_markup on
+        // this MessageObject, the row swaps its body_label text from the
+        // plain-text fallback (shown during the initial bind) to the
+        // properly-rendered Pango markup. If the row has been recycled for
+        // a different message in the interim, the weak-upgrade + event_id
+        // check guards against writing to the wrong row.
+        let row_weak = self.downgrade();
+        let bound_eid = msg.event_id();
+        let mu_id = msg.connect_notify_local(Some("rendered-markup"), move |obj, _| {
+            use crate::models::MessageObject;
+            let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>())
+                else { return };
+            // Same-message check — the row may have been bound to a
+            // different message by the time the worker returned.
+            if *row.imp().event_id.borrow() != bound_eid { return; }
+            let markup = msg.rendered_markup();
+            if markup.is_empty() { return; }
+            row.imp().body_label.set_markup(&markup);
+            row.imp().body_label.set_visible(true);
+        });
+        *self.imp().markup_handler.borrow_mut() = Some((msg.clone().upcast(), mu_id));
     }
 
     /// Disconnect and clear the `notify::is-flashing` handler from the bound MessageObject.
@@ -1195,6 +1224,9 @@ impl MessageRow {
             obj.disconnect(id);
         }
         if let Some((obj, id)) = self.imp().unread_divider_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        if let Some((obj, id)) = self.imp().markup_handler.borrow_mut().take() {
             obj.disconnect(id);
         }
     }

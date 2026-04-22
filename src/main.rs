@@ -10,6 +10,7 @@ mod config;
 mod intelligence;
 mod local_unread;
 mod markdown;
+mod markup_worker;
 mod matrix;
 mod perf;
 mod spell_check;

@@ -1694,6 +1694,13 @@ impl MxWindow {
                     if window_weak.upgrade().is_none() { break; }
                 }
                 match event {
+                    MatrixEvent::MarkupRendered { id, markup } => {
+                        // Background parser delivered Pango markup for a
+                        // MessageObject. Apply to the tracked WeakRef;
+                        // no-op if the object was dropped (e.g. list_store
+                        // swapped away) before we got here.
+                        crate::markup_worker::apply_result(id, markup);
+                    }
                     MatrixEvent::LoginRequired => {
                         if crate::config::gsettings().boolean("first-start") {
                             window.show_onboarding();
