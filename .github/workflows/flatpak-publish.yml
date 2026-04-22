@@ -23,10 +23,16 @@ on:
         type: choice
         options: [stable, beta]
 
-# Only one publish job runs at a time. A new push queues behind the current
-# run rather than racing to write gh-pages simultaneously.
+# Only one publish job runs at a time *per ref*. Grouping globally would
+# let a fresh push to main cancel a queued tag run (and vice versa) with
+# the message "Canceling since a higher priority waiting request for
+# flatpak-publish exists" — GitHub keeps at most one waiting entry per
+# group. Since stable (tags) and beta (main) produce different OSTree
+# branches, they must never cancel each other. Pushing several times to
+# main in rapid succession will still supersede older queued beta builds,
+# which is the desired behaviour for that branch alone.
 concurrency:
-  group: flatpak-publish
+  group: flatpak-publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
