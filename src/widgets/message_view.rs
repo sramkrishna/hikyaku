@@ -3179,6 +3179,14 @@ impl MessageView {
                 .map(|(uid, name)| (name.to_lowercase(), name.clone(), uid.clone()))
                 .collect();
             members.sort_by(|a, b| a.0.cmp(&b.0));
+            // Feed the global directory with every member's display
+            // name + server so any widget (rolodex, pills, mention
+            // autocompleter) can resolve them without re-holding local
+            // state.
+            for (_lower, display, uid) in &members {
+                crate::directory::set_user_display_name(uid, display);
+                crate::directory::observe_server_from_mxid(uid);
+            }
             imp.room_members.replace(members);
             // Stash mxc URLs for each member so the nick popover can look
             // them up and fire FetchAvatar on demand.
@@ -3187,6 +3195,7 @@ impl MessageView {
             for (uid, mxc) in &meta.member_avatars {
                 if !mxc.is_empty() {
                     mxc_map.insert(uid.clone(), mxc.clone());
+                    crate::directory::set_user_avatar_mxc(uid, mxc);
                 }
             }
             imp.member_avatar_mxc.replace(mxc_map);

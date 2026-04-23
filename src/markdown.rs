@@ -382,31 +382,26 @@ fn linkify_http(text: &str) -> String {
     result
 }
 
-/// Global room id → display name cache. Populated from the GTK thread
-/// whenever the room list is refreshed; read from any thread (including
-/// the markup worker) when rendering matrix.to pills, so pill text
-/// shows the human-readable name regardless of which thread linkify
-/// is running on. Was a thread-local closure before — that broke when
-/// the markup worker (a dedicated parse thread) rendered formatted_body
-/// HTML, because its thread-local was always empty.
-static ROOM_NAME_CACHE: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<String, String>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
-
-/// Insert or update the display name for a room id. Safe to call from
-/// any thread; intended to be driven from the GTK thread each time the
-/// room list refreshes. Empty names are ignored so an unresolved room
-/// doesn't overwrite a prior good name.
+/// Shim: room-name lookups now live in `crate::directory`. Kept here so
+/// call sites that already import `markdown::set_room_name` don't need
+/// updating in the same patch. Prefer `crate::directory::set_room_name`
+/// for new code.
 pub fn set_room_name(room_id: &str, name: &str) {
-    if name.is_empty() { return; }
-    if let Ok(mut map) = ROOM_NAME_CACHE.write() {
-        map.insert(room_id.to_string(), name.to_string());
-    }
+    crate::directory::set_room_name(room_id, name);
 }
 
 fn resolve_room_name(room_id_or_alias: &str) -> Option<String> {
-    let map = ROOM_NAME_CACHE.read().ok()?;
-    map.get(room_id_or_alias).cloned()
+    // Direct room-id hit.
+    if let Some(name) = crate::directory::room_name(room_id_or_alias) {
+        return Some(name);
+    }
+    // Alias path → reverse lookup to find the room id, then its name.
+    if room_id_or_alias.starts_with('#') {
+        if let Some(rid) = crate::directory::room_id_for_alias(room_id_or_alias) {
+            return crate::directory::room_name(&rid);
+        }
+    }
+    None
 }
 
 /// Return a compact, human-readable label for a matrix.to URL — used as

@@ -7,6 +7,7 @@
 mod application;
 mod bookmarks;
 mod config;
+mod directory;
 mod intelligence;
 mod local_unread;
 mod markdown;
