@@ -2162,25 +2162,50 @@ impl MessageView {
         let emoji = emoji.to_string();
         let sender = sender.to_string();
         self.update_message_in_place(event_id, |msg| {
-            let mut reactions: Vec<(String, u64, Vec<String>)> =
-                serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
-            // O(1) emoji lookup via position index.
-            let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
-                .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
-            match pos_by_emoji.get(emoji.as_str()) {
-                Some(&i) => {
-                    // O(1) duplicate sender check via HashSet.
-                    let senders: std::collections::HashSet<&str> =
-                        reactions[i].2.iter().map(|s| s.as_str()).collect();
-                    if !senders.contains(sender.as_str()) {
-                        reactions[i].1 += 1;
-                        reactions[i].2.push(sender);
-                    }
-                }
-                None => reactions.push((emoji, 1, vec![sender])),
-            }
-            msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+            apply_reaction_delta(msg, &emoji, &sender);
         });
+    }
+
+    /// Apply an incoming reaction to any room — the current one or a
+    /// cached non-current one. Without this, reactions that arrive
+    /// while the user is viewing a different room are silently dropped
+    /// (the MessageObject never learns about them), so the panel shows
+    /// stale state until the app restarts and reloads from cache.
+    ///
+    /// For non-current rooms: look up the MessageObject in
+    /// `saved_event_indices[room_id]` and mutate it in place. The row
+    /// re-bind happens naturally when the user returns to the room and
+    /// the factory re-binds the cached ListView rows — the factory
+    /// reads `reactions_hash`, sees it changed, and rebuilds the pills.
+    pub fn apply_reaction_in_room(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        emoji: &str,
+        sender: &str,
+    ) {
+        if event_id.is_empty() || room_id.is_empty() { return; }
+        let imp = self.imp();
+        let current_rid = imp.current_room_id.borrow().clone();
+
+        if current_rid == room_id {
+            // Current room: mutate + rebind any visible row.
+            self.add_reaction(event_id, emoji, sender);
+            return;
+        }
+
+        // Non-current room: look up in saved_event_indices and mutate.
+        let msg = imp.saved_event_indices.borrow()
+            .get(room_id)
+            .and_then(|idx| idx.get(event_id).cloned());
+        let Some(msg) = msg else {
+            tracing::debug!(
+                "apply_reaction_in_room: {event_id} not in saved_event_indices[{room_id}] \
+                 (room never visited or message not loaded)"
+            );
+            return;
+        };
+        apply_reaction_delta(&msg, emoji, sender);
     }
 
     /// Remove an emoji reaction from a message (decrement count).
@@ -3693,6 +3718,30 @@ impl MessageView {
 /// pipeline can route the click the same way it routes body-text room
 /// links. The visible text is the human-readable name when we have one,
 /// falling back to the room id so the user can still see and copy it.
+/// Fold a single (emoji, sender) reaction into a MessageObject's
+/// `reactions_json`. Idempotent on (emoji, sender) — re-applying the
+/// same pair is a no-op. Shared between the current-room rebind path
+/// (`add_reaction`) and the non-current-room mutation path
+/// (`apply_reaction_in_room`).
+fn apply_reaction_delta(msg: &MessageObject, emoji: &str, sender: &str) {
+    let mut reactions: Vec<(String, u64, Vec<String>)> =
+        serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
+    let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
+        .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
+    match pos_by_emoji.get(emoji) {
+        Some(&i) => {
+            let senders: std::collections::HashSet<&str> =
+                reactions[i].2.iter().map(|s| s.as_str()).collect();
+            if !senders.contains(sender) {
+                reactions[i].1 += 1;
+                reactions[i].2.push(sender.to_string());
+            }
+        }
+        None => reactions.push((emoji.to_string(), 1, vec![sender.to_string()])),
+    }
+    msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+}
+
 fn tombstone_link_markup(room_id: &str, display: &str) -> String {
     // `!` is URL-safe so keep it literal (matches Element / matrix.to's
     // canonical form). An alias (`#`) would collide with the fragment

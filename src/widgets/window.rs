@@ -2317,16 +2317,17 @@ impl MxWindow {
                         }
                     }
                     MatrixEvent::ReactionUpdate { room_id, event_id, reactions } => {
-                        let current = window.imp().current_room_id.borrow().clone();
-                        tracing::debug!("ReactionUpdate: room={room_id} current={current:?} target={event_id}");
-                        if current.as_deref() == Some(&room_id) {
-                            for (emoji, _count, senders) in &reactions {
-                                for sender in senders {
-                                    message_view.add_reaction(&event_id, emoji, sender);
-                                }
+                        tracing::debug!("ReactionUpdate: room={room_id} target={event_id}");
+                        // Apply regardless of which room the user is currently
+                        // viewing — non-current rooms mutate their saved
+                        // MessageObject so the reaction is visible on return,
+                        // not only after a full restart.
+                        for (emoji, _count, senders) in &reactions {
+                            for sender in senders {
+                                message_view.apply_reaction_in_room(
+                                    &room_id, &event_id, emoji, sender,
+                                );
                             }
-                        } else {
-                            tracing::debug!("ReactionUpdate skipped: not in that room");
                         }
                     }
                     MatrixEvent::ReactionNotification { room_id, room_name, reactor, emoji } => {
