@@ -298,7 +298,25 @@ mod imp {
             // small so the reserved space is minimal.
             self.action_bar.add_css_class("msg-action-bar");
             let obj = self.obj();
-            if let Some(vbox) = obj.first_child().and_downcast::<gtk::Box>() {
+            // The outer template is a horizontal Box with Avatar first
+            // and the content vbox second. `first_child()` was correct
+            // before the avatar was added — it now returns the Avatar,
+            // so walk to the Box sibling instead.
+            let content_vbox = {
+                let mut child = obj.first_child();
+                loop {
+                    match child {
+                        Some(w) => {
+                            if let Some(b) = w.clone().downcast::<gtk::Box>().ok() {
+                                break Some(b);
+                            }
+                            child = w.next_sibling();
+                        }
+                        None => break None,
+                    }
+                }
+            };
+            if let Some(vbox) = content_vbox {
                 vbox.append(&self.action_bar);
             }
 
