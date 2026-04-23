@@ -2890,6 +2890,10 @@ async fn start_sync(
                     let my_id = client.user_id().map(|u| u.to_string());
                     let reactor_is_me = my_id.as_deref()
                         .map_or(false, |uid| uid == event.sender.as_str());
+                    tracing::info!(
+                        "sync reaction handler fired: room={} sender={} target={} emoji={:?} reactor_is_me={}",
+                        room.room_id(), event.sender, target_event_id, emoji, reactor_is_me
+                    );
                     let sender_name = resolve_display_name(&room, &event.sender).await;
                     let display = if reactor_is_me { "You".to_string() } else { sender_name.clone() };
                     let _ = tx.send(MatrixEvent::ReactionUpdate {

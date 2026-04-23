@@ -2317,7 +2317,9 @@ impl MxWindow {
                         }
                     }
                     MatrixEvent::ReactionUpdate { room_id, event_id, reactions } => {
-                        tracing::debug!("ReactionUpdate: room={room_id} target={event_id}");
+                        tracing::info!(
+                            "ReactionUpdate received on GTK thread: room={room_id} target={event_id} reactions={reactions:?}"
+                        );
                         // Apply regardless of which room the user is currently
                         // viewing — non-current rooms mutate their saved
                         // MessageObject so the reaction is visible on return,
