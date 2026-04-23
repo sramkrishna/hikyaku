@@ -30,6 +30,22 @@ mod imp {
         pub message_view: MessageView,
         pub toast_overlay: adw::ToastOverlay,
         pub toolbar: adw::ToolbarView,
+        /// Left-sidebar stack: page "rooms" is the normal room list;
+        /// page "user-info" is the in-place user-info panel (replaces
+        /// the modal dialog). Populated lazily when the user clicks a
+        /// sender name.
+        pub sidebar_stack: OnceCell<gtk::Stack>,
+        /// Scrolled container for the user-info panel body — we rebuild
+        /// the children on every show so prior/fresh state is always
+        /// correct. Kept as a handle so show_user_info_dialog can
+        /// replace its child.
+        pub user_info_container: OnceCell<gtk::ScrolledWindow>,
+        /// Close-over state needed when the user leaves the user-info
+        /// panel: run the same save flow the old dialog's connect_closed
+        /// did. Holds `(user_id, save_closure)` for the currently open
+        /// panel; `save_closure` reads the panel widgets and persists
+        /// flag + notes changes.
+        pub user_info_save: RefCell<Option<(String, Box<dyn Fn()>)>>,
         pub loading_spinner: gtk::Spinner,
         pub verify_banner: adw::Banner,
         /// Transient banner shown at the top for @mention notifications
@@ -175,6 +191,9 @@ mod imp {
                 message_view: MessageView::new(),
                 toast_overlay: adw::ToastOverlay::new(),
                 toolbar: adw::ToolbarView::new(),
+                sidebar_stack: OnceCell::new(),
+                user_info_container: OnceCell::new(),
+                user_info_save: RefCell::new(None),
                 loading_spinner: gtk::Spinner::new(),
                 verify_banner,
                 notify_banner: adw::Banner::builder()
@@ -872,6 +891,11 @@ impl MxWindow {
             let _t0 = std::time::Instant::now();
             let _t_phase1 = std::time::Instant::now();
             if let Some(window) = window_weak.upgrade() {
+                // If the user-info sidebar panel is open when a room is
+                // selected (e.g. Send-DM completed, or a matrix.to click
+                // routed to a room), collapse back to the room list so
+                // the newly-selected room is focused visually.
+                window.close_user_info_panel();
                 window.imp().current_room_id.replace(Some(room_id.clone()));
                 // Drop any pending bg_refresh batches for rooms we're leaving —
                 // stale data for the old room must not fire set_messages() later.
@@ -2901,7 +2925,24 @@ impl MxWindow {
 
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
-        sidebar_toolbar.set_content(Some(&imp.room_list_view));
+
+        // Sidebar stack: "rooms" (the normal room list) vs. "user-info"
+        // (the in-place user-info panel, shown when a sender name is
+        // clicked). Built empty; show_user_info_dialog() populates and
+        // switches it. Avoids the modal dialog that the user found
+        // disruptive.
+        let sidebar_stack = gtk::Stack::new();
+        sidebar_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
+        sidebar_stack.add_named(&imp.room_list_view, Some("rooms"));
+        let user_info_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        sidebar_stack.add_named(&user_info_scroll, Some("user-info"));
+        sidebar_stack.set_visible_child_name("rooms");
+        sidebar_toolbar.set_content(Some(&sidebar_stack));
+        let _ = imp.sidebar_stack.set(sidebar_stack);
+        let _ = imp.user_info_container.set(user_info_scroll);
 
         // Wire search toggle button ↔ search bar.
         let search_bar = imp.room_list_view.search_bar();
@@ -4244,15 +4285,23 @@ impl MxWindow {
         cancel_btn.connect_clicked(move |_| dismiss());
     }
 
-    /// Show an inline bar to start a new DM with a Matrix user.
-    /// Open the user-info dialog for a Matrix user id. Displays a 64px
-    /// avatar (cached image or initials fallback), the display name (if
-    /// known), the mxid as selectable monospace text with a "Copy mxid"
-    /// action, and a "Send DM" action that reuses the existing CreateDm
-    /// flow. Opened from a sender-name click in the message view and
-    /// from matrix.to user-link clicks (future issue).
+    /// Open the user-info panel for a Matrix user id in the LEFT
+    /// SIDEBAR — not a modal dialog. The panel replaces the room list
+    /// (via gtk::Stack) and exposes a Back button to return. Shows a
+    /// 64px avatar (cached image or initials), the display name, the
+    /// mxid as selectable monospace text with a Copy action, the flag
+    /// editor (category / severity / reason / evidence), a notes
+    /// editor, and a Send DM action. Opened from a sender-name click
+    /// in the message view and from matrix.to user-link clicks.
+    ///
+    /// The function name still says "dialog" for call-site continuity
+    /// from the previous implementation; behaviour is sidebar-only now.
     pub fn show_user_info_dialog(&self, user_id: &str) {
         if user_id.is_empty() { return; }
+        // If a prior panel is still displayed, flush its save before
+        // overwriting — user clicked a second name without leaving.
+        self.run_user_info_save();
+
         // Best-effort display-name lookup: the current room's member
         // list is the most reliable source (matches what the user is
         // already seeing). Fall back to localpart so the heading is
@@ -4270,18 +4319,28 @@ impl MxWindow {
                 })
         };
 
-        let dialog = adw::Dialog::builder()
-            .title(&display_name)
-            .content_width(360)
-            .content_height(320)
-            .build();
-
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
-            .margin_start(24).margin_end(24)
-            .margin_top(24).margin_bottom(24)
+            .margin_start(16).margin_end(16)
+            .margin_top(8).margin_bottom(16)
             .build();
+
+        // Back row: small "← Back to rooms" button at the top. The
+        // sidebar header can't host a back button cleanly (it's shared
+        // with the room list), so we put one in the panel itself.
+        let back_btn = gtk::Button::builder()
+            .label("← Back to rooms")
+            .halign(gtk::Align::Start)
+            .css_classes(["flat"])
+            .build();
+        let window_weak_back = self.downgrade();
+        back_btn.connect_clicked(move |_| {
+            if let Some(win) = window_weak_back.upgrade() {
+                win.close_user_info_panel();
+            }
+        });
+        content.append(&back_btn);
 
         let initials_source = display_name.clone();
         let avatar = adw::Avatar::builder()
@@ -4303,6 +4362,7 @@ impl MxWindow {
             .label(&display_name)
             .css_classes(["title-2"])
             .halign(gtk::Align::Center)
+            .wrap(true)
             .build();
         content.append(&name_label);
 
@@ -4317,6 +4377,8 @@ impl MxWindow {
             .label(user_id)
             .selectable(true)
             .css_classes(["monospace", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         let copy_btn = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
@@ -4475,32 +4537,36 @@ impl MxWindow {
         actions.append(&dm_btn);
         content.append(&actions);
 
-        // Send-DM action: dispatch CreateDm, close the dialog.
+        // Send-DM action: dispatch CreateDm, return to the room list.
+        // The new DM room will be selected by the CreateDm handler, so
+        // collapsing the panel is safe — the user sees the fresh DM
+        // room focused in the sidebar.
         let tx_dm = self.imp().command_tx.get().unwrap().clone();
-        let dialog_weak = dialog.downgrade();
+        let window_weak_dm = self.downgrade();
         let uid_for_dm = user_id.to_string();
         dm_btn.connect_clicked(move |_| {
             let tx = tx_dm.clone();
             let uid = uid_for_dm.clone();
-            let dlg = dialog_weak.clone();
+            let win_weak = window_weak_dm.clone();
             glib::spawn_future_local(async move {
                 let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
-                if let Some(d) = dlg.upgrade() { d.close(); }
+                if let Some(win) = win_weak.upgrade() {
+                    win.close_user_info_panel();
+                }
             });
         });
 
-        // Save flag + notes on dialog close — picks up whatever the user
-        // edited and persists via the community-safety store. Diffs against
-        // the prior record so we only write (and only fire refresh) when
-        // something actually changed. Refreshes all visible message rows
-        // for this user so pills / note indicator update in real time.
+        // Build the save closure that mirrors the old connect_closed
+        // handler. It runs when the user leaves the panel (Back button
+        // or opens a different user's panel). Persisted into
+        // `user_info_save` so `close_user_info_panel` can invoke it.
         #[cfg(feature = "community-safety")]
         {
             let uid_for_save = user_id.to_string();
             let window_weak_save = self.downgrade();
             let (cat_row, sev_row, reason_entry, evidence_entry, extra_category) =
                 flag_widgets.expect("flag_widgets is always Some under community-safety");
-            dialog.connect_closed(move |_| {
+            let save: Box<dyn Fn()> = Box::new(move || {
                 use crate::plugins::community_safety::{
                     FLAGGED_STORE, BUILTIN_CATEGORIES,
                     SEVERITY_NOTE, SEVERITY_CAUTION, SEVERITY_WARNING,
@@ -4509,18 +4575,11 @@ impl MxWindow {
                 let store = &*FLAGGED_STORE;
                 let prior = store.get(&uid_for_save);
 
-                // Collect the intended notes text first; we reuse it across
-                // both save paths (flag change + notes-only change).
                 let buffer = notes_view.buffer();
                 let (bstart, bend) = buffer.bounds();
                 let notes_text = buffer.text(&bstart, &bend, false).to_string();
                 let notes_trimmed = notes_text.trim().to_string();
 
-                // Resolve the category string from the ComboRow selection.
-                // Index 0 = "(none)" — clear flag. Indexes 1..=N map onto
-                // BUILTIN_CATEGORIES. The trailing extra slot (present only
-                // when the prior record had an out-of-list category) maps
-                // back to that preserved tag.
                 let (new_category, new_severity, new_reason, new_evidence) = {
                     let cat_idx = cat_row.selected();
                     let cat = if cat_idx == 0 {
@@ -4543,8 +4602,6 @@ impl MxWindow {
                     (cat, sev, reason, evidence)
                 };
 
-                // Compute prior values for diffing. Falls back to the
-                // defaults used by the dialog when no record existed.
                 let prior_category = prior.as_ref().map(|e| e.category.clone()).unwrap_or_default();
                 let prior_severity = prior.as_ref().map(|e| e.effective_severity()).unwrap_or(SEVERITY_CAUTION);
                 let prior_reason = prior.as_ref().map(|e| e.reason.clone()).unwrap_or_default();
@@ -4580,18 +4637,41 @@ impl MxWindow {
                     }
                 }
             });
+            self.imp().user_info_save.replace(Some((user_id.to_string(), save)));
         }
 
-        // Wrap the content in a ToolbarView with a HeaderBar so the
-        // dialog gets the standard close button in the top-right (the
-        // bare adw::Dialog has no visible close affordance — only the
-        // Escape key works, which is not discoverable).
-        let toolbar = adw::ToolbarView::new();
-        let header = adw::HeaderBar::new();
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar));
-        dialog.present(Some(self));
+        // Install into the sidebar: swap the ScrolledWindow's child to
+        // the freshly-built panel body, flip the Stack page, and ensure
+        // the scroll view starts at the top.
+        if let Some(scroll) = self.imp().user_info_container.get() {
+            scroll.set_child(Some(&content));
+            scroll.vadjustment().set_value(0.0);
+        }
+        if let Some(stack) = self.imp().sidebar_stack.get() {
+            stack.set_visible_child_name("user-info");
+        }
+    }
+
+    /// Run any pending user-info save closure (flag + notes persistence).
+    /// Idempotent — the closure is consumed on call.
+    fn run_user_info_save(&self) {
+        if let Some((_uid, save)) = self.imp().user_info_save.take() {
+            save();
+        }
+    }
+
+    /// Close the user-info sidebar panel: flush any pending save, then
+    /// switch the sidebar back to the room list. Clears the panel's
+    /// child so references to the previous user's widgets are dropped
+    /// (the widgets stop receiving keystrokes immediately).
+    pub fn close_user_info_panel(&self) {
+        self.run_user_info_save();
+        if let Some(stack) = self.imp().sidebar_stack.get() {
+            stack.set_visible_child_name("rooms");
+        }
+        if let Some(scroll) = self.imp().user_info_container.get() {
+            scroll.set_child(None::<&gtk::Widget>);
+        }
     }
 
     fn show_new_dm_bar(&self) {
