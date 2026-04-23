@@ -87,7 +87,7 @@
       "build-commands": [
         "mkdir -p .cargo",
         "printf '[source.crates-io]\\nreplace-with = \"vendored-sources\"\\n\\n[source.vendored-sources]\\ndirectory = \"/run/build/hikyaku/cargo/vendor\"\\n' > .cargo/config.toml",
-        "cargo build --release --locked --no-default-features --features rolodex,pinning,motd,ai-flatpak,community-health,devel",
+        "cargo build --release --locked --no-default-features --features rolodex,pinning,motd,ai-flatpak,community-health,community-safety,media-rewrite,devel",
         "install -Dm755 target/release/hikyaku /app/bin/hikyaku",
         "install -Dm644 data/me.ramkrishna.hikyaku.desktop /app/share/applications/me.ramkrishna.hikyaku.desktop",
         "install -Dm644 data/me.ramkrishna.hikyaku.metainfo.xml /app/share/metainfo/me.ramkrishna.hikyaku.metainfo.xml",
