@@ -919,26 +919,38 @@ fn clear_body_box(body_box: &gtk::Box) {
     }
 }
 
-/// Extract a Matrix room ID or alias from a matrix.to or matrix: URI.
-/// Returns `Some("!roomid:server")`, `Some("#alias:server")`, or `None`.
+/// Extract a Matrix identifier (room ID, alias, or user ID) from a
+/// matrix.to or matrix: URI. Returns one of:
+///   * `Some("!roomid:server")`  — room by id
+///   * `Some("#alias:server")`   — room by alias
+///   * `Some("@user:server")`    — user by mxid
+///   * `None`                    — not recognisable
+///
+/// Callers that need to distinguish use the first character: `!`/`#`
+/// are rooms (join or navigate) and `@` is a user (open info dialog).
 pub(crate) fn parse_matrix_uri(uri: &str) -> Option<String> {
-    // https://matrix.to/#/!roomid:server or https://matrix.to/#/#alias:server
+    // https://matrix.to/#/!roomid:server, #alias:server, or @user:server
     if let Some(rest) = uri.strip_prefix("https://matrix.to/#/") {
-        // URL-decode the first component.
         let id = rest.split('?').next().unwrap_or(rest);
         let id = percent_decode(id);
-        if id.starts_with('!') || id.starts_with('#') {
+        if id.starts_with('!') || id.starts_with('#') || id.starts_with('@') {
             return Some(id);
         }
     }
-    // matrix:r/alias.server  or  matrix:roomid/!room:server
+    // matrix:r/alias.server  — room alias
     if let Some(rest) = uri.strip_prefix("matrix:r/") {
         let alias = rest.split('?').next().unwrap_or(rest);
         return Some(format!("#{}", alias.replacen('/', ":", 1)));
     }
+    // matrix:roomid/!room:server — room id
     if let Some(rest) = uri.strip_prefix("matrix:roomid/") {
         let id = rest.split('?').next().unwrap_or(rest);
         return Some(format!("!{}", id.replacen('/', ":", 1)));
+    }
+    // matrix:u/user/server — user by mxid
+    if let Some(rest) = uri.strip_prefix("matrix:u/") {
+        let uid = rest.split('?').next().unwrap_or(rest);
+        return Some(format!("@{}", uid.replacen('/', ":", 1)));
     }
     None
 }

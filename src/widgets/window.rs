@@ -4083,6 +4083,14 @@ impl MxWindow {
     /// If the room is already joined, opens it directly.
     /// Otherwise shows the join bar pre-filled with the identifier.
     pub fn handle_matrix_link(&self, identifier: &str) {
+        // User-id form (@user:server) — open the user-info dialog
+        // instead of trying to join it as a room. Matrix URIs returned
+        // by parse_matrix_uri are prefixed with @, !, or # so the
+        // first character reliably disambiguates the three kinds.
+        if identifier.starts_with('@') {
+            self.show_user_info_dialog(identifier);
+            return;
+        }
         let imp = self.imp();
         // Check if we already have this room.
         let registry = imp.room_list_view.imp().room_registry.borrow();
