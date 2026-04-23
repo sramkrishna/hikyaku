@@ -368,8 +368,8 @@ fn linkify_http(text: &str) -> String {
             let pill_esc = glib::markup_escape_text(&pill_text);
             result.push_str(&format!(
                 "<a href=\"{url}\"><span \
-                    foreground=\"#1c71d8\" \
-                    background=\"#3584e466\" \
+                    foreground=\"#ffffff\" \
+                    background=\"#26a269\" \
                     weight=\"bold\" \
                     underline=\"none\">\u{a0}{pill_esc}\u{a0}</span></a>",
             ));
@@ -571,19 +571,15 @@ fn linkify_aliases(text: &str) -> String {
         let href = format!("https://matrix.to/#/%23{}", &text[local_start..k]);
         // Pango can't apply widget CSS to a markup span (no class selectors)
         // and span attributes don't support padding/radius, so we fake a
-        // pill visually:
-        //   * NBSPs on each side inside the span → horizontal breathing
-        //     room without allowing the pill to wrap at the seams.
-        //   * Bold weight + stronger accent foreground so the label reads
-        //     as a distinct token rather than a link in the prose.
-        //   * Background alpha bumped to ~0.40 so the pill actually shows
-        //     against both light and dark themes (the earlier ~0.14 alpha
-        //     was invisible on the default dark theme).
-        //   * underline="none" keeps the link decoration off.
+        // pill visually with an opaque green fill and white bold text —
+        // the solid background means the pill reads the same against
+        // both the light and dark Adwaita themes without needing a
+        // theme-aware rerender. NBSPs on each side give horizontal
+        // breathing room; underline="none" drops the link decoration.
         result.push_str(&format!(
             "<a href=\"{href}\"><span \
-                foreground=\"#1c71d8\" \
-                background=\"#3584e466\" \
+                foreground=\"#ffffff\" \
+                background=\"#26a269\" \
                 weight=\"bold\" \
                 underline=\"none\">\u{a0}{alias}\u{a0}</span></a>",
         ));
@@ -664,8 +660,8 @@ mod tests {
         // Pill text replaces the long URL with a short label.
         assert!(out.contains("message in !DFxCKzUpzBjtSORjyb:matrix.org"),
             "pill text missing: {out}");
-        // Pill styling applied.
-        assert!(out.contains("background=\"#3584e466\""), "pill style missing: {out}");
+        // Pill styling applied (green fill, white bold text).
+        assert!(out.contains("background=\"#26a269\""), "pill style missing: {out}");
         // Raw URL does not appear in the rendered body.
         assert!(!out.contains(">https://matrix.to"), "raw URL leaked: {out}");
     }
@@ -691,7 +687,7 @@ mod tests {
         // Non-matrix.to URLs should still render as normal inline links.
         let out = linkify_urls("see https://example.com here");
         assert!(out.contains("<a href=\"https://example.com\">https://example.com</a>"));
-        assert!(!out.contains("background=\"#3584e466\""), "plain URL got pill: {out}");
+        assert!(!out.contains("background=\"#26a269\""), "plain URL got pill: {out}");
     }
 
     #[test]
