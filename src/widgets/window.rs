@@ -2073,6 +2073,30 @@ impl MxWindow {
                     MatrixEvent::RoomAvatarReady { room_id, path } => {
                         room_list_view.set_room_avatar_path(&room_id, &path);
                     }
+                    MatrixEvent::OwnAvatarUpdated { success, new_mxc, error } => {
+                        if success {
+                            if new_mxc.is_empty() {
+                                toast(&toast_overlay, "Profile picture removed");
+                            } else {
+                                toast(&toast_overlay, "Profile picture updated");
+                                // Fetch the new avatar into our local cache so
+                                // Preferences re-opens with the fresh image.
+                                if let Some(tx) = window.imp().command_tx.get().cloned() {
+                                    let uid = window.imp().user_id.borrow().clone();
+                                    if !uid.is_empty() {
+                                        let mxc = new_mxc;
+                                        glib::spawn_future_local(async move {
+                                            let _ = tx.send(MatrixCommand::FetchAvatar {
+                                                user_id: uid, mxc_url: mxc,
+                                            }).await;
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            toast_error(&toast_overlay, "Could not update avatar", &error);
+                        }
+                    }
                     MatrixEvent::OlderMessages { room_id, messages, prev_batch_token } => {
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
@@ -6023,6 +6047,99 @@ impl MxWindow {
         let account_group = adw::PreferencesGroup::builder()
             .title("Account")
             .build();
+
+        // Avatar row — preview on the left, Change + Remove buttons on
+        // the right. Preview uses adw::Avatar which handles both the
+        // cached-image path (if we've downloaded the user's own avatar)
+        // and the initials-on-colour fallback when no image is known yet.
+        let my_user_id = self.imp().user_id.borrow().clone();
+        // Use the localpart (@alice:server → "alice") for initials when
+        // we don't have a display name at hand.
+        let initials_source = my_user_id
+            .trim_start_matches('@')
+            .split(':')
+            .next()
+            .unwrap_or(&my_user_id)
+            .to_string();
+        let avatar_preview = adw::Avatar::builder()
+            .size(48)
+            .text(&initials_source)
+            .show_initials(true)
+            .build();
+        if !my_user_id.is_empty() {
+            if let Some(path) = self.imp().avatar_cache.borrow().get(&my_user_id) {
+                if !path.is_empty() {
+                    if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
+                        avatar_preview.set_custom_image(Some(&tex));
+                    }
+                }
+            }
+        }
+
+        let avatar_row = adw::ActionRow::builder()
+            .title("Profile Picture")
+            .subtitle("PNG / JPEG / GIF / WebP, up to 8 MB")
+            .build();
+        avatar_row.add_prefix(&avatar_preview);
+
+        let change_avatar_btn = gtk::Button::builder()
+            .label("Change")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let remove_avatar_btn = gtk::Button::builder()
+            .label("Remove")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        avatar_row.add_suffix(&change_avatar_btn);
+        avatar_row.add_suffix(&remove_avatar_btn);
+        account_group.add(&avatar_row);
+
+        // Change-avatar click → file chooser → SetOwnAvatar command.
+        let tx_change = self.imp().command_tx.get().unwrap().clone();
+        let toast_change = self.imp().toast_overlay.clone();
+        let window_ref_avatar = self.downgrade();
+        change_avatar_btn.connect_clicked(move |_| {
+            let Some(win) = window_ref_avatar.upgrade() else { return };
+            let tx = tx_change.clone();
+            let overlay = toast_change.clone();
+            let image_filter = gtk::FileFilter::new();
+            image_filter.set_name(Some("Images"));
+            image_filter.add_mime_type("image/png");
+            image_filter.add_mime_type("image/jpeg");
+            image_filter.add_mime_type("image/gif");
+            image_filter.add_mime_type("image/webp");
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&image_filter);
+            let file_dialog = gtk::FileDialog::builder()
+                .title("Choose a profile picture")
+                .filters(&filters)
+                .build();
+            file_dialog.open(Some(&win), gio::Cancellable::NONE, move |result| {
+                let Ok(file) = result else { return };
+                let Some(path) = file.path() else { return };
+                let Some(path_str) = path.to_str().map(|s| s.to_string()) else { return };
+                let tx_inner = tx.clone();
+                toast(&overlay, "Uploading avatar…");
+                glib::spawn_future_local(async move {
+                    let _ = tx_inner.send(MatrixCommand::SetOwnAvatar {
+                        file_path: Some(path_str),
+                    }).await;
+                });
+            });
+        });
+
+        // Remove-avatar click → SetOwnAvatar { None }.
+        let tx_remove = self.imp().command_tx.get().unwrap().clone();
+        let toast_remove = self.imp().toast_overlay.clone();
+        remove_avatar_btn.connect_clicked(move |_| {
+            let tx = tx_remove.clone();
+            toast(&toast_remove, "Removing avatar…");
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::SetOwnAvatar { file_path: None }).await;
+            });
+        });
 
         let logout_row = adw::ActionRow::builder()
             .title("Log Out")

@@ -280,6 +280,10 @@ pub enum MatrixEvent {
     AvatarReady { user_id: String, path: String },
     /// A room avatar has been downloaded and is available at `path`.
     RoomAvatarReady { room_id: String, path: String },
+    /// Result of SetOwnAvatar. On success, `new_mxc` holds the mxc://
+    /// URI the homeserver assigned (empty string if the avatar was
+    /// removed). On failure, `error` holds a user-facing message.
+    OwnAvatarUpdated { success: bool, new_mxc: String, error: String },
     /// A message we sent has been confirmed by the server with a real event_id.
     MessageSent { room_id: String, echo_body: String, event_id: String },
     /// Reactions on a message were updated.
@@ -442,6 +446,10 @@ pub enum MatrixCommand {
     EditMessage { room_id: String, event_id: String, new_body: String, new_formatted_body: Option<String> },
     /// Upload and send a media file.
     SendMedia { room_id: String, file_path: String },
+    /// Set the current user's Matrix profile avatar. `None` removes it.
+    /// `Some(path)` uploads the file to the homeserver's media
+    /// repository and sets account avatar_url to the returned mxc.
+    SetOwnAvatar { file_path: Option<String> },
     /// Download media and open with system viewer.
     DownloadMedia { url: String, filename: String, source_json: String },
     /// Fetch and cache a member's avatar. No-op if already cached on disk.
@@ -1217,6 +1225,9 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::SendMedia { room_id, file_path }) => {
                         handle_send_media(&client, &event_tx, &room_id, &file_path).await;
+                    }
+                    Ok(MatrixCommand::SetOwnAvatar { file_path }) => {
+                        handle_set_own_avatar(&client, &event_tx, file_path).await;
                     }
                     Ok(MatrixCommand::FetchRoomAvatar { room_id, mxc_url }) => {
                         let bg_client = client.clone();
@@ -4324,6 +4335,117 @@ async fn handle_send_media(
     // send_attachment handles all media types based on MIME.
     if let Err(e) = room.send_attachment(&filename, &mime_type, data, Default::default()).await {
         tracing::error!("Failed to send attachment: {e}");
+    }
+}
+
+/// Set or clear the current user's profile avatar.
+///
+/// `file_path = Some(path)` uploads the image to the homeserver's media
+/// repository (which on some instances — notably the GNOME one — may
+/// reject media uploads entirely) and then writes the returned mxc://
+/// URI to account avatar_url. `None` clears the avatar without
+/// touching the media repository.
+async fn handle_set_own_avatar(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    file_path: Option<String>,
+) {
+    use std::path::Path;
+
+    let account = client.account();
+
+    // Remove path: no upload, just clear.
+    let Some(file_path) = file_path else {
+        let result = account.set_avatar_url(None).await;
+        match result {
+            Ok(()) => {
+                let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                    success: true, new_mxc: String::new(), error: String::new(),
+                }).await;
+            }
+            Err(e) => {
+                let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                    success: false, new_mxc: String::new(), error: e.to_string(),
+                }).await;
+            }
+        }
+        return;
+    };
+
+    let path = Path::new(&file_path);
+    let data = match std::fs::read(&file_path) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                success: false,
+                new_mxc: String::new(),
+                error: format!("Could not read file: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    // 8 MB cap — most homeservers set the upload limit around 10–50 MB,
+    // but avatars rarely need more than a few hundred KB. Refuse
+    // here rather than let the server return a cryptic failure.
+    const MAX_AVATAR_BYTES: usize = 8 * 1024 * 1024;
+    if data.len() > MAX_AVATAR_BYTES {
+        let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+            success: false,
+            new_mxc: String::new(),
+            error: format!("Avatar is too large ({} MB). Pick a smaller image.",
+                data.len() / (1024 * 1024)),
+        }).await;
+        return;
+    }
+
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => {
+            let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                success: false,
+                new_mxc: String::new(),
+                error: "Avatar must be PNG, JPEG, GIF, or WebP.".to_string(),
+            }).await;
+            return;
+        }
+    };
+    let mime_type: mime::Mime = mime.parse().unwrap_or(mime::IMAGE_JPEG);
+
+    // Upload to the homeserver's media repo. GNOME's instance refuses
+    // this with M_FORBIDDEN — surface that verbatim so the user knows
+    // it's a server-side policy and not a client bug.
+    let response = match client.media().upload(&mime_type, data, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                success: false,
+                new_mxc: String::new(),
+                error: format!("Upload failed: {e}"),
+            }).await;
+            return;
+        }
+    };
+    let mxc_str = response.content_uri.to_string();
+    let mxc_ref = <&matrix_sdk::ruma::MxcUri>::try_from(mxc_str.as_str()).ok();
+
+    if let Some(uri) = mxc_ref {
+        match account.set_avatar_url(Some(uri)).await {
+            Ok(()) => {
+                let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                    success: true, new_mxc: mxc_str, error: String::new(),
+                }).await;
+            }
+            Err(e) => {
+                let _ = event_tx.send(MatrixEvent::OwnAvatarUpdated {
+                    success: false, new_mxc: String::new(),
+                    error: format!("Profile update failed: {e}"),
+                }).await;
+            }
+        }
     }
 }
 
