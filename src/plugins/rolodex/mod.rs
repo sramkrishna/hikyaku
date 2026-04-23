@@ -4,7 +4,9 @@
 // @-completion in the message input, and will eventually support
 // a full-text search index.
 //
-// Storage: ~/.local/share/hikyaku/rolodex.json
+// Storage: $XDG_DATA_HOME/hikyaku/rolodex.json
+// (~/.local/share/hikyaku/rolodex.json natively, or
+// ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/rolodex.json in Flatpak)
 // Feature: "rolodex"
 
 use serde::{Deserialize, Serialize};

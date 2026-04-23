@@ -5,7 +5,9 @@
 //   - Otherwise → a changed-topic icon appears on the room row
 //     in the sidebar until they visit the room.
 //
-// Storage: ~/.local/share/hikyaku/motd_seen.json
+// Storage: $XDG_DATA_HOME/hikyaku/motd_seen.json
+// (~/.local/share/hikyaku/motd_seen.json natively, or
+// ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/motd_seen.json in Flatpak)
 // Feature: "motd"
 
 use std::collections::HashMap;

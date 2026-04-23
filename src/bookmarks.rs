@@ -1,8 +1,10 @@
 // Local message bookmark store.
 //
 // Bookmarks are personal "save for later" pins on individual messages.
-// They live in ~/.local/share/hikyaku/bookmarks.json and are never
-// sent to the Matrix server.
+// They live under $XDG_DATA_HOME/hikyaku/bookmarks.json (that is,
+// ~/.local/share/hikyaku/bookmarks.json natively or
+// ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/bookmarks.json inside
+// the Flatpak sandbox) and are never sent to the Matrix server.
 
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};

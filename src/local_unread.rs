@@ -23,7 +23,9 @@
 //
 // Persistence
 // ───────────
-// ~/.local/share/hikyaku/unread.db
+// $XDG_DATA_HOME/hikyaku/unread.db
+// (~/.local/share/hikyaku/unread.db natively,
+//  ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/unread.db in Flatpak)
 //
 //   local_unread(room_id TEXT PRIMARY KEY, unread INTEGER, highlights INTEGER)
 //

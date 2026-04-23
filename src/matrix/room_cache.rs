@@ -2,7 +2,9 @@
 //
 // Storage layout
 // ──────────────
-// ~/.local/share/hikyaku/timeline/<sanitised_room_id>.json
+// $XDG_DATA_HOME/hikyaku/timeline/<sanitised_room_id>.json
+// (~/.local/share/hikyaku/... natively; in Flatpak this resolves to
+//  ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/timeline/...)
 //
 //   Each file is a JSON object:
 //     { "messages": [...], "prev_batch_token": "t123..." }

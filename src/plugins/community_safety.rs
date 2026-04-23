@@ -2,8 +2,11 @@
 //
 // Tracks users the local user has marked as problematic (anti-trans,
 // racist, harassing, etc.) so their messages get a visible amber pill
-// next to the sender name. Stored in a JSON file at
-// ~/.local/share/hikyaku/flagged_users.json; never sent to Matrix.
+// next to the sender name. Stored as JSON at
+//   $XDG_DATA_HOME/hikyaku/flagged_users.json
+// which resolves to ~/.local/share/hikyaku/flagged_users.json on a
+// native install and ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/
+// flagged_users.json inside the Flatpak sandbox. Never sent to Matrix.
 //
 // v1 is deliberately local-first:
 //   * No outgoing network traffic. Nothing is shared unless the user

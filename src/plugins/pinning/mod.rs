@@ -4,7 +4,9 @@
 // locally only — they are never synced to the Matrix server and are
 // invisible to other room members.
 //
-// Storage: ~/.local/share/hikyaku/pinned_messages.json
+// Storage: $XDG_DATA_HOME/hikyaku/pinned_messages.json
+// (~/.local/share/hikyaku/pinned_messages.json natively, or
+// ~/.var/app/me.ramkrishna.hikyaku/data/hikyaku/pinned_messages.json in Flatpak)
 // Feature: "pinning"
 
 #![allow(dead_code)]
