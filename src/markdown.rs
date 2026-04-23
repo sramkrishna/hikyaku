@@ -358,11 +358,106 @@ fn linkify_http(text: &str) -> String {
             .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
             .unwrap_or(candidate.len());
         let url = &candidate[..url_end];
-        result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
+        // matrix.to permalinks get the same pill styling as bare #alias
+        // mentions — otherwise a 90-character event URL wraps across
+        // four lines and buries the prose around it. Pill text is the
+        // friendly short form (alias, room id, or "message link");
+        // href stays the full URL so the existing matrix-uri click
+        // handler can route it.
+        if let Some(pill_text) = matrix_to_pill_text(url) {
+            let pill_esc = glib::markup_escape_text(&pill_text);
+            result.push_str(&format!(
+                "<a href=\"{url}\"><span \
+                    foreground=\"#1c71d8\" \
+                    background=\"#3584e466\" \
+                    weight=\"bold\" \
+                    underline=\"none\">\u{a0}{pill_esc}\u{a0}</span></a>",
+            ));
+        } else {
+            result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
+        }
         rest = &candidate[url_end..];
     }
     result.push_str(rest);
     result
+}
+
+thread_local! {
+    /// Optional room-name resolver: given a room id (`!abc:server`) or
+    /// alias (`#alias:server`), return the room's display name if the
+    /// local user is a member. Set once by the window at startup (after
+    /// the RoomListView's room_registry is populated) so matrix.to pill
+    /// text can show *where* the link goes instead of just the opaque
+    /// room id. Synchronous, read-only — must not do I/O.
+    static ROOM_NAME_RESOLVER: std::cell::RefCell<
+        Option<Box<dyn Fn(&str) -> Option<String>>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Install the room-name resolver for this thread. Called from the
+/// GTK main thread after the room registry is live. Only one resolver
+/// per thread; a second call replaces the first.
+pub fn set_room_name_resolver<F>(f: F)
+where
+    F: Fn(&str) -> Option<String> + 'static,
+{
+    ROOM_NAME_RESOLVER.with(|cell| *cell.borrow_mut() = Some(Box::new(f)));
+}
+
+fn resolve_room_name(room_id_or_alias: &str) -> Option<String> {
+    ROOM_NAME_RESOLVER.with(|cell| {
+        cell.borrow().as_ref().and_then(|f| f(room_id_or_alias))
+    })
+}
+
+/// Return a compact, human-readable label for a matrix.to URL — used as
+/// the pill text when the URL appears in a message body. Returns None
+/// for non-matrix.to URLs so the caller falls back to the raw href.
+///
+/// Shape decisions (best effort, with the resolver when available):
+///   * event link    → `🔗 <Room Name>` when known, else `🔗 <room-id>`
+///   * room-only     → `# <Room Name>` when known, else `#alias:server`
+///                     / `!id:server`
+///   * user link     → `@user:server`
+/// The leading glyph distinguishes the pill shape at a glance without
+/// needing to read the full text.
+fn matrix_to_pill_text(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://matrix.to/#/")?;
+    // Drop any `?via=` query — it never affects the display form.
+    let path = rest.split('?').next().unwrap_or(rest);
+    // Split on first `/` to separate room from optional event id.
+    let (room_enc, event) = match path.split_once('/') {
+        Some((r, e)) => (r, Some(e)),
+        None => (path, None),
+    };
+    // Decode percent-encoded `!` and `#` (other bytes are unlikely in a
+    // room id / alias, so a minimal decoder is enough).
+    let room = room_enc
+        .replace("%21", "!")
+        .replace("%23", "#");
+    // User link: the whole URL is `@user:server`, no event suffix.
+    if room.starts_with('@') && event.is_none() {
+        return Some(room);
+    }
+    // Reject URLs whose room part isn't a room id or alias — we don't
+    // want to pill arbitrary matrix.to paths we don't recognise.
+    if !(room.starts_with('#') || room.starts_with('!')) {
+        return None;
+    }
+    let resolved = resolve_room_name(&room);
+    // Room-only link → resolved name if we have it, else the raw id.
+    if event.is_none() || event == Some("") {
+        return Some(match resolved {
+            Some(name) => format!("# {name}"),
+            None => room,
+        });
+    }
+    // Event link → point at a specific message. Lead with 🔗 so the
+    // pill reads "jump to a message" rather than "room link".
+    Some(match resolved {
+        Some(name) => format!("\u{1f517} {name}"),
+        None => format!("\u{1f517} message in {room}"),
+    })
 }
 
 /// Detect Matrix room aliases (#name:server.tld) in Pango-escaped text and
@@ -381,10 +476,29 @@ fn linkify_aliases(text: &str) -> String {
     let mut result = String::with_capacity(text.len() + 32);
     let mut i = 0;
     let mut in_tag = false;
+    // Depth counter for `<a>...</a>` nesting. linkify_http runs before us
+    // and may have produced an anchor whose *display* text contains a
+    // literal `#alias:server` (e.g. a matrix.to pill decoded from `%23`).
+    // We must not re-wrap that text in another anchor, so skip alias
+    // matching while anchor_depth > 0.
+    let mut anchor_depth: i32 = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'<' {
             in_tag = true;
+            // Opening anchor: `<a ` or `<a>`.
+            if bytes.get(i + 1) == Some(&b'a')
+                && matches!(bytes.get(i + 2), Some(b' ') | Some(b'>'))
+            {
+                anchor_depth += 1;
+            }
+            // Closing anchor: `</a>`.
+            if bytes.get(i + 1) == Some(&b'/')
+                && bytes.get(i + 2) == Some(&b'a')
+                && bytes.get(i + 3) == Some(&b'>')
+            {
+                anchor_depth -= 1;
+            }
             result.push(b as char);
             i += 1;
             continue;
@@ -395,7 +509,7 @@ fn linkify_aliases(text: &str) -> String {
             i += 1;
             continue;
         }
-        if in_tag || b != b'#' {
+        if in_tag || anchor_depth > 0 || b != b'#' {
             // push this byte verbatim; we're copying ASCII directly and
             // any multi-byte UTF-8 content flows through unmodified via
             // pushing raw bytes … but push_str from the slice is simpler
@@ -404,7 +518,11 @@ fn linkify_aliases(text: &str) -> String {
             while i < bytes.len() {
                 let c = bytes[i];
                 if c == b'<' || c == b'>' { break; }
-                if !in_tag && c == b'#' { break; }
+                // Only break on `#` when we'd actually try to alias-match
+                // it — i.e. outside both raw tags and anchor contents.
+                // Breaking inside an anchor would stall the outer loop
+                // (zero-byte copy, same byte considered again → hang).
+                if !in_tag && anchor_depth == 0 && c == b'#' { break; }
                 i += 1;
             }
             result.push_str(&text[start..i]);
@@ -535,6 +653,45 @@ mod tests {
     fn test_linkify_urls_basic() {
         let out = linkify_urls("see https://example.com here");
         assert!(out.contains("<a href=\"https://example.com\">https://example.com</a>"));
+    }
+
+    #[test]
+    fn test_linkify_matrix_to_event_link_becomes_pill() {
+        let url = "https://matrix.to/#/!DFxCKzUpzBjtSORjyb:matrix.org/$abc";
+        let out = linkify_urls(&format!("see {url} please"));
+        // href stays intact so the existing matrix-uri router fires on click.
+        assert!(out.contains(&format!("<a href=\"{url}\">")), "href missing: {out}");
+        // Pill text replaces the long URL with a short label.
+        assert!(out.contains("message in !DFxCKzUpzBjtSORjyb:matrix.org"),
+            "pill text missing: {out}");
+        // Pill styling applied.
+        assert!(out.contains("background=\"#3584e466\""), "pill style missing: {out}");
+        // Raw URL does not appear in the rendered body.
+        assert!(!out.contains(">https://matrix.to"), "raw URL leaked: {out}");
+    }
+
+    #[test]
+    fn test_linkify_matrix_to_room_alias_becomes_pill() {
+        let url = "https://matrix.to/#/%23room:example.org";
+        let out = linkify_urls(&format!("go to {url}"));
+        assert!(out.contains("#room:example.org\u{a0}</span></a>"),
+            "alias pill text missing: {out}");
+    }
+
+    #[test]
+    fn test_linkify_matrix_to_user_link_becomes_pill() {
+        let url = "https://matrix.to/#/@alice:example.org";
+        let out = linkify_urls(&format!("ping {url}"));
+        assert!(out.contains("@alice:example.org\u{a0}</span></a>"),
+            "user pill text missing: {out}");
+    }
+
+    #[test]
+    fn test_linkify_plain_url_stays_plain() {
+        // Non-matrix.to URLs should still render as normal inline links.
+        let out = linkify_urls("see https://example.com here");
+        assert!(out.contains("<a href=\"https://example.com\">https://example.com</a>"));
+        assert!(!out.contains("background=\"#3584e466\""), "plain URL got pill: {out}");
     }
 
     #[test]
