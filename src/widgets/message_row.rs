@@ -1121,18 +1121,20 @@ impl MessageRow {
         };
         if entry.is_flagged() {
             let cat_text = category_label(&entry.category);
-            let cat_esc = glib::markup_escape_text(cat_text);
+            // Keep the visible glyph privacy-friendly: just a coloured
+            // shape, never the category label. Category text only shows
+            // in the tooltip so it doesn't leak into screenshots.
             let (markup, prefix) = match entry.effective_severity() {
                 SEVERITY_NOTE => (
-                    format!("<span foreground=\"#f5c211\" size=\"smaller\"> • {cat_esc} </span>"),
+                    "<span foreground=\"#f5c211\"> • </span>".to_string(),
                     "Noted",
                 ),
                 SEVERITY_WARNING => (
-                    format!("<span foreground=\"#ffffff\" background=\"#e01b24\"> ⛔ {cat_esc} </span>"),
+                    "<span foreground=\"#e01b24\"> ● </span>".to_string(),
                     "Warning",
                 ),
                 _ => (
-                    format!("<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {cat_esc} </span>"),
+                    "<span foreground=\"#e5a50a\"> ⚠ </span>".to_string(),
                     "Caution",
                 ),
             };
@@ -1452,22 +1454,23 @@ impl MessageRow {
             } else if let Some(entry) = FLAGGED_STORE.get(&sender_id) {
                 if entry.is_flagged() {
                     let label = category_label(&entry.category);
-                    let label_escaped = glib::markup_escape_text(label);
+                    // Visible glyph only — category text lives in the
+                    // tooltip so screenshots don't leak it.
                     let (markup, tooltip_prefix) = match entry.effective_severity() {
                         SEVERITY_NOTE => (
-                            format!("<span foreground=\"#f5c211\" size=\"smaller\"> • {label_escaped} </span>"),
+                            "<span foreground=\"#f5c211\"> • </span>",
                             "Noted",
                         ),
                         SEVERITY_WARNING => (
-                            format!("<span foreground=\"#ffffff\" background=\"#e01b24\"> ⛔ {label_escaped} </span>"),
+                            "<span foreground=\"#e01b24\"> ● </span>",
                             "Warning",
                         ),
                         _ /* SEVERITY_CAUTION and any out-of-range */ => (
-                            format!("<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {label_escaped} </span>"),
+                            "<span foreground=\"#e5a50a\"> ⚠ </span>",
                             "Caution",
                         ),
                     };
-                    imp.sender_flag_label.set_markup(&markup);
+                    imp.sender_flag_label.set_markup(markup);
                     let tooltip = if entry.reason.is_empty() {
                         format!("{tooltip_prefix}: {label}")
                     } else {
