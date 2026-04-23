@@ -706,25 +706,21 @@ impl MxWindow {
         let _ = imp.command_tx.set(command_tx.clone());
         let _ = imp.timeline_cache.set(timeline_cache);
 
-        // Install a synchronous room-name resolver so matrix.to pills
-        // in message bodies can show "# Room Name" / "🔗 Room Name"
-        // instead of the opaque `!id:server`. Reads from the live
-        // room_registry — rooms the local user is a member of.
+        // Prime the global room-name cache with any rooms already in
+        // the registry at startup. Subsequent refreshes update the
+        // cache from RoomListView::set_rooms. The cache is read from
+        // both the GTK thread and the markup worker thread, so every
+        // matrix.to pill — whether rendered synchronously or inside a
+        // formatted_body HTML parse — can show "# Room Name" instead
+        // of the opaque `!id:server`.
         {
-            let rlv = imp.room_list_view.clone();
-            crate::markdown::set_room_name_resolver(move |room_id_or_alias| {
-                // Only resolves room ids (`!…:server`) — RoomObject
-                // doesn't carry the canonical alias today, so aliases
-                // in matrix.to links fall through to the raw-id fallback.
-                // Share links generated from within the app always use
-                // the room id form so the common case is covered.
-                let registry = rlv.imp().room_registry.borrow();
-                if let Some(obj) = registry.get(room_id_or_alias) {
-                    let name = obj.name();
-                    if !name.is_empty() { return Some(name.to_string()); }
+            let registry = imp.room_list_view.imp().room_registry.borrow();
+            for (rid, obj) in registry.iter() {
+                let name = obj.name();
+                if !name.is_empty() {
+                    crate::markdown::set_room_name(rid, &name);
                 }
-                None
-            });
+            }
         }
 
         // Load persisted local unread counts, then connect broker → room list.

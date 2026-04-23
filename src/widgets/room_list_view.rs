@@ -1118,6 +1118,12 @@ impl RoomListView {
                     // was ~2 360 spurious notifications per sync, blocking the
                     // GTK main thread for ~2 s in debug builds.
                     if obj.name() != r.name       { obj.set_name(r.name.as_str()); }
+                    // Keep the global markdown pill-resolver cache fresh
+                    // so matrix.to links in message bodies render with
+                    // the room's display name (readable across threads).
+                    if !r.name.is_empty() {
+                        crate::markdown::set_room_name(&r.room_id, &r.name);
+                    }
                     if obj.unread_count()   != new_unread { obj.set_unread_count(new_unread); }
                     if obj.highlight_count()!= new_hl     { obj.set_highlight_count(new_hl); }
                     if obj.is_pinned()      != r.is_pinned     { obj.set_is_pinned(r.is_pinned); }
@@ -1127,6 +1133,9 @@ impl RoomListView {
                     if obj.last_activity_ts()!= r.last_activity_ts { obj.set_last_activity_ts(r.last_activity_ts); }
                     if obj.avatar_url()     != r.avatar_url   { obj.set_avatar_url(r.avatar_url.as_str()); }
                 } else {
+                    if !r.name.is_empty() {
+                        crate::markdown::set_room_name(&r.room_id, &r.name);
+                    }
                     registry.insert(r.room_id.clone(), Self::room_to_obj(r));
                 }
             }

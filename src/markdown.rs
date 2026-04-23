@@ -382,32 +382,31 @@ fn linkify_http(text: &str) -> String {
     result
 }
 
-thread_local! {
-    /// Optional room-name resolver: given a room id (`!abc:server`) or
-    /// alias (`#alias:server`), return the room's display name if the
-    /// local user is a member. Set once by the window at startup (after
-    /// the RoomListView's room_registry is populated) so matrix.to pill
-    /// text can show *where* the link goes instead of just the opaque
-    /// room id. Synchronous, read-only — must not do I/O.
-    static ROOM_NAME_RESOLVER: std::cell::RefCell<
-        Option<Box<dyn Fn(&str) -> Option<String>>>
-    > = const { std::cell::RefCell::new(None) };
-}
+/// Global room id → display name cache. Populated from the GTK thread
+/// whenever the room list is refreshed; read from any thread (including
+/// the markup worker) when rendering matrix.to pills, so pill text
+/// shows the human-readable name regardless of which thread linkify
+/// is running on. Was a thread-local closure before — that broke when
+/// the markup worker (a dedicated parse thread) rendered formatted_body
+/// HTML, because its thread-local was always empty.
+static ROOM_NAME_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
-/// Install the room-name resolver for this thread. Called from the
-/// GTK main thread after the room registry is live. Only one resolver
-/// per thread; a second call replaces the first.
-pub fn set_room_name_resolver<F>(f: F)
-where
-    F: Fn(&str) -> Option<String> + 'static,
-{
-    ROOM_NAME_RESOLVER.with(|cell| *cell.borrow_mut() = Some(Box::new(f)));
+/// Insert or update the display name for a room id. Safe to call from
+/// any thread; intended to be driven from the GTK thread each time the
+/// room list refreshes. Empty names are ignored so an unresolved room
+/// doesn't overwrite a prior good name.
+pub fn set_room_name(room_id: &str, name: &str) {
+    if name.is_empty() { return; }
+    if let Ok(mut map) = ROOM_NAME_CACHE.write() {
+        map.insert(room_id.to_string(), name.to_string());
+    }
 }
 
 fn resolve_room_name(room_id_or_alias: &str) -> Option<String> {
-    ROOM_NAME_RESOLVER.with(|cell| {
-        cell.borrow().as_ref().and_then(|f| f(room_id_or_alias))
-    })
+    let map = ROOM_NAME_CACHE.read().ok()?;
+    map.get(room_id_or_alias).cloned()
 }
 
 /// Return a compact, human-readable label for a matrix.to URL — used as
@@ -445,18 +444,26 @@ fn matrix_to_pill_text(url: &str) -> Option<String> {
         return None;
     }
     let resolved = resolve_room_name(&room);
-    // Room-only link → resolved name if we have it, else the raw id.
+    // Room-only link → resolved name if we have it. If we can't
+    // resolve, only fall back to the raw id for an alias (`#name`) —
+    // those are human-readable on their own. For a raw room id
+    // (`!abc:server`) we'd rather not paste an opaque identifier, so
+    // show a generic "# external room" that still signals the shape.
     if event.is_none() || event == Some("") {
         return Some(match resolved {
             Some(name) => format!("# {name}"),
-            None => room,
+            None if room.starts_with('#') => room,
+            None => "# external room".to_string(),
         });
     }
     // Event link → point at a specific message. Lead with 🔗 so the
-    // pill reads "jump to a message" rather than "room link".
+    // pill reads "jump to a message" rather than "room link". When
+    // the room isn't in our cache (user isn't a member), avoid
+    // leaking the opaque id into the pill text — the full link is
+    // still in the href for power users.
     Some(match resolved {
         Some(name) => format!("\u{1f517} {name}"),
-        None => format!("\u{1f517} message in {room}"),
+        None => "\u{1f517} message".to_string(),
     })
 }
 
@@ -657,13 +664,26 @@ mod tests {
         let out = linkify_urls(&format!("see {url} please"));
         // href stays intact so the existing matrix-uri router fires on click.
         assert!(out.contains(&format!("<a href=\"{url}\">")), "href missing: {out}");
-        // Pill text replaces the long URL with a short label.
-        assert!(out.contains("message in !DFxCKzUpzBjtSORjyb:matrix.org"),
-            "pill text missing: {out}");
+        // Pill text replaces the long URL with a short label. When the
+        // room isn't in the cache we fall back to a generic "🔗 message"
+        // rather than leaking the opaque room id.
+        assert!(out.contains("\u{1f517} message"), "pill text missing: {out}");
         // Pill styling applied (green fill, white bold text).
         assert!(out.contains("background=\"#26a269\""), "pill style missing: {out}");
         // Raw URL does not appear in the rendered body.
         assert!(!out.contains(">https://matrix.to"), "raw URL leaked: {out}");
+        // Opaque room id must not appear in the pill text.
+        assert!(!out.contains(">!DFxCKzUpzBjtSORjyb"), "room id leaked: {out}");
+    }
+
+    #[test]
+    fn test_linkify_matrix_to_event_link_uses_cached_name() {
+        // With a cached room name, the pill reads "🔗 <Name>".
+        super::set_room_name("!cached:example.org", "My Room");
+        let url = "https://matrix.to/#/!cached:example.org/$abc";
+        let out = linkify_urls(&format!("see {url}"));
+        assert!(out.contains("\u{1f517} My Room"),
+            "cached room name missing: {out}");
     }
 
     #[test]
