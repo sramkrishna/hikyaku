@@ -376,37 +376,26 @@ fn linkify_http(text: &str) -> String {
     result
 }
 
-/// Pill colour for alias / matrix.to links. Kept in one place so the
-/// endcap caps and the pill body stay visually synced — the caps are
-/// the same green at *foreground* (no background), painted against
-/// the theme's default background, so they look like rounded ends
-/// glued onto the rectangular pill body.
+/// Pill colour for alias / matrix.to links.
 const PILL_BG: &str = "#26a269";
 const PILL_FG: &str = "#ffffff";
 
 /// Build the Pango markup for a pill-styled link. `href` is the URL
 /// the anchor should point at; `body_escaped` is the pill's visible
-/// text, already run through `markup_escape_text` when needed.
-///
-/// The pill is three spans wrapped in one `<a>`:
-///   * left cap — `◖` as green foreground on transparent
-///   * body    — white bold on green with NBSP padding
-///   * right cap — `◗` mirror of the left cap
-///
-/// Pango can't draw rounded corners on a span background (it paints
-/// a plain rectangle) and widget CSS doesn't reach into label text,
-/// so this is the closest approximation available in-line. The caps
-/// use geometric half-circle glyphs (U+25D6 / U+25D7), which most
-/// fonts render at roughly line height — alignment isn't pixel
-/// perfect but reads as "rounded pill" from a normal reading distance.
+/// text, already run through `markup_escape_text` when needed. The
+/// pill is a single span with NBSP padding on each side — we tried
+/// bolting half-circle endcaps on for a rounded look but the cap
+/// glyphs rendered at character-cell height, not the pill's line
+/// height, which produced the visible seam in Sriram's screenshot.
+/// Staying with a clean rectangle until we do the real widget-based
+/// renderer.
 fn render_pill_markup(href: &str, body_escaped: &str) -> String {
     format!(
-        "<a href=\"{href}\">\
-            <span foreground=\"{PILL_BG}\">\u{25d6}</span>\
-            <span foreground=\"{PILL_FG}\" background=\"{PILL_BG}\" \
-                  weight=\"bold\" underline=\"none\">\u{a0}{body_escaped}\u{a0}</span>\
-            <span foreground=\"{PILL_BG}\">\u{25d7}</span>\
-        </a>",
+        "<a href=\"{href}\"><span \
+            foreground=\"{PILL_FG}\" \
+            background=\"{PILL_BG}\" \
+            weight=\"bold\" \
+            underline=\"none\">\u{a0}{body_escaped}\u{a0}</span></a>",
     )
 }
 
@@ -479,14 +468,15 @@ fn matrix_to_pill_text(url: &str) -> Option<String> {
             None => "# external room".to_string(),
         });
     }
-    // Event link → point at a specific message. Lead with 🔗 so the
-    // pill reads "jump to a message" rather than "room link". When
-    // the room isn't in our cache (user isn't a member), avoid
-    // leaking the opaque id into the pill text — the full link is
-    // still in the href for power users.
+    // Event link → point at a specific message. Plain English reads
+    // clearer than an emoji prefix (and avoids the emoji-font fallback
+    // that coloured our 🔗 inconsistently inside the pill body). When
+    // the room isn't in our cache (user isn't a member), fall back to
+    // a generic label — the full URL is still in the href for power
+    // users who want to copy it.
     Some(match resolved {
-        Some(name) => format!("\u{1f517} {name}"),
-        None => "\u{1f517} message".to_string(),
+        Some(name) => format!("Comment linked to {name}"),
+        None => "Linked comment".to_string(),
     })
 }
 
@@ -674,10 +664,8 @@ mod tests {
         let out = linkify_urls(&format!("see {url} please"));
         // href stays intact so the existing matrix-uri router fires on click.
         assert!(out.contains(&format!("<a href=\"{url}\">")), "href missing: {out}");
-        // Pill text replaces the long URL with a short label. When the
-        // room isn't in the cache we fall back to a generic "🔗 message"
-        // rather than leaking the opaque room id.
-        assert!(out.contains("\u{1f517} message"), "pill text missing: {out}");
+        // Unknown room → generic "Linked comment" label, no raw id.
+        assert!(out.contains("Linked comment"), "fallback label missing: {out}");
         // Pill styling applied (green fill, white bold text).
         assert!(out.contains("background=\"#26a269\""), "pill style missing: {out}");
         // Raw URL does not appear in the rendered body.
@@ -688,11 +676,11 @@ mod tests {
 
     #[test]
     fn test_linkify_matrix_to_event_link_uses_cached_name() {
-        // With a cached room name, the pill reads "🔗 <Name>".
+        // With a cached room name, the pill reads "Comment linked to <Name>".
         super::set_room_name("!cached:example.org", "My Room");
         let url = "https://matrix.to/#/!cached:example.org/$abc";
         let out = linkify_urls(&format!("see {url}"));
-        assert!(out.contains("\u{1f517} My Room"),
+        assert!(out.contains("Comment linked to My Room"),
             "cached room name missing: {out}");
     }
 
@@ -732,13 +720,9 @@ mod tests {
         let out = linkify_urls("see #outreachy:gnome.org for info");
         assert!(out.contains("<a href=\"https://matrix.to/#/%23outreachy:gnome.org\">"),
             "anchor href missing: {out}");
-        // Alias text survives inside the pill body span, which ends
-        // before the right-side endcap.
-        assert!(out.contains("#outreachy:gnome.org\u{a0}</span>"),
-            "pill body span missing: {out}");
-        // Endcaps are present — left ◖ and right ◗ half-circles.
-        assert!(out.contains('\u{25d6}'), "left endcap missing: {out}");
-        assert!(out.contains('\u{25d7}'), "right endcap missing: {out}");
+        // Alias text survives inside the pill body span, padded with NBSPs.
+        assert!(out.contains("#outreachy:gnome.org\u{a0}</span></a>"),
+            "pill body missing: {out}");
     }
 
     #[test]
