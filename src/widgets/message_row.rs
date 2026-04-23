@@ -835,7 +835,13 @@ fn nick_color(user_id: &str) -> String {
         }
         let hash = user_id.bytes().fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
         let hue = (hash % 360) as f64;
-        let color = hsl_to_hex(hue, 0.65, 0.50);
+        // Saturation 0.55 + lightness 0.70 keeps every hue visible
+        // against the default dark Adwaita background — the previous
+        // L=0.50 produced near-black purples and muddy reds for some
+        // user ids. At L=0.70 the colours still carry enough weight
+        // on the light theme for sender-name emphasis without being
+        // washed out.
+        let color = hsl_to_hex(hue, 0.55, 0.70);
         c.insert(user_id.to_string(), color.clone());
         color
     })
