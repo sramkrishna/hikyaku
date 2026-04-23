@@ -450,6 +450,12 @@ pub enum MatrixCommand {
     /// `Some(path)` uploads the file to the homeserver's media
     /// repository and sets account avatar_url to the returned mxc.
     SetOwnAvatar { file_path: Option<String> },
+    /// Look up the signed-in user's current avatar via
+    /// `account.get_avatar_url()` and, if set, enqueue a download
+    /// through the same path as room-member avatars so the result
+    /// lands in `avatar_cache` for the Preferences preview and any
+    /// other UI that wants it. No-op when the account has no avatar.
+    FetchOwnAvatar,
     /// Download media and open with system viewer.
     DownloadMedia { url: String, filename: String, source_json: String },
     /// Fetch and cache a member's avatar. No-op if already cached on disk.
@@ -1228,6 +1234,23 @@ async fn matrix_task(
                     }
                     Ok(MatrixCommand::SetOwnAvatar { file_path }) => {
                         handle_set_own_avatar(&client, &event_tx, file_path).await;
+                    }
+                    Ok(MatrixCommand::FetchOwnAvatar) => {
+                        // Look up current avatar mxc and enqueue a
+                        // thumbnail fetch into avatar_cache. Fire and
+                        // forget on a tokio task so the main command
+                        // loop isn't blocked by the HTTP round-trip.
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let own_uid = bg_client.user_id()
+                                .map(|u| u.to_string()).unwrap_or_default();
+                            if own_uid.is_empty() { return; }
+                            let mxc_opt = bg_client.account().get_avatar_url().await.ok().flatten();
+                            let Some(mxc) = mxc_opt else { return };
+                            let _permit = AVATAR_PERMITS.acquire().await;
+                            handle_fetch_avatar(&bg_client, &bg_tx, &own_uid, mxc.as_str()).await;
+                        });
                     }
                     Ok(MatrixCommand::FetchRoomAvatar { room_id, mxc_url }) => {
                         let bg_client = client.clone();

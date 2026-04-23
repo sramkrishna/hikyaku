@@ -1720,6 +1720,16 @@ impl MxWindow {
                         tracing::info!("Logged in as {display_name} (from_registration={from_registration}, fresh={is_fresh_login})");
                         window.imp().user_id.replace(user_id.clone());
                         message_view.set_user_id(&user_id);
+                        // Warm the avatar cache with our own avatar so the
+                        // Preferences preview and any other self-avatar
+                        // surface shows the real image rather than falling
+                        // back to initials. Fire-and-forget; AvatarReady
+                        // lands in the handler below when the fetch returns.
+                        if let Some(tx) = window.imp().command_tx.get().cloned() {
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(MatrixCommand::FetchOwnAvatar).await;
+                            });
+                        }
                         let localpart = user_id
                             .strip_prefix('@')
                             .and_then(|s| s.split(':').next())
@@ -6183,6 +6193,16 @@ impl MxWindow {
         // the right. Preview uses adw::Avatar which handles both the
         // cached-image path (if we've downloaded the user's own avatar)
         // and the initials-on-colour fallback when no image is known yet.
+        //
+        // Proactively fetch the user's own avatar on every Preferences
+        // open. The cache is probably already warm from the LoginSuccess
+        // path, but firing here covers startup edge cases and pulls in a
+        // fresh image if the user updated their avatar on another client.
+        if let Some(tx) = self.imp().command_tx.get().cloned() {
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::FetchOwnAvatar).await;
+            });
+        }
         let my_user_id = self.imp().user_id.borrow().clone();
         // Use the localpart (@alice:server → "alice") for initials when
         // we don't have a display name at hand.
