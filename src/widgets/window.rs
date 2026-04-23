@@ -2064,7 +2064,11 @@ impl MxWindow {
                         }
                     }
                     MatrixEvent::AvatarReady { user_id, path } => {
-                        window.imp().avatar_cache.borrow_mut().insert(user_id, path);
+                        window.imp().avatar_cache.borrow_mut().insert(user_id.clone(), path.clone());
+                        // Update the visible nick-picker popover in place so
+                        // the avatar appears without requiring the user to
+                        // close and reopen the picker.
+                        window.imp().message_view.refresh_nick_avatar(&user_id, &path);
                     }
                     MatrixEvent::RoomAvatarReady { room_id, path } => {
                         room_list_view.set_room_avatar_path(&room_id, &path);

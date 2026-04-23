@@ -1897,6 +1897,36 @@ impl MessageView {
 
     /// Load bookmarked event IDs for `room_id` from the store into the in-memory set.
     /// Call after `set_messages` so rows are highlighted on the first bind pass.
+    /// Refresh the visible nick-picker popover's avatar widget for a
+    /// specific user id. Called by window.rs when a MatrixEvent::AvatarReady
+    /// arrives for a member whose row is currently in the popover — without
+    /// this, the user only sees the real avatar after closing and reopening
+    /// the popover (download is async; initial render uses the initials
+    /// fallback until the cache is populated).
+    pub fn refresh_nick_avatar(&self, user_id: &str, path: &str) {
+        let imp = self.imp();
+        if !imp.nick_popover.is_visible() { return; }
+        if user_id.is_empty() || path.is_empty() { return; }
+        let Ok(texture) = gtk::gdk::Texture::from_filename(path) else { return };
+        let mut child = imp.nick_list.first_child();
+        while let Some(node) = child {
+            let next = node.next_sibling();
+            if let Some(row) = node.downcast_ref::<gtk::ListBoxRow>() {
+                if row.widget_name().as_str() == user_id {
+                    if let Some(avatar) = row.child()
+                        .and_then(|c| c.downcast::<gtk::Box>().ok())
+                        .and_then(|b| b.first_child())
+                        .and_then(|c| c.downcast::<adw::Avatar>().ok())
+                    {
+                        avatar.set_custom_image(Some(&texture));
+                    }
+                    break;
+                }
+            }
+            child = next;
+        }
+    }
+
     pub fn load_bookmarks(&self, room_id: &str) {
         let _g = crate::perf::scope("load_bookmarks");
         let entries = crate::bookmarks::BOOKMARK_STORE.load();
