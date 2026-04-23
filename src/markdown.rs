@@ -366,13 +366,7 @@ fn linkify_http(text: &str) -> String {
         // handler can route it.
         if let Some(pill_text) = matrix_to_pill_text(url) {
             let pill_esc = glib::markup_escape_text(&pill_text);
-            result.push_str(&format!(
-                "<a href=\"{url}\"><span \
-                    foreground=\"#ffffff\" \
-                    background=\"#26a269\" \
-                    weight=\"bold\" \
-                    underline=\"none\">\u{a0}{pill_esc}\u{a0}</span></a>",
-            ));
+            result.push_str(&render_pill_markup(url, &pill_esc));
         } else {
             result.push_str(&format!("<a href=\"{url}\">{url}</a>"));
         }
@@ -380,6 +374,40 @@ fn linkify_http(text: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Pill colour for alias / matrix.to links. Kept in one place so the
+/// endcap caps and the pill body stay visually synced — the caps are
+/// the same green at *foreground* (no background), painted against
+/// the theme's default background, so they look like rounded ends
+/// glued onto the rectangular pill body.
+const PILL_BG: &str = "#26a269";
+const PILL_FG: &str = "#ffffff";
+
+/// Build the Pango markup for a pill-styled link. `href` is the URL
+/// the anchor should point at; `body_escaped` is the pill's visible
+/// text, already run through `markup_escape_text` when needed.
+///
+/// The pill is three spans wrapped in one `<a>`:
+///   * left cap — `◖` as green foreground on transparent
+///   * body    — white bold on green with NBSP padding
+///   * right cap — `◗` mirror of the left cap
+///
+/// Pango can't draw rounded corners on a span background (it paints
+/// a plain rectangle) and widget CSS doesn't reach into label text,
+/// so this is the closest approximation available in-line. The caps
+/// use geometric half-circle glyphs (U+25D6 / U+25D7), which most
+/// fonts render at roughly line height — alignment isn't pixel
+/// perfect but reads as "rounded pill" from a normal reading distance.
+fn render_pill_markup(href: &str, body_escaped: &str) -> String {
+    format!(
+        "<a href=\"{href}\">\
+            <span foreground=\"{PILL_BG}\">\u{25d6}</span>\
+            <span foreground=\"{PILL_FG}\" background=\"{PILL_BG}\" \
+                  weight=\"bold\" underline=\"none\">\u{a0}{body_escaped}\u{a0}</span>\
+            <span foreground=\"{PILL_BG}\">\u{25d7}</span>\
+        </a>",
+    )
 }
 
 /// Shim: room-name lookups now live in `crate::directory`. Kept here so
@@ -571,20 +599,7 @@ fn linkify_aliases(text: &str) -> String {
         let alias = &text[i..k]; // #local:server
         // Percent-encode the '#' for the matrix.to fragment.
         let href = format!("https://matrix.to/#/%23{}", &text[local_start..k]);
-        // Pango can't apply widget CSS to a markup span (no class selectors)
-        // and span attributes don't support padding/radius, so we fake a
-        // pill visually with an opaque green fill and white bold text —
-        // the solid background means the pill reads the same against
-        // both the light and dark Adwaita themes without needing a
-        // theme-aware rerender. NBSPs on each side give horizontal
-        // breathing room; underline="none" drops the link decoration.
-        result.push_str(&format!(
-            "<a href=\"{href}\"><span \
-                foreground=\"#ffffff\" \
-                background=\"#26a269\" \
-                weight=\"bold\" \
-                underline=\"none\">\u{a0}{alias}\u{a0}</span></a>",
-        ));
+        result.push_str(&render_pill_markup(&href, alias));
         i = k;
     }
     result
@@ -685,16 +700,16 @@ mod tests {
     fn test_linkify_matrix_to_room_alias_becomes_pill() {
         let url = "https://matrix.to/#/%23room:example.org";
         let out = linkify_urls(&format!("go to {url}"));
-        assert!(out.contains("#room:example.org\u{a0}</span></a>"),
-            "alias pill text missing: {out}");
+        assert!(out.contains("#room:example.org\u{a0}</span>"),
+            "alias pill body missing: {out}");
     }
 
     #[test]
     fn test_linkify_matrix_to_user_link_becomes_pill() {
         let url = "https://matrix.to/#/@alice:example.org";
         let out = linkify_urls(&format!("ping {url}"));
-        assert!(out.contains("@alice:example.org\u{a0}</span></a>"),
-            "user pill text missing: {out}");
+        assert!(out.contains("@alice:example.org\u{a0}</span>"),
+            "user pill body missing: {out}");
     }
 
     #[test]
@@ -717,11 +732,13 @@ mod tests {
         let out = linkify_urls("see #outreachy:gnome.org for info");
         assert!(out.contains("<a href=\"https://matrix.to/#/%23outreachy:gnome.org\">"),
             "anchor href missing: {out}");
-        // Alias text survives inside the span (bracketed by NBSPs for
-        // pill padding). Just assert the alias appears once, still
-        // wrapped by the span + anchor closers.
-        assert!(out.contains("#outreachy:gnome.org\u{a0}</span></a>"),
-            "pill span missing: {out}");
+        // Alias text survives inside the pill body span, which ends
+        // before the right-side endcap.
+        assert!(out.contains("#outreachy:gnome.org\u{a0}</span>"),
+            "pill body span missing: {out}");
+        // Endcaps are present — left ◖ and right ◗ half-circles.
+        assert!(out.contains('\u{25d6}'), "left endcap missing: {out}");
+        assert!(out.contains('\u{25d7}'), "right endcap missing: {out}");
     }
 
     #[test]
