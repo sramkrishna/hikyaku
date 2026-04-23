@@ -24,19 +24,41 @@
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct FlagEntry {
     pub user_id: String,
-    /// Short category tag: "transphobic", "racist", "harassment",
-    /// "scam", "custom", or anything the user types in the dialog
-    /// (free-form so translations and new categories don't require
-    /// a schema change).
+    /// Short category tag for an active flag: "transphobic", "racist",
+    /// "harassment", "scam", "custom", or anything the user types.
+    /// Empty string means "not flagged, but may still have notes" —
+    /// the record lives in the store so notes survive unflag/reflag
+    /// cycles without being dropped.
+    #[serde(default)]
     pub category: String,
-    /// Free-form reason / note. Shown in tooltip and preferences list.
+    /// Free-form reason / note for the flag specifically.
+    /// Distinct from `notes` below which is user-agnostic of flag state.
     #[serde(default)]
     pub reason: String,
-    /// Unix seconds of the original flag.
+    /// Free-form notes about the user, independent of flag state.
+    /// Typed in the user-info dialog; shown there and surfaced as a
+    /// small "has notes" indicator next to the sender label.
+    #[serde(default)]
+    pub notes: String,
+    /// Unix seconds of the original record creation.
+    #[serde(default)]
     pub created_at: u64,
+    /// Unix seconds of the last mutation (flag / notes edit).
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl FlagEntry {
+    pub fn is_flagged(&self) -> bool { !self.category.is_empty() }
+    pub fn has_notes(&self) -> bool { !self.notes.is_empty() }
+    /// True when the record is effectively empty and can be dropped
+    /// from the store entirely (neither flagged nor has notes).
+    pub fn is_empty(&self) -> bool {
+        self.category.is_empty() && self.notes.is_empty()
+    }
 }
 
 pub struct FlaggedStore {
@@ -88,24 +110,74 @@ impl FlaggedStore {
         }
     }
 
-    /// Insert or replace a flag. `category` and `reason` overwrite any
-    /// existing entry so the latest flag wins. Returns the stored entry.
-    pub fn flag(&self, user_id: &str, category: &str, reason: &str) -> FlagEntry {
-        let mut map = self.load();
-        let entry = FlagEntry {
-            user_id: user_id.to_string(),
-            category: category.to_string(),
-            reason: reason.to_string(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0),
-        };
-        map.insert(user_id.to_string(), entry.clone());
-        self.persist(&map);
-        entry
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 
-    /// Remove the flag for `user_id`. No-op if not flagged.
+    /// Set the flag on `user_id`. Preserves any existing notes.
+    /// Returns the stored entry.
+    pub fn set_flag(&self, user_id: &str, category: &str, reason: &str) -> FlagEntry {
+        let mut map = self.load();
+        let now = Self::now();
+        let entry = map.entry(user_id.to_string()).or_insert_with(|| FlagEntry {
+            user_id: user_id.to_string(),
+            created_at: now,
+            ..Default::default()
+        });
+        entry.category = category.to_string();
+        entry.reason = reason.to_string();
+        entry.updated_at = now;
+        let result = entry.clone();
+        self.persist(&map);
+        result
+    }
+
+    /// Clear the flag on `user_id` (not the notes). If the record has
+    /// neither a flag nor notes afterwards, it's dropped entirely.
+    pub fn clear_flag(&self, user_id: &str) {
+        let mut map = self.load();
+        let Some(entry) = map.get_mut(user_id) else { return };
+        entry.category.clear();
+        entry.reason.clear();
+        entry.updated_at = Self::now();
+        let is_empty = entry.is_empty();
+        if is_empty {
+            map.remove(user_id);
+        }
+        self.persist(&map);
+    }
+
+    /// Set or clear free-form notes on `user_id`. Preserves any
+    /// existing flag. An empty `notes` string removes the notes and
+    /// drops the record entirely if the user was not flagged.
+    pub fn set_notes(&self, user_id: &str, notes: &str) {
+        let mut map = self.load();
+        let now = Self::now();
+        let entry = map.entry(user_id.to_string()).or_insert_with(|| FlagEntry {
+            user_id: user_id.to_string(),
+            created_at: now,
+            ..Default::default()
+        });
+        entry.notes = notes.to_string();
+        entry.updated_at = now;
+        let is_empty = entry.is_empty();
+        if is_empty {
+            map.remove(user_id);
+        }
+        self.persist(&map);
+    }
+
+    /// Back-compat wrapper: used by the message-row one-click flag
+    /// toggle. Sets a flag with the given category/reason.
+    pub fn flag(&self, user_id: &str, category: &str, reason: &str) -> FlagEntry {
+        self.set_flag(user_id, category, reason)
+    }
+
+    /// Back-compat wrapper: fully removes any record for `user_id`.
+    /// Clears both flag and notes.
     pub fn unflag(&self, user_id: &str) {
         let mut map = self.load();
         if map.remove(user_id).is_some() {

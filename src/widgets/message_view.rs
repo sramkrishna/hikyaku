@@ -679,6 +679,16 @@ mod imp {
                         }
                     });
 
+                    #[cfg(feature = "community-safety")]
+                    {
+                        let view_weak = setup_view_weak.clone();
+                        row.set_on_flag_changed(move |user_id| {
+                            if let Some(v) = view_weak.upgrade() {
+                                v.refresh_flag_ui_for_user(&user_id);
+                            }
+                        });
+                    }
+
                     let view_weak = setup_view_weak.clone();
                     row.set_on_open_thread(move |thread_root_id| {
                         if let Some(v) = view_weak.upgrade() {
@@ -1917,6 +1927,34 @@ impl MessageView {
 
     /// Load bookmarked event IDs for `room_id` from the store into the in-memory set.
     /// Call after `set_messages` so rows are highlighted on the first bind pass.
+    /// Walk every currently-materialised MessageRow and re-evaluate the
+    /// community-safety flag / notes indicator for a specific user id.
+    /// Called after a flag toggle or notes edit so every visible message
+    /// from that user picks up the new state, not just the row the user
+    /// interacted with. The `list_view` may have many rows in its pool
+    /// at any time — scanning is O(visible_rows) which is bounded.
+    #[cfg(feature = "community-safety")]
+    pub fn refresh_flag_ui_for_user(&self, user_id: &str) {
+        if user_id.is_empty() { return; }
+        // Get the current room's list_view.
+        let imp = self.imp();
+        let list_view = if imp.room_view_cache.borrow().contains_key(
+            imp.current_room_id.borrow().as_str()
+        ) {
+            imp.list_view()
+        } else {
+            return;
+        };
+        let mut child = list_view.first_child();
+        while let Some(node) = child {
+            let next = node.next_sibling();
+            if let Some(row) = crate::widgets::MessageView::find_message_row(&node) {
+                row.refresh_flag_ui(user_id);
+            }
+            child = next;
+        }
+    }
+
     /// Refresh the visible nick-picker popover's avatar widget for a
     /// specific user id. Called by window.rs when a MatrixEvent::AvatarReady
     /// arrives for a member whose row is currently in the popover — without

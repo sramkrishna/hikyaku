@@ -68,6 +68,11 @@ mod imp {
         /// directly" to "show info first" — aligns with how Element /
         /// Cinny / Fractal treat sender-name clicks.
         pub on_user_info: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: community-safety flag or notes changed for a user.
+        /// Wired in MessageView's factory setup to walk every visible
+        /// message row and repaint its sender_flag_label. Without this,
+        /// toggling a flag would only update the row the user clicked.
+        pub on_flag_changed: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Callback: open thread → (thread_root_event_id).
         pub on_open_thread: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Sender's Matrix user ID (e.g. @user:server).
@@ -612,31 +617,34 @@ mod imp {
                 body_label.grab_focus();
             });
 
-            // Flag button — toggle local community-safety flag on the
-            // message's sender. One-click toggles; the pill next to
-            // the sender label refreshes on the current row via a
-            // manual re-paint of sender_flag_label. Other rows from
-            // the same sender will update on their next bind.
+            // Flag button — toggle ONLY the flag on this sender
+            // (not the record as a whole). If the user has notes,
+            // those survive a flag toggle. The current row's pill
+            // updates immediately; other visible rows for the same
+            // sender get refreshed via on_flag_changed (wired in
+            // MessageView's factory setup so it walks the visible
+            // list_view rows).
             #[cfg(feature = "community-safety")]
             {
                 let sender_id = self.sender_id_text.clone();
-                let flag_label = self.sender_flag_label.clone();
+                let on_flag_changed = self.on_flag_changed.clone();
                 flag_button.connect_clicked(move |_| {
                     let uid = sender_id.borrow().clone();
                     if uid.is_empty() { return; }
                     let store = &crate::plugins::community_safety::FLAGGED_STORE;
-                    if store.get(&uid).is_some() {
-                        store.unflag(&uid);
-                        flag_label.set_visible(false);
+                    let currently_flagged = store
+                        .get(&uid)
+                        .map(|e| e.is_flagged())
+                        .unwrap_or(false);
+                    if currently_flagged {
+                        store.clear_flag(&uid);
                     } else {
-                        let entry = store.flag(&uid, "caution", "");
-                        let category_escaped = glib::markup_escape_text(&entry.category);
-                        let markup = format!(
-                            "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
-                        );
-                        flag_label.set_markup(&markup);
-                        flag_label.set_tooltip_text(Some(&format!("Flagged as {}", entry.category)));
-                        flag_label.set_visible(true);
+                        store.set_flag(&uid, "caution", "");
+                    }
+                    // Fire the refresh callback so every visible row
+                    // bound to this sender repaints its pill.
+                    if let Some(ref cb) = *on_flag_changed.borrow() {
+                        cb(uid);
                     }
                 });
             }
@@ -1022,6 +1030,52 @@ impl MessageRow {
         self.imp().on_user_info.borrow_mut().replace(Box::new(f));
     }
 
+    pub fn set_on_flag_changed<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_flag_changed.borrow_mut().replace(Box::new(f));
+    }
+
+    /// Re-render the sender_flag_label based on the current state of the
+    /// community-safety store for the given user id. Idempotent; called
+    /// from MessageView after any flag/notes mutation to keep every
+    /// visible row bound to that user in sync.
+    #[cfg(feature = "community-safety")]
+    pub fn refresh_flag_ui(&self, user_id: &str) {
+        let imp = self.imp();
+        if *imp.sender_id_text.borrow() != user_id {
+            return;
+        }
+        let label = &imp.sender_flag_label;
+        let entry = crate::plugins::community_safety::FLAGGED_STORE.get(user_id);
+        let Some(entry) = entry else {
+            label.set_visible(false);
+            return;
+        };
+        if entry.is_flagged() {
+            let cat = glib::markup_escape_text(&entry.category);
+            label.set_markup(&format!(
+                "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {cat} </span>"
+            ));
+            let tip = if entry.reason.is_empty() {
+                format!("Flagged as {}", entry.category)
+            } else {
+                format!("Flagged as {}: {}", entry.category, entry.reason)
+            };
+            label.set_tooltip_text(Some(&tip));
+            label.set_visible(true);
+        } else if entry.has_notes() {
+            label.set_markup(
+                "<span foreground=\"#62a0ea\" background=\"#62a0ea22\"> 📝 </span>",
+            );
+            let preview = entry.notes.char_indices().nth(80)
+                .map(|(i, _)| &entry.notes[..i])
+                .unwrap_or(&entry.notes);
+            label.set_tooltip_text(Some(&format!("Note: {preview}")));
+            label.set_visible(true);
+        } else {
+            label.set_visible(false);
+        }
+    }
+
     pub fn set_on_open_thread<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_open_thread.borrow_mut().replace(Box::new(f));
     }
@@ -1266,26 +1320,44 @@ impl MessageRow {
         let force_highlight = msg.is_highlight();
         self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
 
-        // Community-safety plugin: show an amber "Caution" pill next to
-        // the sender label for flagged senders. Stored entirely locally —
-        // see src/plugins/community_safety.rs.
+        // Community-safety plugin: show one of
+        //   * amber "⚠ <category>" caution pill when the user is flagged
+        //   * small "📝 note" dim pill when they have notes but no flag
+        //   * nothing when neither
+        // Flag takes precedence — the user can still read the notes via
+        // the user-info dialog reachable by clicking the sender name.
         #[cfg(feature = "community-safety")]
         {
             if sender_id.is_empty() {
                 imp.sender_flag_label.set_visible(false);
             } else if let Some(entry) = crate::plugins::community_safety::FLAGGED_STORE.get(&sender_id) {
-                let category_escaped = glib::markup_escape_text(&entry.category);
-                let markup = format!(
-                    "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
-                );
-                imp.sender_flag_label.set_markup(&markup);
-                let tooltip = if entry.reason.is_empty() {
-                    format!("Flagged as {}", entry.category)
+                if entry.is_flagged() {
+                    let category_escaped = glib::markup_escape_text(&entry.category);
+                    let markup = format!(
+                        "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
+                    );
+                    imp.sender_flag_label.set_markup(&markup);
+                    let tooltip = if entry.reason.is_empty() {
+                        format!("Flagged as {}", entry.category)
+                    } else {
+                        format!("Flagged as {}: {}", entry.category, entry.reason)
+                    };
+                    imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
+                    imp.sender_flag_label.set_visible(true);
+                } else if entry.has_notes() {
+                    imp.sender_flag_label.set_markup(
+                        "<span foreground=\"#62a0ea\" background=\"#62a0ea22\"> 📝 </span>",
+                    );
+                    let preview = entry.notes.char_indices().nth(80)
+                        .map(|(i, _)| &entry.notes[..i])
+                        .unwrap_or(&entry.notes);
+                    imp.sender_flag_label.set_tooltip_text(Some(
+                        &format!("Note: {preview}"),
+                    ));
+                    imp.sender_flag_label.set_visible(true);
                 } else {
-                    format!("Flagged as {}: {}", entry.category, entry.reason)
-                };
-                imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
-                imp.sender_flag_label.set_visible(true);
+                    imp.sender_flag_label.set_visible(false);
+                }
             } else {
                 imp.sender_flag_label.set_visible(false);
             }

@@ -4296,9 +4296,45 @@ impl MxWindow {
         mxid_row.append(&copy_btn);
         content.append(&mxid_row);
 
-        // Spacer pushes the action buttons to the bottom of the dialog.
-        let spacer = gtk::Box::builder().vexpand(true).build();
-        content.append(&spacer);
+        // Notes editor (community-safety plugin). Notes are independent
+        // of the flag — you can have notes about someone you haven't
+        // flagged, or leave notes on someone you have. Saves on dialog
+        // close via connect_closed so the user can type freely without
+        // a save button.
+        #[cfg(feature = "community-safety")]
+        let notes_view = {
+            let notes_label = gtk::Label::builder()
+                .label("Notes")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .margin_top(8)
+                .build();
+            content.append(&notes_label);
+
+            let notes_view = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            if let Some(entry) = crate::plugins::community_safety::FLAGGED_STORE.get(user_id) {
+                if !entry.notes.is_empty() {
+                    notes_view.buffer().set_text(&entry.notes);
+                }
+            }
+            let notes_scroll = gtk::ScrolledWindow::builder()
+                .child(&notes_view)
+                .min_content_height(100)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .css_classes(["card"])
+                .build();
+            content.append(&notes_scroll);
+            notes_view
+        };
+        #[cfg(not(feature = "community-safety"))]
+        {
+            let spacer = gtk::Box::builder().vexpand(true).build();
+            content.append(&spacer);
+        }
 
         let actions = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -4326,6 +4362,31 @@ impl MxWindow {
                 if let Some(d) = dlg.upgrade() { d.close(); }
             });
         });
+
+        // Save notes on dialog close — picks up whatever the user typed
+        // into the TextView and persists via the community-safety store.
+        // Also triggers a refresh on visible message rows so the 📝
+        // note indicator appears / disappears in real time.
+        #[cfg(feature = "community-safety")]
+        {
+            let uid_for_save = user_id.to_string();
+            let window_weak_save = self.downgrade();
+            dialog.connect_closed(move |_| {
+                let buffer = notes_view.buffer();
+                let (start, end) = buffer.bounds();
+                let text = buffer.text(&start, &end, false).to_string();
+                let trimmed = text.trim();
+                let store = &crate::plugins::community_safety::FLAGGED_STORE;
+                let prior = store.get(&uid_for_save)
+                    .map(|e| e.notes).unwrap_or_default();
+                if prior != trimmed {
+                    store.set_notes(&uid_for_save, trimmed);
+                    if let Some(win) = window_weak_save.upgrade() {
+                        win.imp().message_view.refresh_flag_ui_for_user(&uid_for_save);
+                    }
+                }
+            });
+        }
 
         dialog.set_child(Some(&content));
         dialog.present(Some(self));
