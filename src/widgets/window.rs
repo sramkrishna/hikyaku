@@ -4167,7 +4167,7 @@ impl MxWindow {
     /// If the room is already joined, opens it directly.
     /// Otherwise shows the join bar pre-filled with the identifier.
     pub fn handle_matrix_link(&self, identifier: &str) {
-        // User-id form (@user:server) — open the user-info dialog
+        // User-id form (@user:server) — open the user-info panel
         // instead of trying to join it as a room. Matrix URIs returned
         // by parse_matrix_uri are prefixed with @, !, or # so the
         // first character reliably disambiguates the three kinds.
@@ -4175,21 +4175,72 @@ impl MxWindow {
             self.show_user_info_dialog(identifier);
             return;
         }
+        // Event-scoped form: matrix.to permalinks point at a specific
+        // message with `!room:server/$event`. Split the event id off
+        // so the room lookup matches on the bare room id; we'll scroll
+        // to the event after navigating. Aliases (`#name:server`) can
+        // *also* carry a `/$event` suffix per the matrix.to spec.
+        let (room_part, event_id) = match identifier.split_once('/') {
+            Some((room, event)) if !event.is_empty() => (room, Some(event.to_string())),
+            _ => (identifier, None),
+        };
         let imp = self.imp();
-        // Check if we already have this room.
-        let registry = imp.room_list_view.imp().room_registry.borrow();
-        if let Some(obj) = registry.values().find(|o| o.room_id() == identifier) {
-            let room_id = obj.room_id();
-            let name = obj.name();
-            drop(registry);
+        // Check if we already have this room. The registry is keyed by
+        // room id, so a bare id is an O(1) hit; aliases fall back to a
+        // scan via the directory's reverse lookup.
+        let resolved_room_id: Option<String> = {
+            let registry = imp.room_list_view.imp().room_registry.borrow();
+            if room_part.starts_with('!') {
+                registry.get(room_part).map(|o| o.room_id())
+            } else if room_part.starts_with('#') {
+                // Alias → room id via the directory; confirm membership
+                // by checking the registry.
+                crate::directory::room_id_for_alias(room_part)
+                    .filter(|rid| registry.contains_key(rid))
+            } else {
+                None
+            }
+        };
+        if let Some(room_id) = resolved_room_id {
+            let name = {
+                let registry = imp.room_list_view.imp().room_registry.borrow();
+                registry.get(&room_id).map(|o| o.name()).unwrap_or_default()
+            };
             if let Some(ref cb) = *imp.room_list_view.imp().on_room_selected.borrow() {
                 cb(room_id, name);
             }
+            // Scroll to the specific event once the room view is live.
+            // room_selected above triggers an async chain that rebuilds
+            // the message view, so defer the scroll a tick to let the
+            // list render before jumping.
+            if let Some(eid) = event_id {
+                let view_weak = imp.message_view.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(view) = view_weak.upgrade() {
+                        view.scroll_to_event(&eid);
+                    }
+                });
+            }
             return;
         }
-        drop(registry);
-        // Not joined — show the join bar pre-filled.
-        self.show_join_bar_with(Some(identifier));
+        // Not joined — show the join bar pre-filled with a human-
+        // readable token. Prefer the alias (`#name:server`) so the
+        // user sees something they can recognise; the raw room id
+        // is only used when we have nothing better.
+        let prefill = if room_part.starts_with('#') {
+            room_part.to_string()
+        } else {
+            crate::directory::room(room_part)
+                .and_then(|info| {
+                    if info.canonical_alias.is_empty() {
+                        None
+                    } else {
+                        Some(info.canonical_alias)
+                    }
+                })
+                .unwrap_or_else(|| room_part.to_string())
+        };
+        self.show_join_bar_with(Some(&prefill));
     }
 
     fn show_join_bar_with(&self, initial: Option<&str>) {
