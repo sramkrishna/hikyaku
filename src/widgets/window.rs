@@ -4181,8 +4181,14 @@ impl MxWindow {
             .label("Message")
             .css_classes(["suggested-action"])
             .build();
+        // Close affordance: small icon-only X instead of a full-width
+        // "Cancel" label. Saves bar width for the entry + primary action
+        // and matches the standard GNOME pattern for dismissable inline
+        // bars. Adding "flat" + "circular" CSS so it's visually subordinate.
         let cancel_btn = gtk::Button::builder()
-            .label("Cancel")
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel")
+            .css_classes(["flat", "circular"])
             .build();
 
         let bar = gtk::Box::builder()
