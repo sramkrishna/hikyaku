@@ -70,6 +70,18 @@ template $MxMessageRow : Gtk.Box {
         styles ["caption-heading", "mx-message-sender"]
       }
 
+      // Caution pill for flagged users (community-safety plugin).
+      // Hidden by default; bind_message_object consults FLAGGED_STORE
+      // on every bind and flips visibility + text accordingly. Uses
+      // use-markup so bind can embed Pango colour spans for the
+      // amber-on-translucent pill styling without a custom CSS class.
+      Gtk.Label sender_flag_label {
+        halign: start;
+        visible: false;
+        use-markup: true;
+        tooltip-text: "Flagged as problematic";
+      }
+
       // Thread indicator.
       Gtk.Image thread_icon {
         icon-name: "view-list-symbolic";

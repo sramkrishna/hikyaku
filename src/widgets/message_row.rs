@@ -99,6 +99,8 @@ mod imp {
         #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub sender_flag_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub body_label: TemplateChild<gtk::Label>,
@@ -244,6 +246,22 @@ mod imp {
             select_button.add_css_class("flat");
             select_button.add_css_class("circular");
 
+            // Community-safety plugin: toggle a local "caution" flag on
+            // this message's sender. One-click toggles (no dialog for
+            // v1; category defaults to "caution", reason left empty).
+            // The pill next to the sender label refreshes immediately
+            // via a re-bind.
+            #[cfg(feature = "community-safety")]
+            let flag_button = gtk::Button::builder()
+                .icon_name("dialog-warning-symbolic")
+                .tooltip_text("Flag sender as problematic")
+                .build();
+            #[cfg(feature = "community-safety")]
+            {
+                flag_button.add_css_class("flat");
+                flag_button.add_css_class("circular");
+            }
+
             self.action_bar.set_orientation(gtk::Orientation::Horizontal);
             self.action_bar.set_spacing(2);
             self.action_bar.append(&self.reply_button);
@@ -252,6 +270,8 @@ mod imp {
             self.action_bar.append(&bookmark_button);
             self.action_bar.append(&copy_button);
             self.action_bar.append(&select_button);
+            #[cfg(feature = "community-safety")]
+            self.action_bar.append(&flag_button);
             self.action_bar.append(&edit_button);
             self.action_bar.append(&delete_button);
             self.edit_button.replace(Some(edit_button.clone()));
@@ -581,6 +601,35 @@ mod imp {
                 body_label.set_selectable(true);
                 body_label.grab_focus();
             });
+
+            // Flag button — toggle local community-safety flag on the
+            // message's sender. One-click toggles; the pill next to
+            // the sender label refreshes on the current row via a
+            // manual re-paint of sender_flag_label. Other rows from
+            // the same sender will update on their next bind.
+            #[cfg(feature = "community-safety")]
+            {
+                let sender_id = self.sender_id_text.clone();
+                let flag_label = self.sender_flag_label.clone();
+                flag_button.connect_clicked(move |_| {
+                    let uid = sender_id.borrow().clone();
+                    if uid.is_empty() { return; }
+                    let store = &crate::plugins::community_safety::FLAGGED_STORE;
+                    if store.get(&uid).is_some() {
+                        store.unflag(&uid);
+                        flag_label.set_visible(false);
+                    } else {
+                        let entry = store.flag(&uid, "caution", "");
+                        let category_escaped = glib::markup_escape_text(&entry.category);
+                        let markup = format!(
+                            "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
+                        );
+                        flag_label.set_markup(&markup);
+                        flag_label.set_tooltip_text(Some(&format!("Flagged as {}", entry.category)));
+                        flag_label.set_visible(true);
+                    }
+                });
+            }
 
             // When the body label loses focus (user clicked away or
             // pressed Escape) flip selectable back off. This keeps the
@@ -1190,6 +1239,31 @@ impl MessageRow {
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
         self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+
+        // Community-safety plugin: show an amber "Caution" pill next to
+        // the sender label for flagged senders. Stored entirely locally —
+        // see src/plugins/community_safety.rs.
+        #[cfg(feature = "community-safety")]
+        {
+            if sender_id.is_empty() {
+                imp.sender_flag_label.set_visible(false);
+            } else if let Some(entry) = crate::plugins::community_safety::FLAGGED_STORE.get(&sender_id) {
+                let category_escaped = glib::markup_escape_text(&entry.category);
+                let markup = format!(
+                    "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
+                );
+                imp.sender_flag_label.set_markup(&markup);
+                let tooltip = if entry.reason.is_empty() {
+                    format!("Flagged as {}", entry.category)
+                } else {
+                    format!("Flagged as {}: {}", entry.category, entry.reason)
+                };
+                imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
+                imp.sender_flag_label.set_visible(true);
+            } else {
+                imp.sender_flag_label.set_visible(false);
+            }
+        }
 
         // Disconnect old flash handler before connecting to the new object.
         self.clear_flash_handler();

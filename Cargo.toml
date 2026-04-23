@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "hikyaku"
 
 [features]
-default = ["ai", "rolodex", "pinning", "motd"]
+default = ["ai", "rolodex", "pinning", "motd", "community-safety"]
 ## AI summaries via Ollama + semantic interest watcher (fastembed).
 ## Use ort-download-binaries for development builds (cargo run).
 ## Use ort-load-dynamic for Flatpak builds — ORT is dlopen'd at runtime.
@@ -20,6 +20,10 @@ rolodex = []
 pinning = []
 ## Room topic change tracker — toasts and sidebar icon.
 motd = []
+## Community safety — locally-tracked "caution" flags on problematic users.
+## Flags are private to the device (never sent to Matrix); messages from
+## flagged users get a visible amber pill next to the sender name.
+community-safety = []
 ## Development build indicator: amber app icon + rainbow titlebar stripe.
 ## Used by the beta flatpak branch. Never set in the stable build.
 devel = []

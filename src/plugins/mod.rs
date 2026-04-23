@@ -17,3 +17,5 @@ pub mod pinning;
 pub mod rolodex;
 #[cfg(feature = "community-health")]
 pub mod community_health;
+#[cfg(feature = "community-safety")]
+pub mod community_safety;
