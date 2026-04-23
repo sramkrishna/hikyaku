@@ -61,6 +61,13 @@ mod imp {
         pub reply_to: std::rc::Rc<std::cell::RefCell<String>>,
         /// Callback: DM clicked → (sender_id).
         pub on_dm: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: user info requested → (user_id). Fires when the user
+        /// left-clicks the sender label; the handler is expected to open
+        /// a dialog with display name, mxid, copy-to-clipboard, and a
+        /// Send-DM button. Repurposes the click target from "start a DM
+        /// directly" to "show info first" — aligns with how Element /
+        /// Cinny / Fractal treat sender-name clicks.
+        pub on_user_info: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Callback: open thread → (thread_root_event_id).
         pub on_open_thread: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Sender's Matrix user ID (e.g. @user:server).
@@ -388,14 +395,17 @@ mod imp {
                 }
             });
 
-            // Left-click sender name to start DM.
+            // Left-click sender name to open the user-info dialog.
+            // The dialog itself has a "Send DM" action, so the old
+            // click-goes-straight-to-DM workflow is still one step
+            // behind this intermediate surface.
             let sender_id = self.sender_id_text.clone();
-            let on_dm_ref = self.on_dm.clone();
+            let on_user_info_ref = self.on_user_info.clone();
             let sender_click = gtk::GestureClick::builder().button(1).build();
             sender_click.connect_released(move |_, _, _, _| {
                 let uid = sender_id.borrow().clone();
                 if !uid.is_empty() {
-                    if let Some(ref cb) = *on_dm_ref.borrow() {
+                    if let Some(ref cb) = *on_user_info_ref.borrow() {
                         cb(uid);
                     }
                 }
@@ -994,6 +1004,10 @@ impl MessageRow {
 
     pub fn set_on_dm<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_dm.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_user_info<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_user_info.borrow_mut().replace(Box::new(f));
     }
 
     pub fn set_on_open_thread<F: Fn(String) + 'static>(&self, f: F) {

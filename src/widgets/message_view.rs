@@ -659,6 +659,26 @@ mod imp {
                         }
                     });
 
+                    // Sender-name click → walk to MxWindow and open the
+                    // user-info dialog. Uses root-walk rather than a
+                    // callback-through-MessageView so the dialog code
+                    // stays co-located with other window dialogs.
+                    row.set_on_user_info(move |user_id| {
+                        if user_id.is_empty() { return; }
+                        use gtk::prelude::*;
+                        if let Some(app) = gtk::gio::Application::default() {
+                            if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                                if let Some(window) = gtk_app.active_window() {
+                                    if let Some(win) = window
+                                        .downcast_ref::<crate::widgets::MxWindow>()
+                                    {
+                                        win.show_user_info_dialog(&user_id);
+                                    }
+                                }
+                            }
+                        }
+                    });
+
                     let view_weak = setup_view_weak.clone();
                     row.set_on_open_thread(move |thread_root_id| {
                         if let Some(v) = view_weak.upgrade() {

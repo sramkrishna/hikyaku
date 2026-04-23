@@ -4190,6 +4190,129 @@ impl MxWindow {
     }
 
     /// Show an inline bar to start a new DM with a Matrix user.
+    /// Open the user-info dialog for a Matrix user id. Displays a 64px
+    /// avatar (cached image or initials fallback), the display name (if
+    /// known), the mxid as selectable monospace text with a "Copy mxid"
+    /// action, and a "Send DM" action that reuses the existing CreateDm
+    /// flow. Opened from a sender-name click in the message view and
+    /// from matrix.to user-link clicks (future issue).
+    pub fn show_user_info_dialog(&self, user_id: &str) {
+        if user_id.is_empty() { return; }
+        // Best-effort display-name lookup: the current room's member
+        // list is the most reliable source (matches what the user is
+        // already seeing). Fall back to localpart so the heading is
+        // never empty even for members not yet fetched into the room.
+        let display_name = {
+            let members = self.imp().message_view.imp().room_members.borrow();
+            members.iter()
+                .find(|(_, _, uid)| uid == user_id)
+                .map(|(_, name, _)| name.clone())
+                .unwrap_or_else(|| {
+                    user_id.trim_start_matches('@')
+                        .split(':').next()
+                        .unwrap_or(user_id)
+                        .to_string()
+                })
+        };
+
+        let dialog = adw::Dialog::builder()
+            .title(&display_name)
+            .content_width(360)
+            .content_height(320)
+            .build();
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_start(24).margin_end(24)
+            .margin_top(24).margin_bottom(24)
+            .build();
+
+        let initials_source = display_name.clone();
+        let avatar = adw::Avatar::builder()
+            .size(64)
+            .text(&initials_source)
+            .show_initials(true)
+            .halign(gtk::Align::Center)
+            .build();
+        if let Some(path) = self.imp().avatar_cache.borrow().get(user_id) {
+            if !path.is_empty() {
+                if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
+                    avatar.set_custom_image(Some(&tex));
+                }
+            }
+        }
+        content.append(&avatar);
+
+        let name_label = gtk::Label::builder()
+            .label(&display_name)
+            .css_classes(["title-2"])
+            .halign(gtk::Align::Center)
+            .build();
+        content.append(&name_label);
+
+        // mxid row: monospace, selectable, with a Copy button that
+        // writes to the clipboard.
+        let mxid_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .build();
+        let mxid_label = gtk::Label::builder()
+            .label(user_id)
+            .selectable(true)
+            .css_classes(["monospace", "dim-label"])
+            .build();
+        let copy_btn = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy Matrix address")
+            .css_classes(["flat", "circular"])
+            .build();
+        let mxid_for_copy = user_id.to_string();
+        let toast_overlay_for_copy = self.imp().toast_overlay.clone();
+        copy_btn.connect_clicked(move |btn| {
+            btn.display().clipboard().set_text(&mxid_for_copy);
+            toast(&toast_overlay_for_copy, "Matrix address copied");
+        });
+        mxid_row.append(&mxid_label);
+        mxid_row.append(&copy_btn);
+        content.append(&mxid_row);
+
+        // Spacer pushes the action buttons to the bottom of the dialog.
+        let spacer = gtk::Box::builder().vexpand(true).build();
+        content.append(&spacer);
+
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::Fill)
+            .homogeneous(true)
+            .build();
+        let dm_btn = gtk::Button::builder()
+            .label("Send DM")
+            .css_classes(["suggested-action"])
+            .build();
+        actions.append(&dm_btn);
+        content.append(&actions);
+
+        // Send-DM action: dispatch CreateDm, close the dialog.
+        let tx_dm = self.imp().command_tx.get().unwrap().clone();
+        let dialog_weak = dialog.downgrade();
+        let uid_for_dm = user_id.to_string();
+        dm_btn.connect_clicked(move |_| {
+            let tx = tx_dm.clone();
+            let uid = uid_for_dm.clone();
+            let dlg = dialog_weak.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
+                if let Some(d) = dlg.upgrade() { d.close(); }
+            });
+        });
+
+        dialog.set_child(Some(&content));
+        dialog.present(Some(self));
+    }
+
     fn show_new_dm_bar(&self) {
         let imp = self.imp();
         if imp.inline_bar_active.get() { return; }
