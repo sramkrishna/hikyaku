@@ -2319,18 +2319,34 @@ async fn collect_room_info(
     );
 
     // Apply cached timestamps before sorting so rooms with ts=0 that have
-    // a cached value don't get wrongly truncated.
-    if let Some(ts_arc) = ts_cache {
-        let ts_map = ts_arc.lock().unwrap();
-        for room in direct.iter_mut()
-            .chain(ungrouped.iter_mut())
-            .chain(space_children.iter_mut())
-            .chain(with_unread.iter_mut())
-        {
-            if room.last_activity_ts == 0 {
-                if let Some(&cached) = ts_map.get(&room.room_id) {
-                    room.last_activity_ts = cached;
-                }
+    // a cached value don't get wrongly truncated OR sort to the bottom.
+    //
+    // `ts_cache` is only supplied by the main sync-loop caller; one-off
+    // callers (handle_accept_invite, DM-migration pass) don't hold the
+    // Arc, so they pass None — they still need a timestamp seed or
+    // every room without a locally-cached recency_stamp/latest_event
+    // sinks to the bottom of its bucket. Fall back to the persisted
+    // disk cache in that case so sort stays stable across these one-off
+    // refreshes.
+    let disk_ts_fallback: std::collections::HashMap<String, u64>;
+    let ts_map: &std::collections::HashMap<String, u64> = match ts_cache {
+        Some(ts_arc) => {
+            disk_ts_fallback = ts_arc.lock().unwrap().clone();
+            &disk_ts_fallback
+        }
+        None => {
+            disk_ts_fallback = load_timestamp_cache();
+            &disk_ts_fallback
+        }
+    };
+    for room in direct.iter_mut()
+        .chain(ungrouped.iter_mut())
+        .chain(space_children.iter_mut())
+        .chain(with_unread.iter_mut())
+    {
+        if room.last_activity_ts == 0 {
+            if let Some(&cached) = ts_map.get(&room.room_id) {
+                room.last_activity_ts = cached;
             }
         }
     }
@@ -2653,6 +2669,12 @@ async fn start_sync(
     {
         let dm_migrate_client = client.clone();
         let dm_migrate_tx = event_tx.clone();
+        // Share the main sync-loop's timestamps Arc so the
+        // reclassification's RoomListUpdated carries correct
+        // recency — otherwise the DMs it just flipped can land at
+        // the bottom of the DM bucket (observed on fresh flatpak
+        // installs where the persisted timestamp cache is empty).
+        let dm_migrate_ts = room_timestamps.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut migrated: u32 = 0;
@@ -2677,7 +2699,7 @@ async fn start_sync(
             }
             if migrated > 0 {
                 tracing::info!("DM-migrate: {migrated} rooms reclassified; pushing refreshed room list");
-                let rooms = collect_room_info(&dm_migrate_client, None).await;
+                let rooms = collect_room_info(&dm_migrate_client, Some(&dm_migrate_ts)).await;
                 let _ = dm_migrate_tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
             }
         });
