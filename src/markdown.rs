@@ -595,6 +595,66 @@ fn linkify_aliases(text: &str) -> String {
     result
 }
 
+/// Scan a message body for every `#localpart:server.tld` alias and return
+/// the unique ones in order of first appearance. Rules match
+/// `linkify_aliases` so the two passes agree on what counts as an alias:
+/// `#` not preceded by alphanumeric, a non-empty localpart of `[A-Za-z0-9_.-]`,
+/// a `:`, a server name containing at least one `.`, terminated by
+/// whitespace / `<` / `>` / `/` / end.
+///
+/// Pure — no directory lookup, no side effects. Caller filters against
+/// `crate::directory::room_id_for_alias` to decide which to resolve.
+pub(crate) fn extract_aliases(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'#' {
+            i += 1;
+            continue;
+        }
+        let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if !prev_ok {
+            i += 1;
+            continue;
+        }
+        let local_start = i + 1;
+        let mut j = local_start;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j == local_start || j >= bytes.len() || bytes[j] != b':' {
+            i += 1;
+            continue;
+        }
+        let server_start = j + 1;
+        let mut k = server_start;
+        let mut saw_dot = false;
+        while k < bytes.len() {
+            let c = bytes[k];
+            if c.is_ascii_whitespace() || c == b'<' || c == b'>' || c == b'/' { break; }
+            if c == b'.' { saw_dot = true; }
+            k += 1;
+        }
+        if !saw_dot || k == server_start {
+            i += 1;
+            continue;
+        }
+        let alias = text[i..k].to_string();
+        if seen.insert(alias.clone()) {
+            out.push(alias);
+        }
+        i = k;
+    }
+    out
+}
+
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;")
      .replace('<', "&lt;")
@@ -746,4 +806,44 @@ mod tests {
         assert!(out.contains("<a href=\"https://example.org/doc\">https://example.org/doc</a>"));
     }
 
+    // ── extract_aliases (used by #1 async resolve) ──────────────────────
+
+    #[test]
+    fn extract_aliases_plain_text() {
+        let got = extract_aliases("come to #rust:example.org or #fedi.social:mastodon.social");
+        assert_eq!(got, vec!["#rust:example.org", "#fedi.social:mastodon.social"]);
+    }
+
+    #[test]
+    fn extract_aliases_dedupes_repeats() {
+        let got = extract_aliases("#r:example.org then later #r:example.org again");
+        assert_eq!(got, vec!["#r:example.org"]);
+    }
+
+    #[test]
+    fn extract_aliases_rejects_bare_hash_counters() {
+        // A `#123` counter or a `bug#42` issue reference is not an alias.
+        let got = extract_aliases("filed bug#42 against #123 tracker");
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn extract_aliases_requires_dotted_server() {
+        // `#a:b` has no `.` in the server — not a valid alias.
+        let got = extract_aliases("try #a:b and #real:server.tld");
+        assert_eq!(got, vec!["#real:server.tld"]);
+    }
+
+    #[test]
+    fn extract_aliases_empty_on_no_match() {
+        let got = extract_aliases("just plain text with no aliases");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn extract_aliases_stops_at_whitespace_and_tag_edges() {
+        // Trailing slash, whitespace, and angle brackets all terminate the server name.
+        let got = extract_aliases("goto #foo:server.tld/path next");
+        assert_eq!(got, vec!["#foo:server.tld"]);
+    }
 }

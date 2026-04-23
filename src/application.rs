@@ -97,6 +97,7 @@ mod imp {
             app.set_accels_for_action("win.join-room",    &["<Control><Shift>j"]);
             app.set_accels_for_action("win.prev-room",    &["<Alt>Up"]);
             app.set_accels_for_action("win.next-room",    &["<Alt>Down"]);
+            app.set_accels_for_action("win.search",       &["<Control>f"]);
             // Ctrl+Q → close the active window. GtkWindow ships the
             // `window.close` action built-in; binding to it (rather
             // than app.quit) routes through our close_request handler

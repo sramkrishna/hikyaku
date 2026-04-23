@@ -105,6 +105,12 @@ mod imp {
         pub metrics_summary_buf: RefCell<String>,
         /// Set of room IDs for which FetchRoomAvatar has already been sent this session.
         pub requested_room_avatars: RefCell<std::collections::HashSet<String>>,
+        /// Aliases we've already enqueued a ResolveAliasInfo for this
+        /// session. Prevents re-querying the homeserver every time
+        /// bg_refresh scans the same message body. Includes both
+        /// successful and failed lookups — a failure likely repeats so
+        /// re-querying would just spam the server.
+        pub requested_aliases: RefCell<std::collections::HashSet<String>>,
         /// Active GLib timer that pulses the loading progress bar in the hover popover.
         pub hover_pulse_timer: RefCell<Option<glib::SourceId>>,
         /// Latest RoomListUpdated snapshot — written by the event loop, drained
@@ -252,6 +258,7 @@ mod imp {
                 hover_gen: Cell::new(0),
                 metrics_summary_buf: RefCell::new(String::new()),
                 requested_room_avatars: RefCell::new(std::collections::HashSet::new()),
+                requested_aliases: RefCell::new(std::collections::HashSet::new()),
                 hover_pulse_timer: RefCell::new(None),
                 pending_rooms: RefCell::new(None),
                 pending_bg_refresh: RefCell::new(std::collections::HashMap::new()),
@@ -1932,6 +1939,10 @@ impl MxWindow {
                         }
                     }
                     MatrixEvent::RoomMessages { room_id, messages, prev_batch_token, room_meta, is_background } => {
+                        // Alias resolve scan fires regardless of is_current_room —
+                        // background batches also populate the directory so later
+                        // renders get the name for free.
+                        window.enqueue_alias_resolves(messages.iter().map(|m| m.body.as_str()));
                         let current = window.imp().current_room_id.borrow().clone();
                         if current.as_deref() == Some(&room_id) {
                             // Fresh data arrived — hide the loading bar (if shown for stale cache).
@@ -2147,6 +2158,29 @@ impl MxWindow {
                     MatrixEvent::RoomAvatarReady { room_id, path } => {
                         room_list_view.set_room_avatar_path(&room_id, &path);
                     }
+                    MatrixEvent::AliasInfoResolved { alias, room_id, name, avatar_mxc } => {
+                        // Populate directory so future pill renders pick
+                        // up the resolved name. Empty `room_id` means the
+                        // server couldn't resolve — we still flipped the
+                        // alias into requested_aliases, so we won't spam.
+                        if !room_id.is_empty() {
+                            crate::directory::set_room_alias(&room_id, &alias);
+                            if !name.is_empty() {
+                                crate::directory::set_room_name(&room_id, &name);
+                            }
+                            if !avatar_mxc.is_empty() {
+                                // Surfaces in RoomInfo for future features
+                                // (room avatar on pill hover, etc.); no
+                                // ResolvedAliases consumer reads this yet.
+                                let _ = avatar_mxc; // reserved
+                            }
+                            // Walk per-room list stores and re-render any
+                            // message whose body references this alias so
+                            // the user sees the resolved name without
+                            // having to reload.
+                            message_view.refresh_alias_references(&alias);
+                        }
+                    }
                     MatrixEvent::OwnAvatarUpdated { success, new_mxc, error } => {
                         if success {
                             if new_mxc.is_empty() {
@@ -2204,6 +2238,10 @@ impl MxWindow {
                         let is_self = !my_id.is_empty() && sender_id == my_id;
                         let is_current_room = current.as_deref() == Some(&room_id);
                         let window_focused = window.is_active();
+                        // Scan the new body for cross-room aliases so the
+                        // pill renderer picks up real names once resolve
+                        // returns. Dedup + directory hits short-circuit.
+                        window.enqueue_alias_resolves(std::iter::once(message.body.as_str()));
                         tracing::debug!(
                             "UI NewMessage room={room_id} is_dm={is_dm} is_self={is_self} is_current={is_current_room}"
                         );
@@ -3809,6 +3847,39 @@ impl MxWindow {
         }
     }
 
+    /// Scan a batch of messages for `#alias:server` references and enqueue
+    /// a `ResolveAliasInfo` for each unique alias we haven't already
+    /// requested AND isn't already in the directory's alias → room_id
+    /// reverse map. Cheap to call often — the dedup set filters all the
+    /// repeat work. Runs on the GTK thread; the resolves happen
+    /// asynchronously on the matrix thread and return via
+    /// `MatrixEvent::AliasInfoResolved`.
+    fn enqueue_alias_resolves<I, S>(&self, bodies: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let Some(cmd_tx) = self.imp().command_tx.get().cloned() else { return };
+        let mut pending = self.imp().requested_aliases.borrow_mut();
+        for body in bodies {
+            for alias in crate::markdown::extract_aliases(body.as_ref()) {
+                if pending.contains(&alias) { continue; }
+                // Skip if the directory already knows this alias → room
+                // mapping AND has a name for it — nothing would change.
+                if let Some(rid) = crate::directory::room_id_for_alias(&alias) {
+                    if crate::directory::room_name(&rid).is_some() {
+                        continue;
+                    }
+                }
+                pending.insert(alias.clone());
+                let tx = cmd_tx.clone();
+                glib::spawn_future_local(async move {
+                    let _ = tx.send(MatrixCommand::ResolveAliasInfo { alias }).await;
+                });
+            }
+        }
+    }
+
     /// Push a new notification into the session log and update the sidebar.
     /// Called for @mentions and DMs.  Max 50 notifications kept; oldest dropped.
     fn push_notification(
@@ -4175,7 +4246,13 @@ impl MxWindow {
             })
             .build();
 
-        self.add_action_entries([about_action, preferences_action, verify_action, recover_action, import_keys_action, logout_action, join_action, shortcuts_action, prev_room_action, next_room_action]);
+        let search_action = ActionEntryBuilder::new("search")
+            .activate(|window: &Self, _, _| {
+                window.imp().message_view.toggle_search();
+            })
+            .build();
+
+        self.add_action_entries([about_action, preferences_action, verify_action, recover_action, import_keys_action, logout_action, join_action, shortcuts_action, prev_room_action, next_room_action, search_action]);
 
         // Register app.open-room on the *application* so desktop notification
         // clicks (which fire app.* actions, not win.* actions) can navigate to

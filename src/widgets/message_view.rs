@@ -278,6 +278,19 @@ mod imp {
         pub pending_appends: RefCell<Vec<crate::models::MessageObject>>,
         /// True while a flush idle is already queued for pending_appends.
         pub append_flush_pending: Cell<bool>,
+        /// In-room search bar (Ctrl+F). Lives between the info banner
+        /// and the per-room ListView stack; shared across rooms so the
+        /// widget cost is paid once.
+        pub search_bar: std::cell::OnceCell<gtk::SearchBar>,
+        pub search_entry: std::cell::OnceCell<gtk::SearchEntry>,
+        pub search_counter: std::cell::OnceCell<gtk::Label>,
+        /// Ordered list of event_ids in the current room's list_store
+        /// that match the active query. Populated on search-changed;
+        /// prev/next navigate this vector.
+        pub search_matches: RefCell<Vec<String>>,
+        /// Cursor into `search_matches` for prev/next navigation. -1 when
+        /// no match is selected yet.
+        pub search_cursor: Cell<i32>,
     }
 
     impl Default for MessageView {
@@ -394,6 +407,11 @@ mod imp {
                 cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
                 pending_appends: RefCell::new(Vec::new()),
                 append_flush_pending: Cell::new(false),
+                search_bar: std::cell::OnceCell::new(),
+                search_entry: std::cell::OnceCell::new(),
+                search_counter: std::cell::OnceCell::new(),
+                search_matches: RefCell::new(Vec::new()),
+                search_cursor: Cell::new(-1),
             }
         }
     }
@@ -1977,6 +1995,203 @@ impl MessageView {
     /// interacted with. The `list_view` may have many rows in its pool
     /// at any time — scanning is O(visible_rows) which is bounded.
     #[cfg(feature = "community-safety")]
+    /// After a `#alias:server` has been resolved to a room name, re-render
+    /// every MessageObject across every cached room whose body mentions
+    /// that alias so the pill label picks up the resolved name.
+    ///
+    /// Scope limitation: only **plain-text** messages (empty
+    /// `formatted_body`) are re-rendered inline. HTML-formatted messages
+    /// still show the raw alias until the worker re-processes them on
+    /// next room load — re-enqueueing the markup worker on every resolve
+    /// would flood it for rooms with dozens of alias references. TODO:
+    /// handle HTML re-render in a phase 3 batched pass.
+    /// Lazily build the in-room search bar and install it as the first
+    /// child of the MessageView box so it slides in above the info
+    /// banner / ListView stack. Idempotent: returns the existing bar
+    /// on subsequent calls.
+    fn ensure_search_bar(&self) -> gtk::SearchBar {
+        let imp = self.imp();
+        if let Some(bar) = imp.search_bar.get() {
+            return bar.clone();
+        }
+        let entry = gtk::SearchEntry::builder()
+            .placeholder_text("Search this room")
+            .hexpand(true)
+            .build();
+        let counter = gtk::Label::builder()
+            .label("")
+            .css_classes(["dim-label", "caption"])
+            .margin_start(8)
+            .margin_end(4)
+            .build();
+        let prev_btn = gtk::Button::builder()
+            .icon_name("go-up-symbolic")
+            .tooltip_text("Previous match (Shift+Enter)")
+            .css_classes(["flat"])
+            .build();
+        let next_btn = gtk::Button::builder()
+            .icon_name("go-down-symbolic")
+            .tooltip_text("Next match (Enter)")
+            .css_classes(["flat"])
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        row.append(&entry);
+        row.append(&counter);
+        row.append(&prev_btn);
+        row.append(&next_btn);
+
+        let bar = gtk::SearchBar::builder()
+            .child(&row)
+            .show_close_button(true)
+            .build();
+        bar.connect_entry(&entry);
+
+        // Prepend so the bar sits above everything else in the view.
+        use gtk::prelude::*;
+        self.prepend(&bar);
+
+        // Wire entry changes → refresh matches; activation → next;
+        // prev/next buttons → navigate.
+        let view_weak = self.downgrade();
+        entry.connect_search_changed(move |e| {
+            if let Some(view) = view_weak.upgrade() {
+                view.update_search_matches(&e.text());
+            }
+        });
+        let view_weak_next = self.downgrade();
+        entry.connect_activate(move |_| {
+            if let Some(view) = view_weak_next.upgrade() {
+                view.search_step(true);
+            }
+        });
+        let view_weak_next = self.downgrade();
+        next_btn.connect_clicked(move |_| {
+            if let Some(view) = view_weak_next.upgrade() {
+                view.search_step(true);
+            }
+        });
+        let view_weak_prev = self.downgrade();
+        prev_btn.connect_clicked(move |_| {
+            if let Some(view) = view_weak_prev.upgrade() {
+                view.search_step(false);
+            }
+        });
+        // Bar close → clear match state so the next open starts fresh.
+        let view_weak_close = self.downgrade();
+        bar.connect_notify_local(Some("search-mode-enabled"), move |b, _| {
+            if !b.is_search_mode() {
+                if let Some(view) = view_weak_close.upgrade() {
+                    view.imp().search_matches.borrow_mut().clear();
+                    view.imp().search_cursor.set(-1);
+                    if let Some(c) = view.imp().search_counter.get() {
+                        c.set_text("");
+                    }
+                }
+            }
+        });
+
+        let _ = imp.search_bar.set(bar.clone());
+        let _ = imp.search_entry.set(entry);
+        let _ = imp.search_counter.set(counter);
+        bar
+    }
+
+    /// Public entry point from the `win.search` action. Toggle the
+    /// search bar and focus the entry when opening.
+    pub fn toggle_search(&self) {
+        let bar = self.ensure_search_bar();
+        let was_open = bar.is_search_mode();
+        bar.set_search_mode(!was_open);
+        if !was_open {
+            if let Some(entry) = self.imp().search_entry.get() {
+                entry.grab_focus();
+                // Re-scan in case the room changed since last open.
+                self.update_search_matches(&entry.text());
+            }
+        }
+    }
+
+    /// Rebuild the match list for the given query, reset the cursor,
+    /// and update the counter label. Scrolls to the first match when
+    /// one is found so the user gets immediate feedback without hitting
+    /// Enter.
+    pub fn update_search_matches(&self, query: &str) {
+        let imp = self.imp();
+        let store = imp.list_store();
+        let q = query.to_string();
+        let mut matches: Vec<String> = Vec::new();
+        let n = gio::prelude::ListModelExt::n_items(&store);
+        if !q.is_empty() {
+            for i in 0..n {
+                let Some(obj) = gio::prelude::ListModelExt::item(&store, i)
+                    .and_downcast::<MessageObject>() else { continue };
+                let eid = obj.event_id();
+                if eid.is_empty() || eid == "__unread_divider__" { continue; }
+                if search_message_matches(&obj.body(), &q) {
+                    matches.push(eid);
+                }
+            }
+        }
+        let count = matches.len();
+        *imp.search_matches.borrow_mut() = matches;
+        imp.search_cursor.set(-1);
+        if let Some(c) = imp.search_counter.get() {
+            c.set_text(&if q.is_empty() {
+                String::new()
+            } else if count == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{count} match{}", if count == 1 { "" } else { "es" })
+            });
+        }
+        if count > 0 {
+            self.search_step(true);
+        }
+    }
+
+    /// Advance the search cursor and scroll to the selected match.
+    pub fn search_step(&self, forward: bool) {
+        let imp = self.imp();
+        let matches = imp.search_matches.borrow();
+        let len = matches.len();
+        if len == 0 { return; }
+        let cur = search_advance_cursor(len, imp.search_cursor.get(), forward);
+        imp.search_cursor.set(cur);
+        let eid = matches[cur as usize].clone();
+        drop(matches);
+        if let Some(c) = imp.search_counter.get() {
+            c.set_text(&format!("{}/{}", cur + 1, len));
+        }
+        self.scroll_to_event(&eid);
+    }
+
+    pub fn refresh_alias_references(&self, alias: &str) {
+        if alias.is_empty() { return; }
+        let imp = self.imp();
+        // Walk every cached list_store — the resolution helps any room
+        // whose messages mention this alias, not only the current one.
+        for store in imp.list_store_cache.borrow().values() {
+            let n = gio::prelude::ListModelExt::n_items(store);
+            for i in 0..n {
+                let Some(obj) = gio::prelude::ListModelExt::item(store, i)
+                    .and_downcast::<MessageObject>() else { continue };
+                if !obj.formatted_body().is_empty() { continue; }
+                let body = obj.body();
+                if !body.contains(alias) { continue; }
+                // Re-run the plain-text prerender path. The new markup
+                // pulls the resolved room name from the directory.
+                let escaped = gtk::glib::markup_escape_text(&body).to_string();
+                let new_markup = crate::markdown::linkify_urls(&escaped);
+                if new_markup != obj.rendered_markup() {
+                    obj.set_rendered_markup(new_markup);
+                }
+            }
+        }
+    }
+
     pub fn refresh_flag_ui_for_user(&self, user_id: &str) {
         if user_id.is_empty() { return; }
         // Get the current room's list_view.
@@ -3733,8 +3948,17 @@ impl MessageView {
 /// (`add_reaction`) and the non-current-room mutation path
 /// (`apply_reaction_in_room`).
 fn apply_reaction_delta(msg: &MessageObject, emoji: &str, sender: &str) {
+    let merged = merge_reaction_delta_json(&msg.reactions_json(), emoji, sender);
+    msg.update_reactions_json(merged);
+}
+
+/// Pure JSON-level version of `apply_reaction_delta` — takes a
+/// `reactions_json` string and returns the result of folding one
+/// `(emoji, sender)` pair into it. Extracted so the dedupe and
+/// increment rules are unit-testable without constructing a GObject.
+pub(crate) fn merge_reaction_delta_json(json: &str, emoji: &str, sender: &str) -> String {
     let mut reactions: Vec<(String, u64, Vec<String>)> =
-        serde_json::from_str(&msg.reactions_json()).unwrap_or_default();
+        serde_json::from_str(json).unwrap_or_default();
     let pos_by_emoji: std::collections::HashMap<&str, usize> = reactions
         .iter().enumerate().map(|(i, (e, _, _))| (e.as_str(), i)).collect();
     match pos_by_emoji.get(emoji) {
@@ -3748,7 +3972,7 @@ fn apply_reaction_delta(msg: &MessageObject, emoji: &str, sender: &str) {
         }
         None => reactions.push((emoji.to_string(), 1, vec![sender.to_string()])),
     }
-    msg.update_reactions_json(serde_json::to_string(&reactions).unwrap_or_default());
+    serde_json::to_string(&reactions).unwrap_or_default()
 }
 
 fn tombstone_link_markup(room_id: &str, display: &str) -> String {
@@ -3881,6 +4105,35 @@ pub(crate) fn unread_label(n: u32) -> String {
 ///   - Background refresh (`messages_loaded`): use `max(current, new_count)`.
 ///     This preserves the count if the timer fired mid-refresh (new=0 < current),
 ///     and still updates it if new messages arrived (new > current).
+/// Case-insensitive substring search over a message body. Pure — no
+/// tokenising, stemming, or accent folding; ASCII-insensitive lowercase
+/// comparison is enough for the tranche-1 local search feature.
+/// Empty `query` never matches so the UI can clear the result set
+/// without a special case.
+pub(crate) fn search_message_matches(body: &str, query: &str) -> bool {
+    if query.is_empty() { return false; }
+    body.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Move the search cursor by `forward` (true = next, false = prev).
+/// Wraps around at both ends — matches Firefox/Chrome find-in-page
+/// behaviour. Returns the new cursor index, or -1 when the match list
+/// is empty.
+pub(crate) fn search_advance_cursor(len: usize, current: i32, forward: bool) -> i32 {
+    if len == 0 { return -1; }
+    let n = len as i32;
+    let cur = if current < 0 || current >= n {
+        if forward { -1 } else { 0 }
+    } else {
+        current
+    };
+    if forward {
+        (cur + 1) % n
+    } else {
+        (cur - 1 + n) % n
+    }
+}
+
 pub(crate) fn effective_unread_count(messages_loaded: bool, current: u32, new_count: u32) -> u32 {
     if messages_loaded { current.max(new_count) } else { new_count }
 }
@@ -4180,6 +4433,7 @@ mod tests {
         incremental_prev_batch, is_echo_duplicate, sorted_insert_pos_in, unread_label,
         effective_unread_count, prerender_body, prerender_reply_label, fnv1a_str,
         should_mark_as_new, should_show_refresh_banner, should_skip_empty_splice,
+        search_message_matches, search_advance_cursor, merge_reaction_delta_json,
     };
 
     #[test]
@@ -5179,5 +5433,111 @@ mod tests {
     #[test]
     fn front_evict_empty_store() {
         assert_eq!(front_evict_count(&[], 400), 0);
+    }
+
+    // ── in-room search tranche 1 ───────────────────────────────────────
+
+    #[test]
+    fn search_empty_query_never_matches() {
+        assert!(!search_message_matches("hello world", ""));
+    }
+
+    #[test]
+    fn search_case_insensitive_match() {
+        assert!(search_message_matches("Hello World", "WORLD"));
+        assert!(search_message_matches("THE END", "the"));
+    }
+
+    #[test]
+    fn search_no_match() {
+        assert!(!search_message_matches("hello", "xyz"));
+    }
+
+    #[test]
+    fn search_cursor_advances_forward_and_wraps() {
+        // len=3, starting from no selection → forward goes 0, 1, 2, 0.
+        let mut cur: i32 = -1;
+        cur = search_advance_cursor(3, cur, true);
+        assert_eq!(cur, 0);
+        cur = search_advance_cursor(3, cur, true);
+        assert_eq!(cur, 1);
+        cur = search_advance_cursor(3, cur, true);
+        assert_eq!(cur, 2);
+        cur = search_advance_cursor(3, cur, true);
+        assert_eq!(cur, 0, "must wrap to 0 from last match");
+    }
+
+    #[test]
+    fn search_cursor_advances_backward_and_wraps() {
+        // len=3, starting from no selection → prev goes 2, 1, 0, 2.
+        let mut cur: i32 = -1;
+        cur = search_advance_cursor(3, cur, false);
+        assert_eq!(cur, 2);
+        cur = search_advance_cursor(3, cur, false);
+        assert_eq!(cur, 1);
+        cur = search_advance_cursor(3, cur, false);
+        assert_eq!(cur, 0);
+        cur = search_advance_cursor(3, cur, false);
+        assert_eq!(cur, 2, "must wrap to last match from 0");
+    }
+
+    #[test]
+    fn search_cursor_empty_set_stays_neg1() {
+        assert_eq!(search_advance_cursor(0, -1, true), -1);
+        assert_eq!(search_advance_cursor(0, 5, false), -1);
+    }
+
+    // ── reaction delta merge (cross-room live update, shipped 6355536) ──
+
+    #[test]
+    fn reaction_delta_first_reaction_adds_pill() {
+        let out = merge_reaction_delta_json("[]", "👍", "@alice:example.org");
+        assert!(out.contains("👍"));
+        assert!(out.contains("@alice:example.org"));
+    }
+
+    #[test]
+    fn reaction_delta_second_reactor_increments_count() {
+        let out = merge_reaction_delta_json(
+            "[[\"👍\",1,[\"@alice:example.org\"]]]",
+            "👍",
+            "@bob:example.org",
+        );
+        let parsed: Vec<(String, u64, Vec<String>)> = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed[0].1, 2, "count must increment on second reactor");
+        assert_eq!(parsed[0].2.len(), 2);
+    }
+
+    #[test]
+    fn reaction_delta_duplicate_sender_is_noop() {
+        let out = merge_reaction_delta_json(
+            "[[\"👍\",1,[\"@alice:example.org\"]]]",
+            "👍",
+            "@alice:example.org",
+        );
+        let parsed: Vec<(String, u64, Vec<String>)> = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed[0].1, 1, "duplicate must not double-count");
+        assert_eq!(parsed[0].2.len(), 1);
+    }
+
+    #[test]
+    fn reaction_delta_different_emoji_appends_new_bucket() {
+        let out = merge_reaction_delta_json(
+            "[[\"👍\",1,[\"@alice:example.org\"]]]",
+            "❤️",
+            "@alice:example.org",
+        );
+        let parsed: Vec<(String, u64, Vec<String>)> = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().any(|(e, _, _)| e == "❤️"));
+    }
+
+    #[test]
+    fn reaction_delta_malformed_json_treated_as_empty() {
+        // If reactions_json somehow got corrupted, we start fresh.
+        let out = merge_reaction_delta_json("not json", "👍", "@alice:example.org");
+        let parsed: Vec<(String, u64, Vec<String>)> = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "👍");
     }
 }

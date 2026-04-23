@@ -280,6 +280,16 @@ pub enum MatrixEvent {
     AvatarReady { user_id: String, path: String },
     /// A room avatar has been downloaded and is available at `path`.
     RoomAvatarReady { room_id: String, path: String },
+    /// A `#alias:server` → room metadata resolution finished. `name` is
+    /// empty when the homeserver couldn't resolve the alias; `avatar_mxc`
+    /// is empty when the room has no avatar. The GTK side uses this to
+    /// update `directory` and re-render pill markup on matching messages.
+    AliasInfoResolved {
+        alias: String,
+        room_id: String,
+        name: String,
+        avatar_mxc: String,
+    },
     /// Result of SetOwnAvatar. On success, `new_mxc` holds the mxc://
     /// URI the homeserver assigned (empty string if the avatar was
     /// removed). On failure, `error` holds a user-facing message.
@@ -460,6 +470,10 @@ pub enum MatrixCommand {
     DownloadMedia { url: String, filename: String, source_json: String },
     /// Fetch and cache a member's avatar. No-op if already cached on disk.
     FetchAvatar { user_id: String, mxc_url: String },
+    /// Resolve a `#alias:server` to its room id + display name + avatar
+    /// so message-body pills can show the human-readable room name for
+    /// rooms the user hasn't joined. Used by the markdown linkify pass.
+    ResolveAliasInfo { alias: String },
     /// Fetch and cache a room's avatar. No-op if already cached on disk.
     FetchRoomAvatar { room_id: String, mxc_url: String },
     /// Toggle bookmark (m.favourite tag) on a room.
@@ -1284,6 +1298,13 @@ async fn matrix_task(
                         tokio::spawn(async move {
                             let _permit = AVATAR_PERMITS.acquire().await;
                             handle_fetch_avatar(&bg_client, &bg_tx, &user_id, &mxc_url).await;
+                        });
+                    }
+                    Ok(MatrixCommand::ResolveAliasInfo { alias }) => {
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_resolve_alias_info(&bg_client, &bg_tx, &alias).await;
                         });
                     }
                     Ok(MatrixCommand::DownloadMedia { url, filename, source_json }) => {
@@ -6134,6 +6155,82 @@ async fn handle_fetch_room_avatar(
         }
         Err(e) => tracing::warn!("FetchRoomAvatar: download failed for {room_id}: {e}"),
     }
+}
+
+/// Resolve `#alias:server` → room id + display name + avatar mxc.
+///
+/// Tries in order:
+///   1. `client.resolve_room_alias(alias)` — works even for unjoined
+///      rooms; gives us room_id + federation servers.
+///   2. `client.get_room(room_id)` — populated if we're joined OR if
+///      the SDK has cached state. Synchronous getters for name and
+///      avatar, so no extra network cost when it hits.
+///
+/// Always emits `AliasInfoResolved` so the GTK side can cache the
+/// negative result and stop re-querying. `name` empty = resolve
+/// failed; `room_id` empty only when the alias couldn't be resolved
+/// at all (server rejected / network error).
+async fn handle_resolve_alias_info(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    alias: &str,
+) {
+    use matrix_sdk::ruma::RoomAliasId;
+
+    let Ok(parsed) = RoomAliasId::parse(alias) else {
+        tracing::debug!("ResolveAliasInfo: malformed alias {alias:?}");
+        let _ = event_tx.send(MatrixEvent::AliasInfoResolved {
+            alias: alias.to_string(),
+            room_id: String::new(),
+            name: String::new(),
+            avatar_mxc: String::new(),
+        }).await;
+        return;
+    };
+
+    let resolved = match client.resolve_room_alias(&parsed).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("ResolveAliasInfo: {alias} failed: {e}");
+            let _ = event_tx.send(MatrixEvent::AliasInfoResolved {
+                alias: alias.to_string(),
+                room_id: String::new(),
+                name: String::new(),
+                avatar_mxc: String::new(),
+            }).await;
+            return;
+        }
+    };
+
+    let room_id = resolved.room_id.to_string();
+
+    // If the SDK has the room in its store (joined, or previously
+    // peeked/left), pull name and avatar from local state — no extra
+    // network call. For a truly external room that we've never seen,
+    // name stays empty; the GTK side will still learn the alias → id
+    // mapping, which improves future navigations.
+    let (name, avatar_mxc) = match client.get_room(&resolved.room_id) {
+        Some(room) => {
+            let name = room.cached_display_name()
+                .map(|n| n.to_string())
+                .or_else(|| room.name())
+                .unwrap_or_default();
+            let avatar = room.avatar_url().map(|u| u.to_string()).unwrap_or_default();
+            (name, avatar)
+        }
+        None => (String::new(), String::new()),
+    };
+
+    tracing::info!(
+        "ResolveAliasInfo: {alias} → room_id={room_id} name={:?} avatar_mxc_set={}",
+        name, !avatar_mxc.is_empty()
+    );
+    let _ = event_tx.send(MatrixEvent::AliasInfoResolved {
+        alias: alias.to_string(),
+        room_id,
+        name,
+        avatar_mxc,
+    }).await;
 }
 
 /// Shared reqwest client — avoids creating a new TCP connection for every

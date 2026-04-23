@@ -37,6 +37,9 @@ fn config_path() -> std::path::PathBuf {
 
 fn load_map_from_disk() -> HashMap<String, String> {
     let path = config_path();
+    // sync-io-ok: tiny user-edited config (typically <1 KB, a handful
+    // of host→host entries); runs once per session at first use, and
+    // on explicit reload_from_disk. Negligible on the GTK thread.
     let Ok(data) = std::fs::read_to_string(&path) else {
         return HashMap::new();
     };

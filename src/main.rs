@@ -304,6 +304,14 @@ mod sync_io_lint {
         // TODO: convert the write to gio::File::replace_async to avoid blocking the GTK thread.
         ("ollama_manager.rs", "std::fs::create_dir_all(parent)"),
         ("ollama_manager.rs", "std::fs::write(&dest, &data)"),
+        // plugins/community_safety — per-user flag + notes store; write is user-triggered
+        // (flag toggle in message row or user-info panel), load is once per session.
+        ("community_safety.rs", "std::fs::create_dir_all(&path)"),
+        ("community_safety.rs", "std::fs::read(&self.path)"),
+        ("community_safety.rs", "std::fs::write(&self.path, data)"),
+        // plugins/media_rewrite — tiny config file (<1 KB), loaded once per session on
+        // first rewrite_url call and on explicit reload_from_disk; no write path.
+        ("media_rewrite/mod.rs", "std::fs::read_to_string(&path)"),
     ];
 
     fn src_dir() -> std::path::PathBuf {
