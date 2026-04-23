@@ -138,6 +138,11 @@ mod imp {
         pub on_edit: RefCell<Option<Box<dyn Fn(String, String)>>>,
         /// Callback for deleting a message: (event_id).
         pub on_delete: RefCell<Option<Box<dyn Fn(String)>>>,
+        /// Callback for sharing a message: (room_id, event_id). Fired when
+        /// the row's Share button is clicked; MessageView supplies the
+        /// current room id so MxWindow can build the matrix.to permalink
+        /// and copy it to the clipboard.
+        pub on_share: RefCell<Option<Box<dyn Fn(String, String)>>>,
         /// Callback for media hover: (mxc_url, filename, anchor widget).
         pub on_media_click: RefCell<Option<Box<dyn Fn(String, String, String)>>>,
         /// Callback for sending a file: (file_path).
@@ -318,6 +323,7 @@ mod imp {
                 on_react: RefCell::new(None),
                 on_edit: RefCell::new(None),
                 on_delete: RefCell::new(None),
+                on_share: RefCell::new(None),
                 on_media_click: RefCell::new(None),
                 on_attach: RefCell::new(None),
                 on_dm: RefCell::new(None),
@@ -610,6 +616,17 @@ mod imp {
                         if let Some(v) = view_weak.upgrade() {
                             if let Some(ref cb) = *v.imp().on_delete.borrow() {
                                 cb(eid);
+                            }
+                        }
+                    });
+
+                    let view_weak = setup_view_weak.clone();
+                    row.set_on_share(move |eid| {
+                        if let Some(v) = view_weak.upgrade() {
+                            let rid = v.imp().current_room_id.borrow().clone();
+                            if rid.is_empty() { return; }
+                            if let Some(ref cb) = *v.imp().on_share.borrow() {
+                                cb(rid, eid);
                             }
                         }
                     });
@@ -1835,6 +1852,10 @@ impl MessageView {
 
     pub fn connect_delete<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_delete.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_share<F: Fn(String, String) + 'static>(&self, f: F) {
+        self.imp().on_share.replace(Some(Box::new(f)));
     }
 
     /// Enter edit mode — populate compose box with old text.

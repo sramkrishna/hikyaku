@@ -55,6 +55,10 @@ mod imp {
         pub on_edit: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String, String)>>>>,
         /// Callback: delete clicked → (event_id).
         pub on_delete: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
+        /// Callback: share clicked → (event_id). The handler (MessageView
+        /// then MxWindow) builds a matrix.to permalink using the current
+        /// room id and copies it to the clipboard.
+        pub on_share: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Callback: jump to replied-to message → (event_id).
         pub on_jump_to_reply: std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn(String)>>>>,
         /// Current reply-to event ID — updated on each bind.
@@ -260,6 +264,18 @@ mod imp {
             select_button.add_css_class("flat");
             select_button.add_css_class("circular");
 
+            // Share: copies a matrix.to permalink for this message to the
+            // clipboard. The row only knows the event_id; MessageView
+            // supplies the current room_id and MxWindow builds the URL.
+            // Icon is the GNOME "share" / "send" glyph so the intent
+            // reads as "give this message to someone else" not "save".
+            let share_button = gtk::Button::builder()
+                .icon_name("send-to-symbolic")
+                .tooltip_text("Copy message link")
+                .build();
+            share_button.add_css_class("flat");
+            share_button.add_css_class("circular");
+
             // Community-safety plugin: toggle a local "caution" flag on
             // this message's sender. One-click toggles (no dialog for
             // v1; category defaults to "caution", reason left empty).
@@ -284,6 +300,7 @@ mod imp {
             self.action_bar.append(&bookmark_button);
             self.action_bar.append(&copy_button);
             self.action_bar.append(&select_button);
+            self.action_bar.append(&share_button);
             #[cfg(feature = "community-safety")]
             self.action_bar.append(&flag_button);
             self.action_bar.append(&edit_button);
@@ -635,6 +652,19 @@ mod imp {
             select_button.connect_clicked(move |_| {
                 body_label.set_selectable(true);
                 body_label.grab_focus();
+            });
+
+            // Share button — bubble the event_id up to MessageView, which
+            // attaches the current room_id and forwards to MxWindow so
+            // MxWindow can build the matrix.to permalink + copy + toast.
+            let event_id = self.event_id.clone();
+            let on_share = self.on_share.clone();
+            share_button.connect_clicked(move |_| {
+                let eid = event_id.borrow().clone();
+                if eid.is_empty() { return; }
+                if let Some(ref cb) = *on_share.borrow() {
+                    cb(eid);
+                }
             });
 
             // Flag button — toggle ONLY the flag on this sender
@@ -1032,6 +1062,10 @@ impl MessageRow {
 
     pub fn set_on_delete<F: Fn(String) + 'static>(&self, f: F) {
         self.imp().on_delete.borrow_mut().replace(Box::new(f));
+    }
+
+    pub fn set_on_share<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp().on_share.borrow_mut().replace(Box::new(f));
     }
 
     pub fn set_on_jump_to_reply<F: Fn(String) + 'static>(&self, f: F) {

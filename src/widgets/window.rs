@@ -1255,6 +1255,18 @@ impl MxWindow {
             }
         });
 
+        // Share: row's Share button → matrix.to permalink → clipboard + toast.
+        // MessageView already attaches the current room_id before firing so
+        // the window doesn't have to reach for current_room_id a second time.
+        let toast_share = imp.toast_overlay.clone();
+        let window_weak_share = window.downgrade();
+        imp.message_view.connect_share(move |room_id, event_id| {
+            let Some(win) = window_weak_share.upgrade() else { return };
+            let url = build_matrix_to_event_url(&room_id, &event_id);
+            win.display().clipboard().set_text(&url);
+            toast(&toast_share, "Message link copied");
+        });
+
         // Wire up edit → send replacement.
         let cmd_tx_edit = command_tx.clone();
         let window_weak_edit = window.downgrade();
@@ -7671,6 +7683,27 @@ fn parse_matrix_link_or_id(text: &str) -> Option<String> {
     None
 }
 
+/// Build a matrix.to permalink pointing at a specific event inside a room.
+/// Used by the Share button on message rows. Canonical form is
+/// `https://matrix.to/#/!room:server/$event:server` — the leading `!` of the
+/// room id is percent-encoded so the fragment stays canonical and the event
+/// id is appended verbatim. Room aliases (`#alias:server`) go in unencoded
+/// besides the `#` which matrix.to accepts either way.
+///
+/// We omit `?via=` hints in v1 — matrix.to will still resolve on most
+/// homeservers via its fallback path. A follow-up can pull a list of
+/// well-connected servers from the room's member set.
+pub(crate) fn build_matrix_to_event_url(room_id: &str, event_id: &str) -> String {
+    let room_part = if let Some(rest) = room_id.strip_prefix('!') {
+        format!("%21{rest}")
+    } else if let Some(rest) = room_id.strip_prefix('#') {
+        format!("%23{rest}")
+    } else {
+        room_id.to_string()
+    };
+    format!("https://matrix.to/#/{room_part}/{event_id}")
+}
+
 // ── bg_refresh coalescing helpers ────────────────────────────────────────────
 
 /// Insert or replace the pending batch for `room_id`.
@@ -7735,7 +7768,7 @@ fn percent_decode_simple(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bg_refresh_insert, should_process_bg_refresh_sync};
+    use super::{bg_refresh_insert, build_matrix_to_event_url, should_process_bg_refresh_sync};
     use crate::matrix::MessageInfo;
     use std::collections::HashMap;
 
@@ -7759,6 +7792,20 @@ mod tests {
 
     fn batch(ids: &[&str]) -> Vec<MessageInfo> {
         ids.iter().map(|id| make_msg(id)).collect()
+    }
+
+    // ── matrix.to permalink builder ──────────────────────────────────────────
+
+    #[test]
+    fn share_url_percent_encodes_room_id_bang() {
+        let url = build_matrix_to_event_url("!abc:example.com", "$ev");
+        assert_eq!(url, "https://matrix.to/#/%21abc:example.com/$ev");
+    }
+
+    #[test]
+    fn share_url_percent_encodes_room_alias_hash() {
+        let url = build_matrix_to_event_url("#room:example.com", "$ev");
+        assert_eq!(url, "https://matrix.to/#/%23room:example.com/$ev");
     }
 
     // ── Core scheduling invariant ─────────────────────────────────────────────
