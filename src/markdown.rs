@@ -451,18 +451,23 @@ fn linkify_aliases(text: &str) -> String {
         let alias = &text[i..k]; // #local:server
         // Percent-encode the '#' for the matrix.to fragment.
         let href = format!("https://matrix.to/#/%23{}", &text[local_start..k]);
-        // Pango can't apply widget CSS to a markup span (no class selectors),
-        // so style the alias pill via Pango span attributes directly: drop
-        // the default link underline, use an accent foreground, and give it
-        // a subtle translucent background so it reads as a pill instead of
-        // a plain underlined URL. Colours picked to track the libadwaita
-        // accent tones; the background alpha (~0.14) keeps contrast in
-        // both light and dark themes.
+        // Pango can't apply widget CSS to a markup span (no class selectors)
+        // and span attributes don't support padding/radius, so we fake a
+        // pill visually:
+        //   * NBSPs on each side inside the span → horizontal breathing
+        //     room without allowing the pill to wrap at the seams.
+        //   * Bold weight + stronger accent foreground so the label reads
+        //     as a distinct token rather than a link in the prose.
+        //   * Background alpha bumped to ~0.40 so the pill actually shows
+        //     against both light and dark themes (the earlier ~0.14 alpha
+        //     was invisible on the default dark theme).
+        //   * underline="none" keeps the link decoration off.
         result.push_str(&format!(
             "<a href=\"{href}\"><span \
-                foreground=\"#62a0ea\" \
-                background=\"#3584e424\" \
-                underline=\"none\">{alias}</span></a>",
+                foreground=\"#1c71d8\" \
+                background=\"#3584e466\" \
+                weight=\"bold\" \
+                underline=\"none\">\u{a0}{alias}\u{a0}</span></a>",
         ));
         i = k;
     }
@@ -544,7 +549,10 @@ mod tests {
         let out = linkify_urls("see #outreachy:gnome.org for info");
         assert!(out.contains("<a href=\"https://matrix.to/#/%23outreachy:gnome.org\">"),
             "anchor href missing: {out}");
-        assert!(out.contains(">#outreachy:gnome.org</span></a>"),
+        // Alias text survives inside the span (bracketed by NBSPs for
+        // pill padding). Just assert the alias appears once, still
+        // wrapped by the span + anchor closers.
+        assert!(out.contains("#outreachy:gnome.org\u{a0}</span></a>"),
             "pill span missing: {out}");
     }
 
