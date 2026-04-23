@@ -1589,6 +1589,10 @@ impl MessageRow {
             if *row.imp().event_id.borrow() != bound_eid { return; }
             let markup = msg.rendered_markup();
             if markup.is_empty() { return; }
+            tracing::info!(
+                "scroll-diag: async markup applied eid={} markup_len={}",
+                bound_eid, markup.len()
+            );
             row.imp().body_label.set_markup(&markup);
             row.imp().body_label.set_visible(true);
         });

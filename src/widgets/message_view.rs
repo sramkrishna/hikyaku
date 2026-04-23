@@ -2652,7 +2652,16 @@ impl MessageView {
         let imp = self.imp();
         let today = glib::DateTime::now_local().ok();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
+        let vadj_before = imp.scrolled_window().vadjustment();
+        tracing::info!(
+            "scroll-diag: prepend_messages n={} vadj_before value={:.1} upper={:.1}",
+            objs.len(), vadj_before.value(), vadj_before.upper()
+        );
         imp.list_store().splice(0, 0, &objs);
+        tracing::info!(
+            "scroll-diag: prepend_messages post-splice vadj value={:.1} upper={:.1}",
+            vadj_before.value(), vadj_before.upper()
+        );
         // Add new objects to the event_index.
         {
             let mut idx = imp.event_index.borrow_mut();
