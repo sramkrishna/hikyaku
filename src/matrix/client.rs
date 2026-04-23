@@ -5265,6 +5265,21 @@ async fn handle_accept_invite(client: &Client, event_tx: &Sender<MatrixEvent>, r
                 room_id: room_id.to_string(),
                 room_name,
             }).await;
+
+            // Push a fresh room list so the sidebar picks up the
+            // newly-joined room immediately. Without this, the user
+            // sees the "Joined" toast but the room only appears on
+            // the next periodic sync-driven room list refresh
+            // (currently every 3 minutes) or when a message arrives
+            // in it. A user reported an accepted DM was confirmed
+            // as joined yet never showed up in the UI — this is
+            // that missing nudge.
+            let bg_client = client.clone();
+            let bg_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let rooms = collect_room_info(&bg_client, None).await;
+                let _ = bg_tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
+            });
         }
         Err(e) => {
             tracing::error!("Failed to accept invite to {room_id}: {e}");
