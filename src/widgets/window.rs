@@ -4392,7 +4392,15 @@ impl MxWindow {
             });
         }
 
-        dialog.set_child(Some(&content));
+        // Wrap the content in a ToolbarView with a HeaderBar so the
+        // dialog gets the standard close button in the top-right (the
+        // bare adw::Dialog has no visible close affordance — only the
+        // Escape key works, which is not discoverable).
+        let toolbar = adw::ToolbarView::new();
+        let header = adw::HeaderBar::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
         dialog.present(Some(self));
     }
 
