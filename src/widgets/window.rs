@@ -448,6 +448,20 @@ fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
     }
 }
 
+/// Human-readable label for the flag-severity slider, shown next to the
+/// scale so the slider self-documents. Index 0 = "happy / no flag";
+/// 1..3 = the three stored severities. Pure — used only by the flag
+/// editor setup path.
+#[cfg(feature = "community-safety")]
+fn severity_state_text(value: u8) -> &'static str {
+    match value {
+        0 => "No flag",
+        1 => "Note",
+        2 => "Caution",
+        _ => "Unsafe",
+    }
+}
+
 fn toast(overlay: &adw::ToastOverlay, msg: &str) {
     overlay.add_toast(adw::Toast::new(msg));
 }
@@ -4539,16 +4553,43 @@ impl MxWindow {
             btn.display().clipboard().set_text(&mxid_for_copy);
             toast(&toast_overlay_for_copy, "Matrix address copied");
         });
+        // Subtle "Send DM" icon button right next to Copy. Replaces
+        // the full-width suggested-action button at the bottom of the
+        // panel — that was visually heavy for a secondary action when
+        // the user-info surface is primarily informational.
+        let dm_btn = gtk::Button::builder()
+            .icon_name("mail-send-symbolic")
+            .tooltip_text("Send a direct message")
+            .css_classes(["flat", "circular"])
+            .build();
+        let tx_dm = self.imp().command_tx.get().unwrap().clone();
+        let window_weak_dm = self.downgrade();
+        let uid_for_dm = user_id.to_string();
+        dm_btn.connect_clicked(move |_| {
+            let tx = tx_dm.clone();
+            let uid = uid_for_dm.clone();
+            let win_weak = window_weak_dm.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
+                if let Some(win) = win_weak.upgrade() {
+                    win.close_user_info_panel();
+                }
+            });
+        });
         mxid_row.append(&mxid_label);
         mxid_row.append(&copy_btn);
+        mxid_row.append(&dm_btn);
         content.append(&mxid_row);
 
-        // Flag editor (community-safety plugin). Full control over
-        // category, severity, reason, and evidence URL — the Flag
-        // button in the message action bar is a one-click shortcut
-        // that sets the Interactive / Caution defaults; this is the
-        // surface for picking Race / LGBTQ / a11y / Far-right etc.,
-        // bumping severity, writing a reason, and attaching a link.
+        // Flag editor (community-safety plugin). Category picker + a
+        // "vibe" slider that spans 0 (happy → no flag) through 3
+        // (unsafe → warning red). Reason / evidence entries were
+        // dropped — the per-user notes textbox below handles every
+        // longform case we had in mind. The slider snaps to four ticks
+        // so an accidental small drag lands on an intended severity;
+        // category "(none)" always clears the flag regardless of
+        // slider position, fixing the previous "forced to pick a
+        // severity on an empty flag" footgun.
         #[cfg(feature = "community-safety")]
         let flag_widgets = {
             use crate::plugins::community_safety::{
@@ -4594,40 +4635,57 @@ impl MxWindow {
             cat_group.add(&category_row);
             content.append(&cat_group);
 
-            // Severity dropdown: Note / Caution / Warning. Default
-            // Caution for any existing flag where severity is unset.
-            let sev_items = gtk::StringList::new(&[
-                "1 — Note (subtle)",
-                "2 — Caution (amber)",
-                "3 — Warning (red)",
-            ]);
-            let sev_idx: u32 = match prior.as_ref().map(|e| e.effective_severity()).unwrap_or(2) {
-                1 => 0,
-                3 => 2,
-                _ => 1,
+            // Severity slider: 0 = happy / no flag, 1 = Note, 2 = Caution,
+            // 3 = Warning (unsafe). Initial value is the stored severity
+            // when a flag exists, or 0 when it doesn't. An adjacent label
+            // shows the human-readable state so the slider self-documents.
+            let sev_initial: f64 = match prior.as_ref() {
+                Some(e) if !e.category.is_empty() => e.effective_severity() as f64,
+                _ => 0.0,
             };
-            let severity_row = adw::ComboRow::builder()
-                .title("Severity")
-                .model(&sev_items)
-                .selected(sev_idx)
+            let sev_adj = gtk::Adjustment::new(sev_initial, 0.0, 3.0, 1.0, 1.0, 0.0);
+            let sev_scale = gtk::Scale::builder()
+                .adjustment(&sev_adj)
+                .orientation(gtk::Orientation::Horizontal)
+                .digits(0)
+                .draw_value(false)
+                .hexpand(true)
                 .build();
-            let sev_group = adw::PreferencesGroup::new();
-            sev_group.add(&severity_row);
-            content.append(&sev_group);
+            sev_scale.set_round_digits(0);
+            // Distinctive "temperature" ticks: blank-face → yellow →
+            // orange → red. The coloured circles are easier to scan
+            // than text labels and echo the sender-row glyphs on the
+            // last two ticks (the ones that alert on the nick).
+            sev_scale.add_mark(0.0, gtk::PositionType::Bottom, Some("😀"));
+            sev_scale.add_mark(1.0, gtk::PositionType::Bottom, Some("🟡"));
+            sev_scale.add_mark(2.0, gtk::PositionType::Bottom, Some("🟠"));
+            sev_scale.add_mark(3.0, gtk::PositionType::Bottom, Some("🔴"));
 
-            let reason_entry = gtk::Entry::builder()
-                .placeholder_text("Reason (optional)")
-                .text(prior.as_ref().map(|e| e.reason.as_str()).unwrap_or(""))
+            let sev_state_label = gtk::Label::builder()
+                .label(severity_state_text(sev_initial as u8))
+                .halign(gtk::Align::Start)
+                .css_classes(["dim-label", "caption"])
+                .margin_start(8)
                 .build();
-            content.append(&reason_entry);
-
-            let evidence_entry = gtk::Entry::builder()
-                .placeholder_text("Evidence link (matrix.to URL, optional)")
-                .text(prior.as_ref().map(|e| e.evidence.as_str()).unwrap_or(""))
+            let sev_row_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .margin_top(4)
+                .margin_bottom(12)
                 .build();
-            content.append(&evidence_entry);
+            sev_row_box.append(&sev_scale);
+            sev_row_box.append(&sev_state_label);
+            content.append(&sev_row_box);
 
-            Some((category_row, severity_row, reason_entry, evidence_entry, extra_category))
+            // Keep the side label in sync with the slider.
+            let label_weak = sev_state_label.downgrade();
+            sev_scale.connect_value_changed(move |s| {
+                if let Some(lbl) = label_weak.upgrade() {
+                    lbl.set_text(severity_state_text(s.value().round() as u8));
+                }
+            });
+
+            Some((category_row, sev_scale, extra_category))
         };
         #[cfg(not(feature = "community-safety"))]
         let _flag_widgets: Option<()> = None;
@@ -4672,38 +4730,6 @@ impl MxWindow {
             content.append(&spacer);
         }
 
-        let actions = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .halign(gtk::Align::Fill)
-            .homogeneous(true)
-            .build();
-        let dm_btn = gtk::Button::builder()
-            .label("Send DM")
-            .css_classes(["suggested-action"])
-            .build();
-        actions.append(&dm_btn);
-        content.append(&actions);
-
-        // Send-DM action: dispatch CreateDm, return to the room list.
-        // The new DM room will be selected by the CreateDm handler, so
-        // collapsing the panel is safe — the user sees the fresh DM
-        // room focused in the sidebar.
-        let tx_dm = self.imp().command_tx.get().unwrap().clone();
-        let window_weak_dm = self.downgrade();
-        let uid_for_dm = user_id.to_string();
-        dm_btn.connect_clicked(move |_| {
-            let tx = tx_dm.clone();
-            let uid = uid_for_dm.clone();
-            let win_weak = window_weak_dm.clone();
-            glib::spawn_future_local(async move {
-                let _ = tx.send(MatrixCommand::CreateDm { user_id: uid }).await;
-                if let Some(win) = win_weak.upgrade() {
-                    win.close_user_info_panel();
-                }
-            });
-        });
-
         // Build the save closure that mirrors the old connect_closed
         // handler. It runs when the user leaves the panel (Back button
         // or opens a different user's panel). Persisted into
@@ -4712,7 +4738,7 @@ impl MxWindow {
         {
             let uid_for_save = user_id.to_string();
             let window_weak_save = self.downgrade();
-            let (cat_row, sev_row, reason_entry, evidence_entry, extra_category) =
+            let (cat_row, sev_scale, extra_category) =
                 flag_widgets.expect("flag_widgets is always Some under community-safety");
             let save: Box<dyn Fn()> = Box::new(move || {
                 use crate::plugins::community_safety::{
@@ -4728,7 +4754,7 @@ impl MxWindow {
                 let notes_text = buffer.text(&bstart, &bend, false).to_string();
                 let notes_trimmed = notes_text.trim().to_string();
 
-                let (new_category, new_severity, new_reason, new_evidence) = {
+                let (new_category, new_severity) = {
                     let cat_idx = cat_row.selected();
                     let cat = if cat_idx == 0 {
                         String::new()
@@ -4740,38 +4766,46 @@ impl MxWindow {
                             extra_category.clone().unwrap_or_default()
                         }
                     };
-                    let sev = match sev_row.selected() {
-                        0 => SEVERITY_NOTE,
-                        2 => SEVERITY_WARNING,
-                        _ => SEVERITY_CAUTION,
+                    // Slider → severity. 0 means "no flag" (happy) — the
+                    // category is cleared below regardless of position,
+                    // but we also clear it here when slider=0 so category
+                    // + 0-slider is consistent and doesn't keep a stale
+                    // flag around with severity=0.
+                    let slider = sev_scale.value().round() as u8;
+                    let (cat_final, sev) = match slider {
+                        0 => (String::new(), SEVERITY_NOTE),
+                        1 => (cat, SEVERITY_NOTE),
+                        2 => (cat, SEVERITY_CAUTION),
+                        _ => (cat, SEVERITY_WARNING),
                     };
-                    let reason = reason_entry.text().to_string();
-                    let evidence = evidence_entry.text().to_string();
-                    (cat, sev, reason, evidence)
+                    (cat_final, sev)
                 };
 
                 let prior_category = prior.as_ref().map(|e| e.category.clone()).unwrap_or_default();
                 let prior_severity = prior.as_ref().map(|e| e.effective_severity()).unwrap_or(SEVERITY_CAUTION);
-                let prior_reason = prior.as_ref().map(|e| e.reason.clone()).unwrap_or_default();
-                let prior_evidence = prior.as_ref().map(|e| e.evidence.clone()).unwrap_or_default();
                 let prior_notes = prior.as_ref().map(|e| e.notes.clone()).unwrap_or_default();
 
                 let flag_changed = new_category != prior_category
-                    || (!new_category.is_empty() && new_severity != prior_severity)
-                    || (!new_category.is_empty() && new_reason != prior_reason)
-                    || (!new_category.is_empty() && new_evidence != prior_evidence);
+                    || (!new_category.is_empty() && new_severity != prior_severity);
                 let notes_changed = notes_trimmed != prior_notes;
 
                 if flag_changed {
                     if new_category.is_empty() {
                         store.clear_flag(&uid_for_save);
                     } else {
+                        // Reason and evidence were removed from the UI
+                        // (see PR dropping those entries) — notes are
+                        // the longform surface now. Preserve any prior
+                        // reason/evidence that was set before the UI
+                        // change so migrating users don't lose data.
+                        let reason = prior.as_ref().map(|e| e.reason.as_str()).unwrap_or("");
+                        let evidence = prior.as_ref().map(|e| e.evidence.as_str()).unwrap_or("");
                         store.set_flag_full(
                             &uid_for_save,
                             &new_category,
                             new_severity,
-                            &new_reason,
-                            &new_evidence,
+                            reason,
+                            evidence,
                         );
                     }
                 }

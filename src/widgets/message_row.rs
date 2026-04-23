@@ -1141,32 +1141,39 @@ impl MessageRow {
         };
         if entry.is_flagged() {
             let cat_text = category_label(&entry.category);
-            // Keep the visible glyph privacy-friendly: just a coloured
-            // shape, never the category label. Category text only shows
-            // in the tooltip so it doesn't leak into screenshots.
-            let (markup, prefix) = match entry.effective_severity() {
-                SEVERITY_NOTE => (
-                    "<span foreground=\"#f5c211\"> • </span>".to_string(),
-                    "Noted",
-                ),
-                SEVERITY_WARNING => (
+            // Only Caution and Warning surface a glyph on the nick —
+            // Note is a private marker (visible in the user-info panel
+            // and tooltips only) so the row stays clean for low-priority
+            // flags. Category text stays out of the visible glyph for
+            // screenshot safety.
+            let rendered = match entry.effective_severity() {
+                SEVERITY_NOTE => None,
+                SEVERITY_WARNING => Some((
                     "<span foreground=\"#e01b24\"> ● </span>".to_string(),
                     "Warning",
-                ),
-                _ => (
+                )),
+                _ => Some((
                     "<span foreground=\"#e5a50a\"> ⚠ </span>".to_string(),
                     "Caution",
-                ),
+                )),
             };
-            label.set_markup(&markup);
-            let tip = if entry.reason.is_empty() {
-                format!("{prefix}: {cat_text}")
-            } else {
-                format!("{prefix} — {cat_text}: {}", entry.reason)
-            };
-            label.set_tooltip_text(Some(&tip));
-            label.set_visible(true);
-            let _ = SEVERITY_NOTE; let _ = SEVERITY_CAUTION; let _ = SEVERITY_WARNING;
+            match rendered {
+                Some((markup, prefix)) => {
+                    label.set_markup(&markup);
+                    let tip = if entry.reason.is_empty() {
+                        format!("{prefix}: {cat_text}")
+                    } else {
+                        format!("{prefix} — {cat_text}: {}", entry.reason)
+                    };
+                    label.set_tooltip_text(Some(&tip));
+                    label.set_visible(true);
+                }
+                None => {
+                    // Note: stored flag, but no visible glyph on the nick.
+                    label.set_visible(false);
+                }
+            }
+            let _ = SEVERITY_CAUTION;
         } else if entry.has_notes() {
             label.set_markup(
                 "<span foreground=\"#62a0ea\" size=\"smaller\"> ℹ </span>",
@@ -1474,30 +1481,35 @@ impl MessageRow {
             } else if let Some(entry) = FLAGGED_STORE.get(&sender_id) {
                 if entry.is_flagged() {
                     let label = category_label(&entry.category);
-                    // Visible glyph only — category text lives in the
-                    // tooltip so screenshots don't leak it.
-                    let (markup, tooltip_prefix) = match entry.effective_severity() {
-                        SEVERITY_NOTE => (
-                            "<span foreground=\"#f5c211\"> • </span>",
-                            "Noted",
-                        ),
-                        SEVERITY_WARNING => (
+                    // Only Caution and Warning surface a glyph on the nick.
+                    // Note is silent here by design (see refresh_flag_ui).
+                    let rendered: Option<(&'static str, &'static str)> = match entry.effective_severity() {
+                        SEVERITY_NOTE => None,
+                        SEVERITY_WARNING => Some((
                             "<span foreground=\"#e01b24\"> ● </span>",
                             "Warning",
-                        ),
-                        _ /* SEVERITY_CAUTION and any out-of-range */ => (
+                        )),
+                        _ /* SEVERITY_CAUTION and any out-of-range */ => Some((
                             "<span foreground=\"#e5a50a\"> ⚠ </span>",
                             "Caution",
-                        ),
+                        )),
                     };
-                    imp.sender_flag_label.set_markup(markup);
-                    let tooltip = if entry.reason.is_empty() {
-                        format!("{tooltip_prefix}: {label}")
-                    } else {
-                        format!("{tooltip_prefix} — {label}: {}", entry.reason)
-                    };
-                    imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
-                    imp.sender_flag_label.set_visible(true);
+                    let _ = SEVERITY_CAUTION;
+                    match rendered {
+                        Some((markup, tooltip_prefix)) => {
+                            imp.sender_flag_label.set_markup(markup);
+                            let tooltip = if entry.reason.is_empty() {
+                                format!("{tooltip_prefix}: {label}")
+                            } else {
+                                format!("{tooltip_prefix} — {label}: {}", entry.reason)
+                            };
+                            imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
+                            imp.sender_flag_label.set_visible(true);
+                        }
+                        None => {
+                            imp.sender_flag_label.set_visible(false);
+                        }
+                    }
                 } else if entry.has_notes() {
                     imp.sender_flag_label.set_markup(
                         "<span foreground=\"#62a0ea\" size=\"smaller\"> ℹ </span>",
