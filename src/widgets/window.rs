@@ -7685,18 +7685,16 @@ fn parse_matrix_link_or_id(text: &str) -> Option<String> {
 
 /// Build a matrix.to permalink pointing at a specific event inside a room.
 /// Used by the Share button on message rows. Canonical form is
-/// `https://matrix.to/#/!room:server/$event:server` — the leading `!` of the
-/// room id is percent-encoded so the fragment stays canonical and the event
-/// id is appended verbatim. Room aliases (`#alias:server`) go in unencoded
-/// besides the `#` which matrix.to accepts either way.
+/// `https://matrix.to/#/!room:server/$event` — only the `#` of a room alias
+/// needs percent-encoding (the outer `#` is the fragment delimiter, so a
+/// second literal `#` would terminate the fragment). `!` is URL-safe and
+/// stays literal so the link reads like the ones Element / Cinny produce.
 ///
 /// We omit `?via=` hints in v1 — matrix.to will still resolve on most
 /// homeservers via its fallback path. A follow-up can pull a list of
 /// well-connected servers from the room's member set.
 pub(crate) fn build_matrix_to_event_url(room_id: &str, event_id: &str) -> String {
-    let room_part = if let Some(rest) = room_id.strip_prefix('!') {
-        format!("%21{rest}")
-    } else if let Some(rest) = room_id.strip_prefix('#') {
+    let room_part = if let Some(rest) = room_id.strip_prefix('#') {
         format!("%23{rest}")
     } else {
         room_id.to_string()
@@ -7797,13 +7795,17 @@ mod tests {
     // ── matrix.to permalink builder ──────────────────────────────────────────
 
     #[test]
-    fn share_url_percent_encodes_room_id_bang() {
+    fn share_url_keeps_room_id_bang_literal() {
+        // `!` is URL-safe; don't percent-encode it. Matches the form
+        // Element / Cinny / matrix.to itself emit.
         let url = build_matrix_to_event_url("!abc:example.com", "$ev");
-        assert_eq!(url, "https://matrix.to/#/%21abc:example.com/$ev");
+        assert_eq!(url, "https://matrix.to/#/!abc:example.com/$ev");
     }
 
     #[test]
     fn share_url_percent_encodes_room_alias_hash() {
+        // `#` *must* be encoded — a literal second `#` would close the
+        // URL fragment early, truncating the path at the alias.
         let url = build_matrix_to_event_url("#room:example.com", "$ev");
         assert_eq!(url, "https://matrix.to/#/%23room:example.com/$ev");
     }

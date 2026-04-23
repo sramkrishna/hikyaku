@@ -3685,13 +3685,11 @@ impl MessageView {
 /// links. The visible text is the human-readable name when we have one,
 /// falling back to the room id so the user can still see and copy it.
 fn tombstone_link_markup(room_id: &str, display: &str) -> String {
-    // Percent-encode just the `!` → `%21` so the matrix.to fragment stays
-    // canonical; the rest of the id (server part after `:`) is URL-safe.
-    let href = if let Some(rest) = room_id.strip_prefix('!') {
-        format!("https://matrix.to/#/%21{rest}")
-    } else {
-        format!("https://matrix.to/#/{room_id}")
-    };
+    // `!` is URL-safe so keep it literal (matches Element / matrix.to's
+    // canonical form). An alias (`#`) would collide with the fragment
+    // delimiter and needs `%23`, but tombstones only ever point at a
+    // concrete room id so we don't handle that case here.
+    let href = format!("https://matrix.to/#/{room_id}");
     let href_esc = glib::markup_escape_text(&href);
     let text_esc = glib::markup_escape_text(display);
     format!("<a href=\"{href_esc}\">{text_esc}</a>")
