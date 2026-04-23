@@ -4302,7 +4302,9 @@ impl MxWindow {
             .css_classes(["suggested-action"])
             .build();
         let cancel_btn = gtk::Button::builder()
-            .label("Cancel")
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel")
+            .css_classes(["flat", "circular"])
             .build();
 
         let bar = gtk::Box::builder()
@@ -4885,6 +4887,12 @@ impl MxWindow {
         let list_for_changed = completion_list.clone();
         let servers_for_changed = known_servers.clone();
         let submit_from_list = submit_user_id.clone();
+        // Avatar lookup handles for the row builder: the window's
+        // local-path cache (populated by MatrixEvent::AvatarReady) and
+        // the command channel to enqueue FetchAvatar when we know the
+        // mxc but haven't downloaded it yet.
+        let win_avatar_cache = imp.avatar_cache.clone();
+        let win_cmd_tx = tx.clone();
         entry.connect_changed(move |e| {
             let raw = e.text().to_string();
             let trimmed = raw.trim_start_matches('@').to_string();
@@ -4901,12 +4909,91 @@ impl MxWindow {
                 let row = gtk::ListBoxRow::builder()
                     .activatable(true)
                     .build();
-                let label = gtk::Label::builder()
-                    .label(&full)
-                    .halign(gtk::Align::Start)
+
+                // Look up the candidate in the global directory — most
+                // synthetic "@local:server" guesses won't be known users,
+                // but when one IS (we've seen them in a room / rolodex),
+                // we get their display name and avatar for free. Known
+                // candidates render with the two-line name+mxid layout
+                // mirroring the nick popover; unknown ones stay as a
+                // single-line mxid with an initials avatar.
+                let known = crate::directory::user(&full);
+
+                let avatar = adw::Avatar::builder()
+                    .size(24)
+                    .text(known.as_ref()
+                        .map(|u| u.display_name.as_str())
+                        .unwrap_or(trimmed.as_str()))
+                    .show_initials(true)
+                    .build();
+                if let Some(ref u) = known {
+                    if !u.avatar_mxc.is_empty() {
+                        let cached_path = win_avatar_cache
+                            .borrow()
+                            .get(&full)
+                            .cloned();
+                        match cached_path {
+                            Some(p) if !p.is_empty() => {
+                                if let Ok(tex) = gtk::gdk::Texture::from_filename(&p) {
+                                    avatar.set_custom_image(Some(&tex));
+                                }
+                            }
+                            _ => {
+                                // Enqueue a fetch so subsequent popover
+                                // openings render the downloaded image.
+                                let tx = win_cmd_tx.clone();
+                                let uid = full.clone();
+                                let mxc = u.avatar_mxc.clone();
+                                glib::spawn_future_local(async move {
+                                    let _ = tx.send(
+                                        MatrixCommand::FetchAvatar { user_id: uid, mxc_url: mxc }
+                                    ).await;
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let text_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(0)
+                    .build();
+                match known.as_ref() {
+                    Some(u) if !u.display_name.is_empty() && u.display_name != full => {
+                        text_box.append(&gtk::Label::builder()
+                            .label(&u.display_name)
+                            .halign(gtk::Align::Start)
+                            .css_classes(["body"])
+                            .build());
+                        text_box.append(&gtk::Label::builder()
+                            .label(&full)
+                            .halign(gtk::Align::Start)
+                            .css_classes(["dim-label", "caption"])
+                            .build());
+                    }
+                    _ => {
+                        text_box.append(&gtk::Label::builder()
+                            .label(&full)
+                            .halign(gtk::Align::Start)
+                            .build());
+                    }
+                }
+
+                let row_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(8)
                     .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
                     .build();
-                row.set_child(Some(&label));
+                row_box.append(&avatar);
+                row_box.append(&text_box);
+                row.set_child(Some(&row_box));
+                // Stash the full mxid on the row so do_start's "pick the
+                // selected row" path can read it without poking into the
+                // nested Box. (Label-based extraction worked before; mxid
+                // now lives in the caption sub-label for known users, so
+                // a widget-name stash is more robust.)
+                row.set_widget_name(&full);
+
                 let full_clone = full.clone();
                 let submit = submit_from_list.clone();
                 let popover = popover_for_changed.clone();
@@ -4931,10 +5018,13 @@ impl MxWindow {
             let text = entry_for_start.text().to_string();
             if text.is_empty() { return; }
             // If the text lacks ':' try the highlighted completion row first.
+            // The full mxid is stashed on the ListBoxRow via set_widget_name
+            // so we don't have to dig through the nested Avatar/Label layout.
             if !text.contains(':') {
                 if let Some(selected) = list_for_start.selected_row() {
-                    if let Some(label) = selected.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
-                        submit_for_start(label.label().to_string());
+                    let stashed = selected.widget_name().to_string();
+                    if !stashed.is_empty() {
+                        submit_for_start(stashed);
                         return;
                     }
                 }
