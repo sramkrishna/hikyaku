@@ -2629,6 +2629,60 @@ async fn start_sync(
         });
     }
 
+    // Catch-up pass: migrate historically-mis-categorised 1-to-1 rooms
+    // into m.direct so they show up in the DM section.
+    //
+    // Background: Matrix clients that don't set `is_direct: true` on
+    // DM invites left us with real DMs sitting in the regular rooms
+    // list. The accept-side fix (handle_accept_invite's heuristic)
+    // only helps for NEW invites; rooms the user already joined
+    // before that fix stay mis-categorised forever because no code
+    // path re-runs on them. This pass closes that gap.
+    //
+    // Heuristic mirrors the accept-side: joined_members_count == 2
+    // AND not already direct AND not a space AND not tombstoned →
+    // call set_is_direct(true). Runs once per session, non-blocking,
+    // and waits 2s so the SDK's first sync response has populated
+    // room state (joined_members_count pre-sync can read 0 on rooms
+    // that only have hero summaries cached).
+    //
+    // Safety: false positives (a 2-person group room mis-tagged as
+    // DM) are recoverable — the user can unflag it — and rare
+    // compared to the "stuck DM invisible in DM section" cost of
+    // leaving the bug in place.
+    {
+        let dm_migrate_client = client.clone();
+        let dm_migrate_tx = event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut migrated: u32 = 0;
+            for room in dm_migrate_client.joined_rooms() {
+                if room.is_space() || room.is_tombstoned() { continue; }
+                if room.is_direct().await.unwrap_or(false) { continue; }
+                let members = room.joined_members_count();
+                if members != 2 { continue; }
+                match room.set_is_direct(true).await {
+                    Ok(()) => {
+                        migrated += 1;
+                        tracing::info!(
+                            "DM-migrate: marked joined room {} as direct (1-to-1, was missing m.direct)",
+                            room.room_id()
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "DM-migrate: failed to mark {} as direct: {e}",
+                        room.room_id()
+                    ),
+                }
+            }
+            if migrated > 0 {
+                tracing::info!("DM-migrate: {migrated} rooms reclassified; pushing refreshed room list");
+                let rooms = collect_room_info(&dm_migrate_client, None).await;
+                let _ = dm_migrate_tx.send(MatrixEvent::RoomListUpdated { rooms }).await;
+            }
+        });
+    }
+
     // Register handlers for new messages (both decrypted and encrypted).
     // The SDK auto-decrypts when keys are available and fires the
     // RoomMessage handler. When decryption fails, the RoomEncrypted
