@@ -97,6 +97,12 @@ mod imp {
             app.set_accels_for_action("win.join-room",    &["<Control><Shift>j"]);
             app.set_accels_for_action("win.prev-room",    &["<Alt>Up"]);
             app.set_accels_for_action("win.next-room",    &["<Alt>Down"]);
+            // Ctrl+Q → close the active window. GtkWindow ships the
+            // `window.close` action built-in; binding to it (rather
+            // than app.quit) routes through our close_request handler
+            // so MarkRead / Shutdown flush the same way the title-bar
+            // X does. GNOME HIG standard for quit.
+            app.set_accels_for_action("window.close",     &["<Control>q"]);
 
             // For dev builds (cargo run), register the local icon directory so
             // GTK can find the app icon without a system install.

@@ -7454,6 +7454,7 @@ fn show_shortcuts_window(window: &MxWindow) {
         ("<Control>comma",    "Preferences"),
         ("<Control><Shift>j", "Join a room"),
         ("<Control>question", "Keyboard shortcuts"),
+        ("<Control>q",        "Quit"),
     ] {
         app_group.add_shortcut(&gtk::ShortcutsShortcut::builder()
             .accelerator(accel)
