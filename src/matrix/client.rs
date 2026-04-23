@@ -577,8 +577,20 @@ fn keyring_app_attr() -> &'static str {
 ///      window.  This is precise and works even when the SDK notification count
 ///      is 0 (e.g. before the first sync has refreshed counts from the server,
 ///      or when the Messages API was used instead of the sync timeline).
-///   2. Fall back to `max(sdk_count, known_unread)` when the marker is absent
-///      or outside the current window.
+///   2. If `fully_read` is set but the event is NOT in the fetched window, the
+///      marker must be older than our oldest fetched message — we always fetch
+///      newest-first, so an unresolvable marker means the user last read
+///      something older than what we loaded.  Every message in the window is
+///      therefore after the marker and unread.  Take `max(messages.len(), sdk,
+///      known)` so the server's notification count (which may reflect
+///      unfetched older messages) still wins when it is higher.  This fixes
+///      the "New messages divider placed too low" bug in busy rooms: the SDK's
+///      `notification_count` is push-rule-filtered and often under-counts real
+///      activity (reactions, unprominent messages, bot chatter), so naively
+///      trusting it left most of the actual unread messages untinted above
+///      the divider.
+///   3. Fall back to `max(sdk_count, known_unread)` when the marker is absent
+///      (room never read, or account-data fetch failed — don't speculate).
 ///
 /// `messages` must be **oldest-first** (the order returned after reversal in
 /// `extract_messages`).
@@ -593,6 +605,10 @@ pub(crate) fn compute_enter_unread(
             // Messages at pos+1..len are after the fully_read marker → new.
             return (messages.len().saturating_sub(pos + 1)) as u32;
         }
+        // Marker is older than our window (fetch is newest-first with a
+        // bounded limit). Treat every fetched message as unread; let the
+        // server count override when it is higher.
+        return (messages.len() as u32).max(sdk_count).max(known_unread);
     }
     sdk_count.max(known_unread)
 }
@@ -6757,11 +6773,30 @@ mod compute_enter_unread_tests {
         assert_eq!(compute_enter_unread(&ms, Some("$e0"), 0, 0), 3);
     }
 
-    /// fully_read is outside the window → fall back to max(sdk, known).
+    /// fully_read is outside the window and sdk count is higher than the
+    /// fetched window → server count wins (covers unfetched older messages).
     #[test]
-    fn fully_read_not_in_window_falls_back_to_sdk() {
+    fn fully_read_not_in_window_sdk_higher() {
         let ms = msgs(&["$e0", "$e1", "$e2"]);
         assert_eq!(compute_enter_unread(&ms, Some("$old"), 4, 0), 4);
+    }
+
+    /// fully_read is outside the window and sdk count is LOWER than the
+    /// fetched window → all fetched messages count as unread. This is the
+    /// "busy room after long absence" case: push-rule-filtered sdk=5 when
+    /// 50 real messages have arrived since the user last read.
+    #[test]
+    fn fully_read_not_in_window_counts_all_fetched() {
+        let ms = msgs(&["$e0","$e1","$e2","$e3","$e4","$e5","$e6","$e7","$e8","$e9"]);
+        assert_eq!(compute_enter_unread(&ms, Some("$old"), 5, 0), 10);
+    }
+
+    /// fully_read outside window, sdk=0, known=0 (pre-sync) → all fetched are
+    /// unread. Previously fell back to 0 and showed no divider.
+    #[test]
+    fn fully_read_not_in_window_pre_sync_counts_all() {
+        let ms = msgs(&["$e0","$e1","$e2","$e3","$e4"]);
+        assert_eq!(compute_enter_unread(&ms, Some("$old"), 0, 0), 5);
     }
 
     /// fully_read absent, sdk=0, known=3 → use known (restart scenario).
