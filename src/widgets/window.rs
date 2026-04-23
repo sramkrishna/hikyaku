@@ -30,16 +30,18 @@ mod imp {
         pub message_view: MessageView,
         pub toast_overlay: adw::ToastOverlay,
         pub toolbar: adw::ToolbarView,
-        /// Left-sidebar stack: page "rooms" is the normal room list;
-        /// page "user-info" is the in-place user-info panel (replaces
-        /// the modal dialog). Populated lazily when the user clicks a
-        /// sender name.
-        pub sidebar_stack: OnceCell<gtk::Stack>,
+        /// Right-side revealer hosting the user-info panel. Slides in
+        /// from the right when the user clicks a sender name; sibling
+        /// to `details_revealer` / `notif_revealer` so it doesn't cover
+        /// the room list.
+        pub user_info_revealer: gtk::Revealer,
         /// Scrolled container for the user-info panel body — we rebuild
         /// the children on every show so prior/fresh state is always
         /// correct. Kept as a handle so show_user_info_dialog can
         /// replace its child.
         pub user_info_container: OnceCell<gtk::ScrolledWindow>,
+        /// Separator between message view and user-info right sidebar.
+        pub user_info_separator: OnceCell<gtk::Separator>,
         /// Close-over state needed when the user leaves the user-info
         /// panel: run the same save flow the old dialog's connect_closed
         /// did. Holds `(user_id, save_closure)` for the currently open
@@ -191,8 +193,13 @@ mod imp {
                 message_view: MessageView::new(),
                 toast_overlay: adw::ToastOverlay::new(),
                 toolbar: adw::ToolbarView::new(),
-                sidebar_stack: OnceCell::new(),
+                user_info_revealer: gtk::Revealer::builder()
+                    .transition_type(gtk::RevealerTransitionType::SlideLeft)
+                    .reveal_child(false)
+                    .visible(false)
+                    .build(),
                 user_info_container: OnceCell::new(),
+                user_info_separator: OnceCell::new(),
                 user_info_save: RefCell::new(None),
                 loading_spinner: gtk::Spinner::new(),
                 verify_banner,
@@ -2922,23 +2929,10 @@ impl MxWindow {
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
 
-        // Sidebar stack: "rooms" (the normal room list) vs. "user-info"
-        // (the in-place user-info panel, shown when a sender name is
-        // clicked). Built empty; show_user_info_dialog() populates and
-        // switches it. Avoids the modal dialog that the user found
-        // disruptive.
-        let sidebar_stack = gtk::Stack::new();
-        sidebar_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
-        sidebar_stack.add_named(&imp.room_list_view, Some("rooms"));
-        let user_info_scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .build();
-        sidebar_stack.add_named(&user_info_scroll, Some("user-info"));
-        sidebar_stack.set_visible_child_name("rooms");
-        sidebar_toolbar.set_content(Some(&sidebar_stack));
-        let _ = imp.sidebar_stack.set(sidebar_stack);
-        let _ = imp.user_info_container.set(user_info_scroll);
+        // Sidebar content is just the room list — the user-info panel
+        // lives in a right-side revealer (see `user_info_revealer`
+        // below) so it doesn't hide the room list when opened.
+        sidebar_toolbar.set_content(Some(&imp.room_list_view));
 
         // Wire search toggle button ↔ search bar.
         let search_bar = imp.room_list_view.search_bar();
@@ -3172,6 +3166,37 @@ impl MxWindow {
         details_wrapper.append(&details_close_btn);
         imp.details_revealer.set_child(Some(&details_wrapper));
 
+        // User-info right sidebar (hidden by default). Populated lazily
+        // by show_user_info_dialog; mirrors the details_revealer layout
+        // so it looks and behaves like a sibling panel.
+        let user_info_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .width_request(280)
+            .build();
+        let user_info_close_btn = gtk::Button::builder()
+            .label("Close")
+            .css_classes(["suggested-action", "caption"])
+            .margin_start(8)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        let window_weak_uinfo_close = self.downgrade();
+        user_info_close_btn.connect_clicked(move |_| {
+            if let Some(win) = window_weak_uinfo_close.upgrade() {
+                win.close_user_info_panel();
+            }
+        });
+        let user_info_wrapper = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        user_info_wrapper.append(&user_info_scroll);
+        user_info_wrapper.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        user_info_wrapper.append(&user_info_close_btn);
+        imp.user_info_revealer.set_child(Some(&user_info_wrapper));
+        let _ = imp.user_info_container.set(user_info_scroll);
+
         // Notification sidebar contents.
         let notif_list_box = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -3244,7 +3269,8 @@ impl MxWindow {
             notif_revealer_for_bell.set_reveal_child(visible);
         });
 
-        // Content area: message view + optional notifications sidebar + optional details sidebar.
+        // Content area: message view + optional notifications sidebar
+        // + optional details sidebar + optional user-info sidebar.
         let content_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .build();
@@ -3253,10 +3279,17 @@ impl MxWindow {
             .visible(false)
             .build();
         imp.details_separator.set(details_separator.clone()).ok();
+        let user_info_separator = gtk::Separator::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        imp.user_info_separator.set(user_info_separator.clone()).ok();
         content_box.append(&imp.message_view);
         content_box.append(&imp.notif_revealer);
         content_box.append(&details_separator);
         content_box.append(&imp.details_revealer);
+        content_box.append(&user_info_separator);
+        content_box.append(&imp.user_info_revealer);
         // Make message view expand, sidebars stay fixed width.
         imp.message_view.set_hexpand(true);
 
@@ -4373,22 +4406,6 @@ impl MxWindow {
             .margin_top(8).margin_bottom(16)
             .build();
 
-        // Back row: small "← Back to rooms" button at the top. The
-        // sidebar header can't host a back button cleanly (it's shared
-        // with the room list), so we put one in the panel itself.
-        let back_btn = gtk::Button::builder()
-            .label("← Back to rooms")
-            .halign(gtk::Align::Start)
-            .css_classes(["flat"])
-            .build();
-        let window_weak_back = self.downgrade();
-        back_btn.connect_clicked(move |_| {
-            if let Some(win) = window_weak_back.upgrade() {
-                win.close_user_info_panel();
-            }
-        });
-        content.append(&back_btn);
-
         let initials_source = display_name.clone();
         let avatar = adw::Avatar::builder()
             .size(64)
@@ -4687,16 +4704,18 @@ impl MxWindow {
             self.imp().user_info_save.replace(Some((user_id.to_string(), save)));
         }
 
-        // Install into the sidebar: swap the ScrolledWindow's child to
-        // the freshly-built panel body, flip the Stack page, and ensure
-        // the scroll view starts at the top.
+        // Install into the right-side panel: swap the ScrolledWindow's
+        // child to the freshly-built panel body, scroll to top, and
+        // reveal the right-side panel + separator.
         if let Some(scroll) = self.imp().user_info_container.get() {
             scroll.set_child(Some(&content));
             scroll.vadjustment().set_value(0.0);
         }
-        if let Some(stack) = self.imp().sidebar_stack.get() {
-            stack.set_visible_child_name("user-info");
+        if let Some(sep) = self.imp().user_info_separator.get() {
+            sep.set_visible(true);
         }
+        self.imp().user_info_revealer.set_visible(true);
+        self.imp().user_info_revealer.set_reveal_child(true);
     }
 
     /// Run any pending user-info save closure (flag + notes persistence).
@@ -4707,14 +4726,16 @@ impl MxWindow {
         }
     }
 
-    /// Close the user-info sidebar panel: flush any pending save, then
-    /// switch the sidebar back to the room list. Clears the panel's
-    /// child so references to the previous user's widgets are dropped
-    /// (the widgets stop receiving keystrokes immediately).
+    /// Close the user-info right-side panel: flush any pending save,
+    /// hide the revealer + separator, and drop the panel's child so
+    /// references to the previous user's widgets are released (the
+    /// widgets stop receiving keystrokes immediately).
     pub fn close_user_info_panel(&self) {
         self.run_user_info_save();
-        if let Some(stack) = self.imp().sidebar_stack.get() {
-            stack.set_visible_child_name("rooms");
+        self.imp().user_info_revealer.set_reveal_child(false);
+        self.imp().user_info_revealer.set_visible(false);
+        if let Some(sep) = self.imp().user_info_separator.get() {
+            sep.set_visible(false);
         }
         if let Some(scroll) = self.imp().user_info_container.get() {
             scroll.set_child(None::<&gtk::Widget>);
