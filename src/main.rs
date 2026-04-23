@@ -419,6 +419,17 @@ fn main() {
         std::env::set_var("GSK_RENDERER", "vulkan");
     }
 
+    // Default RUST_BACKTRACE=1 on beta — flatpak crashes on user machines
+    // give us no stderr by default, so a backtrace in the log is the
+    // only forensic artifact if the user hits a panic. User override
+    // always wins. Stable builds stay quiet.
+    #[cfg(feature = "devel")]
+    {
+        if std::env::var_os("RUST_BACKTRACE").is_none() {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
+    }
+
     // Initialize structured logging. Override with RUST_LOG env var, e.g.
     // RUST_LOG=hikyaku=debug cargo run
     tracing_subscriber::fmt()
