@@ -927,7 +927,21 @@ pub fn strip_reply_fallback(body: &str) -> String {
 
 /// Extract an image/gif URL from message body text, if present.
 /// Converts Giphy page URLs to direct media URLs.
+///
+/// When the `media-rewrite` plugin is enabled and the user has
+/// configured a host-rewrite map, any detected URL is passed through
+/// `plugins::media_rewrite::rewrite_url` before being returned. This
+/// lets users route e.g. `imgur.com` to a proxy host when their
+/// homeserver blocks imgur.
 pub(crate) fn extract_image_url(body: &str) -> Option<String> {
+    let raw = extract_image_url_raw(body)?;
+    #[cfg(feature = "media-rewrite")]
+    { Some(crate::plugins::media_rewrite::rewrite_url(&raw)) }
+    #[cfg(not(feature = "media-rewrite"))]
+    { Some(raw) }
+}
+
+fn extract_image_url_raw(body: &str) -> Option<String> {
     let body_trimmed = body.trim();
     for word in body_trimmed.split_whitespace() {
         if !(word.starts_with("https://") || word.starts_with("http://")) {

@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "hikyaku"
 
 [features]
-default = ["ai", "rolodex", "pinning", "motd", "community-safety"]
+default = ["ai", "rolodex", "pinning", "motd", "community-safety", "media-rewrite"]
 ## AI summaries via Ollama + semantic interest watcher (fastembed).
 ## Use ort-download-binaries for development builds (cargo run).
 ## Use ort-load-dynamic for Flatpak builds — ORT is dlopen'd at runtime.
@@ -24,6 +24,10 @@ motd = []
 ## Flags are private to the device (never sent to Matrix); messages from
 ## flagged users get a visible amber pill next to the sender name.
 community-safety = []
+## Media-rewrite — host-swap for image/GIF URLs whose origin your
+## homeserver blocks. User-supplied map at
+## $XDG_CONFIG_HOME/hikyaku/media_rewrite.json; no-op if missing.
+media-rewrite = []
 ## Development build indicator: amber app icon + rainbow titlebar stripe.
 ## Used by the beta flatpak branch. Never set in the stable build.
 devel = []

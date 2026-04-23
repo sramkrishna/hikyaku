@@ -19,3 +19,5 @@ pub mod rolodex;
 pub mod community_health;
 #[cfg(feature = "community-safety")]
 pub mod community_safety;
+#[cfg(feature = "media-rewrite")]
+pub mod media_rewrite;
