@@ -5219,9 +5219,45 @@ async fn handle_search_users(
 async fn handle_accept_invite(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
     let Ok(parsed_id) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&parsed_id) else { return };
+
+    // Capture the hero count BEFORE join() — that's our "1-to-1"
+    // signal for the DM heuristic below, and member state may
+    // mutate as join() processes the transition out of Invited.
+    let heroes_before = room.heroes().len();
+
     match room.join().await {
         Ok(()) => {
             tracing::info!("Accepted invite to {room_id}");
+
+            // matrix-sdk's Room::join() auto-marks the room as a DM
+            // only when the invite event carried `is_direct: true`.
+            // Many clients (older nheko, FluffyChat, various bridges)
+            // don't set that flag on DM invites, so the room ends up
+            // in the regular rooms list instead of the DM section —
+            // and a restart doesn't help because our `m.direct`
+            // account data never got updated. Fall back to a 1-to-1
+            // heuristic: if the room only has one other party
+            // (heroes ≤ 1 at invite time), treat it as a DM and
+            // update m.direct ourselves.
+            //
+            // False positives are rare in practice — a brand-new
+            // group room with only the inviter and you is
+            // overwhelmingly likely to be a DM. The cost of a false
+            // positive is a room showing up in the DM section
+            // instead of the rooms list, which the user can
+            // re-categorise manually later.
+            let already_direct = room.is_direct().await.unwrap_or(false);
+            if !already_direct && heroes_before <= 1 {
+                match room.set_is_direct(true).await {
+                    Ok(()) => tracing::info!(
+                        "Marked {room_id} as direct via 1-to-1 heuristic (invite lacked is_direct flag)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to mark {room_id} as direct after accepting invite: {e}"
+                    ),
+                }
+            }
+
             let room_name = room.display_name().await
                 .map(|n| n.to_string())
                 .unwrap_or_else(|_| room_id.to_string());
