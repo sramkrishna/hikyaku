@@ -1990,11 +1990,6 @@ impl MessageView {
 
     /// Walk every currently-materialised MessageRow and re-evaluate the
     /// community-safety flag / notes indicator for a specific user id.
-    /// Called after a flag toggle or notes edit so every visible message
-    /// from that user picks up the new state, not just the row the user
-    /// interacted with. The `list_view` may have many rows in its pool
-    /// at any time — scanning is O(visible_rows) which is bounded.
-    #[cfg(feature = "community-safety")]
     /// After a `#alias:server` has been resolved to a room name, re-render
     /// every MessageObject across every cached room whose body mentions
     /// that alias so the pill label picks up the resolved name.
@@ -2192,6 +2187,7 @@ impl MessageView {
         }
     }
 
+    #[cfg(feature = "community-safety")]
     pub fn refresh_flag_ui_for_user(&self, user_id: &str) {
         if user_id.is_empty() { return; }
         // Get the current room's list_view.
