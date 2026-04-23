@@ -1,12 +1,23 @@
 using Gtk 4.0;
+using Adw 1;
 
 template $MxMessageRow : Gtk.Box {
   orientation: horizontal;
-  spacing: 2;
+  spacing: 8;
   margin-top: 2;
   margin-bottom: 2;
   margin-start: 12;
   margin-end: 12;
+
+  // Sender avatar — 32px, positioned at the top of the row so the
+  // avatar aligns with the sender name rather than floating mid-body.
+  // bind_message_object populates text + custom_image from the cache.
+  Adw.Avatar sender_avatar {
+    size: 32;
+    show-initials: true;
+    valign: start;
+    margin-top: 2;
+  }
 
   Gtk.Box {
     orientation: vertical;

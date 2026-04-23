@@ -109,6 +109,8 @@ mod imp {
         #[template_child]
         pub unread_divider_box: TemplateChild<gtk::Box>,
         #[template_child]
+        pub sender_avatar: TemplateChild<adw::Avatar>,
+        #[template_child]
         pub sender_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub sender_flag_label: TemplateChild<gtk::Label>,
@@ -1034,6 +1036,18 @@ impl MessageRow {
         self.imp().on_flag_changed.borrow_mut().replace(Box::new(f));
     }
 
+    /// Re-apply the avatar image for `user_id` if this row is bound
+    /// to that sender. Called from MessageView::refresh_sender_avatar
+    /// after AvatarReady populates the window's avatar_cache.
+    pub fn refresh_sender_avatar(&self, user_id: &str, path: &str) {
+        let imp = self.imp();
+        if *imp.sender_id_text.borrow() != user_id { return; }
+        if path.is_empty() { return; }
+        if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
+            imp.sender_avatar.set_custom_image(Some(&tex));
+        }
+    }
+
     /// Re-render the sender_flag_label based on the current state of the
     /// community-safety store for the given user id. Idempotent; called
     /// from MessageView after any flag/notes mutation to keep every
@@ -1319,6 +1333,36 @@ impl MessageRow {
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
         self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+
+        // Sender avatar — 32px next to the sender name. Image from the
+        // window's avatar_cache if we've downloaded it; initials-on-
+        // colour fallback otherwise. Walking to MxWindow is O(1) and the
+        // cache read is a HashMap get.
+        {
+            imp.sender_avatar.set_text(Some(sender.as_str()));
+            imp.sender_avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
+            if !sender_id.is_empty() {
+                use gtk::prelude::*;
+                if let Some(app) = gtk::gio::Application::default() {
+                    if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                        if let Some(window) = gtk_app.active_window() {
+                            if let Some(win) = window
+                                .downcast_ref::<crate::widgets::MxWindow>()
+                            {
+                                let cache = win.imp().avatar_cache.borrow();
+                                if let Some(path) = cache.get(&sender_id) {
+                                    if !path.is_empty() {
+                                        if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
+                                            imp.sender_avatar.set_custom_image(Some(&tex));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Community-safety plugin: show one of
         //   * amber "⚠ <category>" caution pill when the user is flagged

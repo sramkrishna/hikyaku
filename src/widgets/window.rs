@@ -2079,6 +2079,10 @@ impl MxWindow {
                         // the avatar appears without requiring the user to
                         // close and reopen the picker.
                         window.imp().message_view.refresh_nick_avatar(&user_id, &path);
+                        // Update every visible message row's sender avatar
+                        // so a freshly downloaded image replaces the
+                        // initials fallback without requiring a rebind.
+                        window.imp().message_view.refresh_sender_avatar(&user_id, &path);
                     }
                     MatrixEvent::RoomAvatarReady { room_id, path } => {
                         room_list_view.set_room_avatar_path(&room_id, &path);

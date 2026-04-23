@@ -1927,6 +1927,28 @@ impl MessageView {
 
     /// Load bookmarked event IDs for `room_id` from the store into the in-memory set.
     /// Call after `set_messages` so rows are highlighted on the first bind pass.
+    /// Walk every currently-materialised MessageRow and install the
+    /// just-downloaded avatar image for a specific user id. Called
+    /// from the AvatarReady handler after the cache is updated —
+    /// without this every message from the user still shows the
+    /// initials fallback until it's scrolled out and back.
+    pub fn refresh_sender_avatar(&self, user_id: &str, path: &str) {
+        if user_id.is_empty() || path.is_empty() { return; }
+        let imp = self.imp();
+        if !imp.room_view_cache.borrow().contains_key(
+            imp.current_room_id.borrow().as_str()
+        ) { return; }
+        let list_view = imp.list_view();
+        let mut child = list_view.first_child();
+        while let Some(node) = child {
+            let next = node.next_sibling();
+            if let Some(row) = crate::widgets::MessageView::find_message_row(&node) {
+                row.refresh_sender_avatar(user_id, path);
+            }
+            child = next;
+        }
+    }
+
     /// Walk every currently-materialised MessageRow and re-evaluate the
     /// community-safety flag / notes indicator for a specific user id.
     /// Called after a flag toggle or notes edit so every visible message
