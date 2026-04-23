@@ -3171,19 +3171,23 @@ impl MxWindow {
 
         // User-info right sidebar (hidden by default). Populated lazily
         // by show_user_info_dialog; mirrors the details_revealer layout
-        // so it looks and behaves like a sibling panel.
+        // so it looks and behaves like a sibling panel. A small chevron
+        // (`go-next-symbolic`, i.e. `>`) in the top-right dismisses it —
+        // points away from the room list, so it reads as "push me out
+        // to the right."
         let user_info_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .width_request(280)
             .build();
         let user_info_close_btn = gtk::Button::builder()
-            .label("Close")
-            .css_classes(["suggested-action", "caption"])
-            .margin_start(8)
-            .margin_end(8)
+            .icon_name("go-next-symbolic")
+            .tooltip_text("Close")
+            .css_classes(["flat", "circular"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
             .margin_top(4)
-            .margin_bottom(4)
+            .margin_end(4)
             .build();
         let window_weak_uinfo_close = self.downgrade();
         user_info_close_btn.connect_clicked(move |_| {
@@ -3191,13 +3195,11 @@ impl MxWindow {
                 win.close_user_info_panel();
             }
         });
-        let user_info_wrapper = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
+        let user_info_overlay = gtk::Overlay::builder()
+            .child(&user_info_scroll)
             .build();
-        user_info_wrapper.append(&user_info_scroll);
-        user_info_wrapper.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        user_info_wrapper.append(&user_info_close_btn);
-        imp.user_info_revealer.set_child(Some(&user_info_wrapper));
+        user_info_overlay.add_overlay(&user_info_close_btn);
+        imp.user_info_revealer.set_child(Some(&user_info_overlay));
         let _ = imp.user_info_container.set(user_info_scroll);
 
         // Notification sidebar contents.
