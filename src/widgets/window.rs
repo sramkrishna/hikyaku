@@ -4300,6 +4300,95 @@ impl MxWindow {
         mxid_row.append(&copy_btn);
         content.append(&mxid_row);
 
+        // Flag editor (community-safety plugin). Full control over
+        // category, severity, reason, and evidence URL — the Flag
+        // button in the message action bar is a one-click shortcut
+        // that sets the Interactive / Caution defaults; this is the
+        // surface for picking Race / LGBTQ / a11y / Far-right etc.,
+        // bumping severity, writing a reason, and attaching a link.
+        #[cfg(feature = "community-safety")]
+        let flag_widgets = {
+            use crate::plugins::community_safety::{
+                FLAGGED_STORE, BUILTIN_CATEGORIES, category_label,
+            };
+            let flag_label = gtk::Label::builder()
+                .label("Flag")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .margin_top(8)
+                .build();
+            content.append(&flag_label);
+
+            let prior = FLAGGED_STORE.get(user_id);
+
+            // Category dropdown: "(none)" + built-in categories. If the
+            // stored category isn't in the built-in list, we append it
+            // at the end so the user's existing selection isn't lost
+            // on reopen.
+            let items = gtk::StringList::new(&["(none)"]);
+            for tag in BUILTIN_CATEGORIES {
+                items.append(category_label(tag));
+            }
+            let mut extra_category: Option<String> = None;
+            let mut selected_idx: u32 = 0;
+            if let Some(ref e) = prior {
+                if !e.category.is_empty() {
+                    if let Some(pos) = BUILTIN_CATEGORIES.iter().position(|t| *t == e.category) {
+                        selected_idx = (pos + 1) as u32;
+                    } else {
+                        items.append(category_label(&e.category));
+                        selected_idx = (BUILTIN_CATEGORIES.len() + 1) as u32;
+                        extra_category = Some(e.category.clone());
+                    }
+                }
+            }
+            let category_row = adw::ComboRow::builder()
+                .title("Category")
+                .model(&items)
+                .selected(selected_idx)
+                .build();
+            let cat_group = adw::PreferencesGroup::new();
+            cat_group.add(&category_row);
+            content.append(&cat_group);
+
+            // Severity dropdown: Note / Caution / Warning. Default
+            // Caution for any existing flag where severity is unset.
+            let sev_items = gtk::StringList::new(&[
+                "1 — Note (subtle)",
+                "2 — Caution (amber)",
+                "3 — Warning (red)",
+            ]);
+            let sev_idx: u32 = match prior.as_ref().map(|e| e.effective_severity()).unwrap_or(2) {
+                1 => 0,
+                3 => 2,
+                _ => 1,
+            };
+            let severity_row = adw::ComboRow::builder()
+                .title("Severity")
+                .model(&sev_items)
+                .selected(sev_idx)
+                .build();
+            let sev_group = adw::PreferencesGroup::new();
+            sev_group.add(&severity_row);
+            content.append(&sev_group);
+
+            let reason_entry = gtk::Entry::builder()
+                .placeholder_text("Reason (optional)")
+                .text(prior.as_ref().map(|e| e.reason.as_str()).unwrap_or(""))
+                .build();
+            content.append(&reason_entry);
+
+            let evidence_entry = gtk::Entry::builder()
+                .placeholder_text("Evidence link (matrix.to URL, optional)")
+                .text(prior.as_ref().map(|e| e.evidence.as_str()).unwrap_or(""))
+                .build();
+            content.append(&evidence_entry);
+
+            Some((category_row, severity_row, reason_entry, evidence_entry, extra_category))
+        };
+        #[cfg(not(feature = "community-safety"))]
+        let _flag_widgets: Option<()> = None;
+
         // Notes editor (community-safety plugin). Notes are independent
         // of the flag — you can have notes about someone you haven't
         // flagged, or leave notes on someone you have. Saves on dialog
@@ -4367,24 +4456,92 @@ impl MxWindow {
             });
         });
 
-        // Save notes on dialog close — picks up whatever the user typed
-        // into the TextView and persists via the community-safety store.
-        // Also triggers a refresh on visible message rows so the 📝
-        // note indicator appears / disappears in real time.
+        // Save flag + notes on dialog close — picks up whatever the user
+        // edited and persists via the community-safety store. Diffs against
+        // the prior record so we only write (and only fire refresh) when
+        // something actually changed. Refreshes all visible message rows
+        // for this user so pills / note indicator update in real time.
         #[cfg(feature = "community-safety")]
         {
             let uid_for_save = user_id.to_string();
             let window_weak_save = self.downgrade();
+            let (cat_row, sev_row, reason_entry, evidence_entry, extra_category) =
+                flag_widgets.expect("flag_widgets is always Some under community-safety");
             dialog.connect_closed(move |_| {
+                use crate::plugins::community_safety::{
+                    FLAGGED_STORE, BUILTIN_CATEGORIES,
+                    SEVERITY_NOTE, SEVERITY_CAUTION, SEVERITY_WARNING,
+                };
+
+                let store = &*FLAGGED_STORE;
+                let prior = store.get(&uid_for_save);
+
+                // Collect the intended notes text first; we reuse it across
+                // both save paths (flag change + notes-only change).
                 let buffer = notes_view.buffer();
-                let (start, end) = buffer.bounds();
-                let text = buffer.text(&start, &end, false).to_string();
-                let trimmed = text.trim();
-                let store = &crate::plugins::community_safety::FLAGGED_STORE;
-                let prior = store.get(&uid_for_save)
-                    .map(|e| e.notes).unwrap_or_default();
-                if prior != trimmed {
-                    store.set_notes(&uid_for_save, trimmed);
+                let (bstart, bend) = buffer.bounds();
+                let notes_text = buffer.text(&bstart, &bend, false).to_string();
+                let notes_trimmed = notes_text.trim().to_string();
+
+                // Resolve the category string from the ComboRow selection.
+                // Index 0 = "(none)" — clear flag. Indexes 1..=N map onto
+                // BUILTIN_CATEGORIES. The trailing extra slot (present only
+                // when the prior record had an out-of-list category) maps
+                // back to that preserved tag.
+                let (new_category, new_severity, new_reason, new_evidence) = {
+                    let cat_idx = cat_row.selected();
+                    let cat = if cat_idx == 0 {
+                        String::new()
+                    } else {
+                        let builtin_n = BUILTIN_CATEGORIES.len() as u32;
+                        if cat_idx >= 1 && cat_idx <= builtin_n {
+                            BUILTIN_CATEGORIES[(cat_idx - 1) as usize].to_string()
+                        } else {
+                            extra_category.clone().unwrap_or_default()
+                        }
+                    };
+                    let sev = match sev_row.selected() {
+                        0 => SEVERITY_NOTE,
+                        2 => SEVERITY_WARNING,
+                        _ => SEVERITY_CAUTION,
+                    };
+                    let reason = reason_entry.text().to_string();
+                    let evidence = evidence_entry.text().to_string();
+                    (cat, sev, reason, evidence)
+                };
+
+                // Compute prior values for diffing. Falls back to the
+                // defaults used by the dialog when no record existed.
+                let prior_category = prior.as_ref().map(|e| e.category.clone()).unwrap_or_default();
+                let prior_severity = prior.as_ref().map(|e| e.effective_severity()).unwrap_or(SEVERITY_CAUTION);
+                let prior_reason = prior.as_ref().map(|e| e.reason.clone()).unwrap_or_default();
+                let prior_evidence = prior.as_ref().map(|e| e.evidence.clone()).unwrap_or_default();
+                let prior_notes = prior.as_ref().map(|e| e.notes.clone()).unwrap_or_default();
+
+                let flag_changed = new_category != prior_category
+                    || (!new_category.is_empty() && new_severity != prior_severity)
+                    || (!new_category.is_empty() && new_reason != prior_reason)
+                    || (!new_category.is_empty() && new_evidence != prior_evidence);
+                let notes_changed = notes_trimmed != prior_notes;
+
+                if flag_changed {
+                    if new_category.is_empty() {
+                        store.clear_flag(&uid_for_save);
+                    } else {
+                        store.set_flag_full(
+                            &uid_for_save,
+                            &new_category,
+                            new_severity,
+                            &new_reason,
+                            &new_evidence,
+                        );
+                    }
+                }
+                if notes_changed {
+                    store.set_notes(&uid_for_save, &notes_trimmed);
+                }
+
+                if flag_changed || notes_changed {
                     if let Some(win) = window_weak_save.upgrade() {
                         win.imp().message_view.refresh_flag_ui_for_user(&uid_for_save);
                     }

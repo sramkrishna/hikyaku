@@ -1072,28 +1072,45 @@ impl MessageRow {
     /// visible row bound to that user in sync.
     #[cfg(feature = "community-safety")]
     pub fn refresh_flag_ui(&self, user_id: &str) {
+        use crate::plugins::community_safety::{
+            FLAGGED_STORE, SEVERITY_NOTE, SEVERITY_CAUTION, SEVERITY_WARNING,
+            category_label,
+        };
         let imp = self.imp();
         if *imp.sender_id_text.borrow() != user_id {
             return;
         }
         let label = &imp.sender_flag_label;
-        let entry = crate::plugins::community_safety::FLAGGED_STORE.get(user_id);
-        let Some(entry) = entry else {
+        let Some(entry) = FLAGGED_STORE.get(user_id) else {
             label.set_visible(false);
             return;
         };
         if entry.is_flagged() {
-            let cat = glib::markup_escape_text(&entry.category);
-            label.set_markup(&format!(
-                "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {cat} </span>"
-            ));
+            let cat_text = category_label(&entry.category);
+            let cat_esc = glib::markup_escape_text(cat_text);
+            let (markup, prefix) = match entry.effective_severity() {
+                SEVERITY_NOTE => (
+                    format!("<span foreground=\"#f5c211\" size=\"smaller\"> • {cat_esc} </span>"),
+                    "Noted",
+                ),
+                SEVERITY_WARNING => (
+                    format!("<span foreground=\"#ffffff\" background=\"#e01b24\"> ⛔ {cat_esc} </span>"),
+                    "Warning",
+                ),
+                _ => (
+                    format!("<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {cat_esc} </span>"),
+                    "Caution",
+                ),
+            };
+            label.set_markup(&markup);
             let tip = if entry.reason.is_empty() {
-                format!("Flagged as {}", entry.category)
+                format!("{prefix}: {cat_text}")
             } else {
-                format!("Flagged as {}: {}", entry.category, entry.reason)
+                format!("{prefix} — {cat_text}: {}", entry.reason)
             };
             label.set_tooltip_text(Some(&tip));
             label.set_visible(true);
+            let _ = SEVERITY_NOTE; let _ = SEVERITY_CAUTION; let _ = SEVERITY_WARNING;
         } else if entry.has_notes() {
             label.set_markup(
                 "<span foreground=\"#62a0ea\" size=\"smaller\"> ℹ </span>",
@@ -1383,26 +1400,44 @@ impl MessageRow {
         }
 
         // Community-safety plugin: show one of
-        //   * amber "⚠ <category>" caution pill when the user is flagged
-        //   * small blue "ℹ" info glyph when they have notes but no flag
+        //   * severity-1 small yellow dot pill ("note" level flag)
+        //   * severity-2 amber "⚠ <category>" pill (default caution)
+        //   * severity-3 red "⛔ <category>" pill (block-level warning)
+        //   * small blue "ℹ" info glyph when notes exist but no flag
         //   * nothing when neither
-        // Flag takes precedence — the user can still read the notes via
-        // the user-info dialog reachable by clicking the sender name.
+        // Flag takes precedence over notes — the user can still read
+        // the notes via the user-info dialog reachable from the name.
         #[cfg(feature = "community-safety")]
         {
+            use crate::plugins::community_safety::{
+                FLAGGED_STORE, SEVERITY_NOTE, SEVERITY_CAUTION, SEVERITY_WARNING,
+                category_label,
+            };
             if sender_id.is_empty() {
                 imp.sender_flag_label.set_visible(false);
-            } else if let Some(entry) = crate::plugins::community_safety::FLAGGED_STORE.get(&sender_id) {
+            } else if let Some(entry) = FLAGGED_STORE.get(&sender_id) {
                 if entry.is_flagged() {
-                    let category_escaped = glib::markup_escape_text(&entry.category);
-                    let markup = format!(
-                        "<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {category_escaped} </span>"
-                    );
+                    let label = category_label(&entry.category);
+                    let label_escaped = glib::markup_escape_text(label);
+                    let (markup, tooltip_prefix) = match entry.effective_severity() {
+                        SEVERITY_NOTE => (
+                            format!("<span foreground=\"#f5c211\" size=\"smaller\"> • {label_escaped} </span>"),
+                            "Noted",
+                        ),
+                        SEVERITY_WARNING => (
+                            format!("<span foreground=\"#ffffff\" background=\"#e01b24\"> ⛔ {label_escaped} </span>"),
+                            "Warning",
+                        ),
+                        _ /* SEVERITY_CAUTION and any out-of-range */ => (
+                            format!("<span foreground=\"#e5a50a\" background=\"#e5a50a26\"> ⚠ {label_escaped} </span>"),
+                            "Caution",
+                        ),
+                    };
                     imp.sender_flag_label.set_markup(&markup);
                     let tooltip = if entry.reason.is_empty() {
-                        format!("Flagged as {}", entry.category)
+                        format!("{tooltip_prefix}: {label}")
                     } else {
-                        format!("Flagged as {}: {}", entry.category, entry.reason)
+                        format!("{tooltip_prefix} — {label}: {}", entry.reason)
                     };
                     imp.sender_flag_label.set_tooltip_text(Some(&tooltip));
                     imp.sender_flag_label.set_visible(true);
@@ -1420,6 +1455,12 @@ impl MessageRow {
                 } else {
                     imp.sender_flag_label.set_visible(false);
                 }
+                // Suppress unused warning when neither SEVERITY_NOTE nor
+                // SEVERITY_CAUTION arms hit (compiler's match-completeness
+                // warning sometimes flags this pattern).
+                let _ = SEVERITY_NOTE;
+                let _ = SEVERITY_CAUTION;
+                let _ = SEVERITY_WARNING;
             } else {
                 imp.sender_flag_label.set_visible(false);
             }
