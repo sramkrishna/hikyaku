@@ -1096,7 +1096,7 @@ impl MessageRow {
             label.set_visible(true);
         } else if entry.has_notes() {
             label.set_markup(
-                "<span foreground=\"#62a0ea\" background=\"#62a0ea22\"> 📝 </span>",
+                "<span foreground=\"#62a0ea\" size=\"smaller\"> ℹ </span>",
             );
             let preview = entry.notes.char_indices().nth(80)
                 .map(|(i, _)| &entry.notes[..i])
@@ -1384,7 +1384,7 @@ impl MessageRow {
 
         // Community-safety plugin: show one of
         //   * amber "⚠ <category>" caution pill when the user is flagged
-        //   * small "📝 note" dim pill when they have notes but no flag
+        //   * small blue "ℹ" info glyph when they have notes but no flag
         //   * nothing when neither
         // Flag takes precedence — the user can still read the notes via
         // the user-info dialog reachable by clicking the sender name.
@@ -1408,7 +1408,7 @@ impl MessageRow {
                     imp.sender_flag_label.set_visible(true);
                 } else if entry.has_notes() {
                     imp.sender_flag_label.set_markup(
-                        "<span foreground=\"#62a0ea\" background=\"#62a0ea22\"> 📝 </span>",
+                        "<span foreground=\"#62a0ea\" size=\"smaller\"> ℹ </span>",
                     );
                     let preview = entry.notes.char_indices().nth(80)
                         .map(|(i, _)| &entry.notes[..i])
