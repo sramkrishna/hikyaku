@@ -2756,6 +2756,8 @@ impl MessageView {
                 imp.current_room_id.borrow()
             );
 
+            self.dedup_list_store("set_messages incremental");
+
             // Insert divider if needed (same logic as the no-change path).
             let unread = imp.room_unread_count.get();
             let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
@@ -2921,6 +2923,7 @@ impl MessageView {
                 }
             }
         }
+        self.dedup_list_store("prepend_messages");
         // Cap the store at MAX_STORE_SIZE to keep GTK height-tracking bounded.
         // Items at the tail (high indices = newest messages) are evicted first
         // when the user loads deep history via prepend.
@@ -3774,6 +3777,56 @@ impl MessageView {
         }
     }
 
+    /// Defensive dedup: walk the current room's list_store and remove any
+    /// MessageObject whose event_id has already appeared earlier in the
+    /// same store. Logs an INFO entry with context (room, event_id,
+    /// duplicate count) so recurrences point at the insertion path.
+    ///
+    /// This is a safety net against stealth-duplication paths that haven't
+    /// been fully traced — the dedup checks in `append_message`,
+    /// `set_messages` incremental, and `prepend_messages` each guard their
+    /// own path, but duplicates keep cropping up in field reports where
+    /// the log shows a single clean send yet the UI renders twice. Until
+    /// the exact race is root-caused, auto-healing is better than
+    /// leaving the user with ghost rows.
+    ///
+    /// Echoes (empty event_id) are never deduped — two in-flight echoes
+    /// with the same body are legitimate user intent (tapping Send twice
+    /// is a valid way to repeat a message).
+    fn dedup_list_store(&self, context: &str) {
+        let imp = self.imp();
+        let store = imp.list_store();
+        let n = gio::prelude::ListModelExt::n_items(&store);
+        if n <= 1 { return; }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(n as usize);
+        // Collect duplicate positions high-to-low so removals don't shift
+        // the indices of entries we haven't inspected yet.
+        let mut dupes_high_to_low: Vec<(u32, String)> = Vec::new();
+        for i in 0..n {
+            let Some(obj) = gio::prelude::ListModelExt::item(&store, i)
+                .and_downcast::<MessageObject>() else { continue };
+            let eid = obj.event_id();
+            if eid.is_empty() { continue; }
+            if !seen.insert(eid.clone()) {
+                dupes_high_to_low.push((i, eid));
+            }
+        }
+        if dupes_high_to_low.is_empty() { return; }
+        // Sort descending so later removals don't shift earlier positions.
+        dupes_high_to_low.sort_by(|a, b| b.0.cmp(&a.0));
+        let count = dupes_high_to_low.len();
+        let sample_eid = dupes_high_to_low.first().map(|(_, e)| e.clone()).unwrap_or_default();
+        tracing::info!(
+            "dedup_list_store: removing {} duplicate row(s) (context={context}, room={}, sample_eid={})",
+            count,
+            imp.current_room_id.borrow(),
+            sample_eid,
+        );
+        for (pos, _) in dupes_high_to_low {
+            store.splice(pos, 1, &[] as &[MessageObject]);
+        }
+    }
+
     /// Flush all pending appends to the list_store in a single splice call.
     /// Called from the idle scheduled by append_message().
     fn flush_pending_appends(&self) {
@@ -3812,6 +3865,7 @@ impl MessageView {
                 tracing::debug!("flush_pending_appends: evicted {} from front, store={}", evict, new_n - evict);
             }
         }
+        self.dedup_list_store("flush_pending_appends");
         if self.is_near_bottom() {
             self.scroll_to_bottom();
         }
