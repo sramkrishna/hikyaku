@@ -4690,6 +4690,155 @@ impl MxWindow {
         #[cfg(not(feature = "community-safety"))]
         let _flag_widgets: Option<()> = None;
 
+        // Flair editor (community-flair plugin). A flair is a reusable
+        // personal label with a colour — the user applies "downstream
+        // distro", "coworker", etc. to people; notes (above) carry the
+        // specifics of who they are. Combo row lists every flair the
+        // user has defined plus "(none)" and a trailing "Create new
+        // flair…" entry that reveals an inline editor for name + colour.
+        // On save the selection is turned into a `FLAIR_STORE.set_user_flair`
+        // call; create-flair auto-assigns to this user immediately so the
+        // user sees the effect without a second click.
+        #[cfg(feature = "community-flair")]
+        let flair_widgets = {
+            use crate::plugins::community_flair::FLAIR_STORE;
+            let flair_label = gtk::Label::builder()
+                .label("Flair")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .margin_top(8)
+                .build();
+            content.append(&flair_label);
+
+            let flairs = FLAIR_STORE.list_flairs();
+            let prior_flair_id = FLAIR_STORE.get_user_flair(user_id).map(|f| f.id);
+
+            let items = gtk::StringList::new(&["(none)"]);
+            for f in &flairs {
+                items.append(&f.name);
+            }
+            // Last entry opens the inline create-new editor.
+            items.append("+ Create new flair…");
+            let create_idx: u32 = items.n_items() - 1;
+
+            let selected_idx: u32 = match prior_flair_id {
+                Some(pfid) => flairs.iter().position(|f| f.id == pfid)
+                    .map(|p| (p + 1) as u32)
+                    .unwrap_or(0),
+                None => 0,
+            };
+
+            let flair_row = adw::ComboRow::builder()
+                .title("Flair")
+                .model(&items)
+                .selected(selected_idx)
+                .build();
+            let flair_group = adw::PreferencesGroup::new();
+            flair_group.add(&flair_row);
+            content.append(&flair_group);
+
+            // Inline create-new editor, collapsed by default.
+            let editor_revealer = gtk::Revealer::builder()
+                .transition_type(gtk::RevealerTransitionType::SlideDown)
+                .reveal_child(false)
+                .build();
+            let editor_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .margin_top(4)
+                .margin_bottom(8)
+                .build();
+            let new_name_entry = gtk::Entry::builder()
+                .placeholder_text("Flair name")
+                .hexpand(true)
+                .build();
+            let color_dialog = gtk::ColorDialog::builder()
+                .title("Pick flair colour")
+                .build();
+            let color_btn = gtk::ColorDialogButton::builder()
+                .dialog(&color_dialog)
+                .build();
+            // Default to the pill's fallback colour so the user sees
+            // what they'd get if they skip picking.
+            color_btn.set_rgba(&gtk::gdk::RGBA::new(
+                0x66 as f32 / 255.0,
+                0xa0 as f32 / 255.0,
+                0xea as f32 / 255.0,
+                1.0,
+            ));
+            let create_flair_btn = gtk::Button::builder()
+                .label("Create")
+                .css_classes(["suggested-action"])
+                .build();
+            let cancel_flair_btn = gtk::Button::builder()
+                .label("Cancel")
+                .css_classes(["flat"])
+                .build();
+            editor_box.append(&new_name_entry);
+            editor_box.append(&color_btn);
+            editor_box.append(&create_flair_btn);
+            editor_box.append(&cancel_flair_btn);
+            editor_revealer.set_child(Some(&editor_box));
+            content.append(&editor_revealer);
+
+            // Combo selection → toggle the editor for "Create new flair…".
+            let editor_reveal_for_combo = editor_revealer.clone();
+            flair_row.connect_selected_notify(move |row| {
+                editor_reveal_for_combo.set_reveal_child(row.selected() == create_idx);
+            });
+
+            // Cancel: collapse editor, snap combo back to "(none)" so
+            // save doesn't persist the placeholder selection.
+            let flair_row_for_cancel = flair_row.clone();
+            let editor_reveal_for_cancel = editor_revealer.clone();
+            let name_entry_for_cancel = new_name_entry.clone();
+            cancel_flair_btn.connect_clicked(move |_| {
+                flair_row_for_cancel.set_selected(0);
+                editor_reveal_for_cancel.set_reveal_child(false);
+                name_entry_for_cancel.set_text("");
+            });
+
+            // Create: persist the new flair, insert before the "+ Create…"
+            // trailer, select it, and assign to this user immediately so
+            // the flair renders without waiting for the save closure.
+            let flair_row_for_create = flair_row.clone();
+            let items_for_create = items.clone();
+            let name_entry_for_create = new_name_entry.clone();
+            let color_btn_for_create = color_btn.clone();
+            let editor_reveal_for_create = editor_revealer.clone();
+            let uid_for_create = user_id.to_string();
+            let window_weak_create = self.downgrade();
+            create_flair_btn.connect_clicked(move |_| {
+                let name = name_entry_for_create.text().trim().to_string();
+                if name.is_empty() { return; }
+                let rgba = color_btn_for_create.rgba();
+                let hex = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    (rgba.red() * 255.0).round() as u8,
+                    (rgba.green() * 255.0).round() as u8,
+                    (rgba.blue() * 255.0).round() as u8,
+                );
+                let new_id = FLAIR_STORE.create_flair(&name, &hex);
+                FLAIR_STORE.set_user_flair(&uid_for_create, Some(new_id));
+                // Insert the new name BEFORE the "+ Create new flair…" trailer.
+                let n = items_for_create.n_items();
+                let insert_at = n.saturating_sub(1);
+                items_for_create.splice(insert_at, 0, &[name.as_str()]);
+                flair_row_for_create.set_selected(insert_at);
+                editor_reveal_for_create.set_reveal_child(false);
+                name_entry_for_create.set_text("");
+                // Refresh existing visible rows so the pill appears
+                // without waiting for a room switch or bg_refresh.
+                if let Some(win) = window_weak_create.upgrade() {
+                    win.imp().message_view.refresh_flair_for_user(&uid_for_create);
+                }
+            });
+
+            Some((flair_row, create_idx))
+        };
+        #[cfg(not(feature = "community-flair"))]
+        let flair_widgets: Option<()> = None;
+
         // Notes editor (community-safety plugin). Notes are independent
         // of the flag — you can have notes about someone you haven't
         // flagged, or leave notes on someone you have. Saves on dialog
@@ -4740,6 +4889,11 @@ impl MxWindow {
             let window_weak_save = self.downgrade();
             let (cat_row, sev_scale, extra_category) =
                 flag_widgets.expect("flag_widgets is always Some under community-safety");
+            #[cfg(feature = "community-flair")]
+            let (flair_row, flair_create_idx) = flair_widgets
+                .expect("flair_widgets is always Some under community-flair");
+            #[cfg(not(feature = "community-flair"))]
+            let _ = flair_widgets;
             let save: Box<dyn Fn()> = Box::new(move || {
                 use crate::plugins::community_safety::{
                     FLAGGED_STORE, BUILTIN_CATEGORIES,
@@ -4753,6 +4907,37 @@ impl MxWindow {
                 let (bstart, bend) = buffer.bounds();
                 let notes_text = buffer.text(&bstart, &bend, false).to_string();
                 let notes_trimmed = notes_text.trim().to_string();
+
+                // Flair: fresh snapshot of the library — the combo may
+                // have had a new flair inserted by the inline editor
+                // earlier in this session, and the index order matches
+                // FLAIR_STORE.list_flairs() (id-sorted).
+                #[cfg(feature = "community-flair")]
+                {
+                    use crate::plugins::community_flair::FLAIR_STORE as FLAIR;
+                    let idx = flair_row.selected();
+                    let flairs_now = FLAIR.list_flairs();
+                    let prior_flair_id = FLAIR.get_user_flair(&uid_for_save).map(|f| f.id);
+                    let new_flair_id: Option<u32> = if idx == 0 {
+                        None
+                    } else if idx < flair_create_idx {
+                        // Bounds check the index against the fresh list;
+                        // an in-flight create/delete could have shifted
+                        // positions (rare — combo mutations happen on
+                        // this thread — but cheap to guard).
+                        flairs_now.get((idx - 1) as usize).map(|f| f.id)
+                    } else {
+                        // "+ Create new flair…" still selected with no
+                        // commit — don't change anything.
+                        prior_flair_id
+                    };
+                    if new_flair_id != prior_flair_id {
+                        FLAIR.set_user_flair(&uid_for_save, new_flair_id);
+                        if let Some(win) = window_weak_save.upgrade() {
+                            win.imp().message_view.refresh_flair_for_user(&uid_for_save);
+                        }
+                    }
+                }
 
                 let (new_category, new_severity) = {
                     let cat_idx = cat_row.selected();

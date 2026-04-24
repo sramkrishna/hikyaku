@@ -2187,6 +2187,44 @@ impl MessageView {
         }
     }
 
+    /// Re-render the flair pill on every visible row whose sender
+    /// matches `user_id`. Called after the user-info panel saves a
+    /// flair change so existing rows pick up the new pill without a
+    /// room switch or bg_refresh. Off-screen rows are re-rendered
+    /// naturally when they scroll back into view.
+    #[cfg(feature = "community-flair")]
+    pub fn refresh_flair_for_user(&self, user_id: &str) {
+        if user_id.is_empty() { return; }
+        let imp = self.imp();
+        if !imp.room_view_cache.borrow().contains_key(
+            imp.current_room_id.borrow().as_str()
+        ) {
+            return;
+        }
+        let list_view = imp.list_view();
+        let mut child = list_view.first_child();
+        while let Some(node) = child {
+            let next = node.next_sibling();
+            if let Some(row) = crate::widgets::MessageView::find_message_row(&node) {
+                // MessageRow re-consults FLAIR_STORE in its bind path,
+                // so rebinding the current MessageObject is enough —
+                // no MessageObject property mutation required.
+                let eid = row.imp().event_id.borrow().clone();
+                if !eid.is_empty() {
+                    if let Some(msg) = imp.event_index.borrow().get(&eid).cloned() {
+                        // Only rebind rows belonging to this user to
+                        // keep the work proportional to matching rows
+                        // rather than the full viewport.
+                        if msg.sender_id() == user_id {
+                            row.bind_message_object(&msg, &self.row_context());
+                        }
+                    }
+                }
+            }
+            child = next;
+        }
+    }
+
     #[cfg(feature = "community-safety")]
     pub fn refresh_flag_ui_for_user(&self, user_id: &str) {
         if user_id.is_empty() { return; }

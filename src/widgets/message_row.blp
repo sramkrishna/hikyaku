@@ -93,6 +93,16 @@ template $MxMessageRow : Gtk.Box {
         tooltip-text: "Flagged as problematic";
       }
 
+      // Flair pill (community-flair plugin). Shown when the user has
+      // a flair assigned; size="smaller" inside the markup keeps the
+      // pill a step below the sender font regardless of the user's
+      // appearance-pref font size.
+      Gtk.Label sender_flair_label {
+        halign: start;
+        visible: false;
+        use-markup: true;
+      }
+
       // Thread indicator.
       Gtk.Image thread_icon {
         icon-name: "view-list-symbolic";

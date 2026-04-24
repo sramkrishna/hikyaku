@@ -309,6 +309,14 @@ mod sync_io_lint {
         ("community_safety.rs", "std::fs::create_dir_all(&path)"),
         ("community_safety.rs", "std::fs::read(&self.path)"),
         ("community_safety.rs", "std::fs::write(&self.path, data)"),
+        // plugins/community_flair — flair library + per-user assignments.
+        // Loaded once at first use; writes are user-triggered (create /
+        // edit / delete flair, assign flair to user).
+        ("community_flair/mod.rs", "std::fs::read_to_string(&path_flairs)"),
+        ("community_flair/mod.rs", "std::fs::read_to_string(&path_user_flairs)"),
+        ("community_flair/mod.rs", "std::fs::create_dir_all(parent)"),
+        ("community_flair/mod.rs", "std::fs::write(&self.path_flairs, data)"),
+        ("community_flair/mod.rs", "std::fs::write(&self.path_user_flairs, data)"),
         // plugins/media_rewrite — tiny config file (<1 KB), loaded once per session on
         // first rewrite_url call and on explicit reload_from_disk; no write path.
         ("media_rewrite/mod.rs", "std::fs::read_to_string(&path)"),

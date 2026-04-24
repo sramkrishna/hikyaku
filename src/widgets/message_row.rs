@@ -119,6 +119,8 @@ mod imp {
         #[template_child]
         pub sender_flag_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub sender_flair_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub body_label: TemplateChild<gtk::Label>,
@@ -1532,6 +1534,24 @@ impl MessageRow {
                 let _ = SEVERITY_WARNING;
             } else {
                 imp.sender_flag_label.set_visible(false);
+            }
+        }
+
+        // Flair pill (community-flair plugin) — independent of flags;
+        // a user can have both a flag and a flair ("downstream distro"
+        // who is also flagged ⚠), in which case both pills render
+        // side-by-side.
+        #[cfg(feature = "community-flair")]
+        {
+            use crate::plugins::community_flair::{FLAIR_STORE, flair_markup};
+            if sender_id.is_empty() {
+                imp.sender_flair_label.set_visible(false);
+            } else if let Some(flair) = FLAIR_STORE.get_user_flair(&sender_id) {
+                imp.sender_flair_label.set_markup(&flair_markup(&flair));
+                imp.sender_flair_label.set_tooltip_text(Some(&flair.name));
+                imp.sender_flair_label.set_visible(true);
+            } else {
+                imp.sender_flair_label.set_visible(false);
             }
         }
 
