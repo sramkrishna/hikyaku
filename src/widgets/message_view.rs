@@ -2547,11 +2547,26 @@ impl MessageView {
         }
     }
 
-    /// Reparent the single shared react EmojiChooser onto a row's react
-    /// button and pop it up. Called by MessageRow when its react button is
-    /// clicked; ownership of the chooser lives here so only one emoji widget
-    /// tree is ever built for the entire MessageView.
+    /// Pop up the shared react EmojiChooser anchored to a row's react
+    /// button. Ownership of the chooser lives here so only one emoji
+    /// widget tree is ever built for the entire MessageView.
+    ///
+    /// History: the original implementation reparented the chooser onto
+    /// each clicked button via `unparent()` + `set_parent(btn)`. That
+    /// left the chooser holding a parent pointer that could become a
+    /// stale widget pointer when the previously-attached button's row
+    /// got evicted (room evicted from cache, list_store dedup removed
+    /// the row, ListView pool drop on shutdown). The next click then
+    /// hit `g_object_ref_sink: G_IS_OBJECT failed` on the chooser's
+    /// internal state, followed by the usual a11y / focus / draw
+    /// CRITICAL cascade — observed as a crash on emoji interaction.
+    ///
+    /// Fix: parent the chooser to MessageView ONCE (a stable ancestor
+    /// that lives the entire session), then reposition it on each click
+    /// via `set_pointing_to(button_bounds_in_message_view)`. No
+    /// reparenting ever happens, so no stale parent pointer is possible.
     pub fn show_react_chooser_at(&self, btn: &gtk::Button, event_id: String) {
+        use gtk::prelude::*;
         let imp = self.imp();
         *imp.react_target_event_id.borrow_mut() = event_id;
         let chooser = imp.react_chooser.get_or_init(|| {
@@ -2568,12 +2583,30 @@ impl MessageView {
                     borrow.as_ref().unwrap()(eid, emoji.to_string());
                 }
             });
+            // Park the chooser permanently on the MessageView. Only
+            // happens on first click since we're inside get_or_init.
+            c.set_parent(self.upcast_ref::<gtk::Widget>());
             c
         });
-        if chooser.parent().is_some() {
-            chooser.unparent();
+        // Compute the button's bounds in MessageView's coordinate space
+        // so the popover anchors visually at the button even though it
+        // is parented to MessageView. compute_bounds returns None if the
+        // widgets aren't in the same tree (shouldn't happen — the click
+        // came from a row inside this view).
+        let parent_view: &gtk::Widget = self.upcast_ref();
+        if let Some(bounds) = btn.compute_bounds(parent_view) {
+            let rect = gtk::gdk::Rectangle::new(
+                bounds.x() as i32,
+                bounds.y() as i32,
+                bounds.width() as i32,
+                bounds.height() as i32,
+            );
+            chooser.set_pointing_to(Some(&rect));
+        } else {
+            // Defensive: clear any stale pointing-to from a prior open
+            // so the popover doesn't anchor in the wrong place.
+            chooser.set_pointing_to(None);
         }
-        chooser.set_parent(btn);
         chooser.popup();
     }
 
