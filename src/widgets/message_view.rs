@@ -2168,20 +2168,41 @@ impl MessageView {
         let imp = self.imp();
         // Walk every cached list_store — the resolution helps any room
         // whose messages mention this alias, not only the current one.
+        //
+        // Two paths depending on message type:
+        // - Plain text (formatted_body is empty): re-run linkify_urls
+        //   synchronously here; the directory is now populated so the
+        //   alias renders with its real name.
+        // - HTML (formatted_body present): re-enqueue the markup worker,
+        //   which re-parses the HTML through html_to_pango → linkify_urls
+        //   and delivers the new markup via notify::rendered-markup. The
+        //   match is on whichever side of the body contains the alias —
+        //   `body` (plain) or `formatted_body` (raw HTML may quote the
+        //   alias inside `<a href>` attributes, but the linkify pass
+        //   handles outside-of-anchor matches only, so checking either
+        //   string for the substring is sufficient as a candidate filter.
         for store in imp.list_store_cache.borrow().values() {
             let n = gio::prelude::ListModelExt::n_items(store);
             for i in 0..n {
                 let Some(obj) = gio::prelude::ListModelExt::item(store, i)
                     .and_downcast::<MessageObject>() else { continue };
-                if !obj.formatted_body().is_empty() { continue; }
                 let body = obj.body();
-                if !body.contains(alias) { continue; }
-                // Re-run the plain-text prerender path. The new markup
-                // pulls the resolved room name from the directory.
-                let escaped = gtk::glib::markup_escape_text(&body).to_string();
-                let new_markup = crate::markdown::linkify_urls(&escaped);
-                if new_markup != obj.rendered_markup() {
-                    obj.set_rendered_markup(new_markup);
+                let formatted = obj.formatted_body();
+                let mentions_alias = body.contains(alias)
+                    || (!formatted.is_empty() && formatted.contains(alias));
+                if !mentions_alias { continue; }
+                if formatted.is_empty() {
+                    let escaped = gtk::glib::markup_escape_text(&body).to_string();
+                    let new_markup = crate::markdown::linkify_urls(&escaped);
+                    if new_markup != obj.rendered_markup() {
+                        obj.set_rendered_markup(new_markup);
+                    }
+                } else {
+                    // Re-enqueue: markup_worker is a single bounded queue
+                    // with try_send semantics, so worst case some messages
+                    // get dropped during a flood — the next AliasInfoResolved
+                    // (or a room reload) will pick them up.
+                    crate::markup_worker::try_enqueue(&obj, formatted);
                 }
             }
         }
