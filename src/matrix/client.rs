@@ -305,6 +305,19 @@ pub enum MatrixEvent {
         display_name: String,
         reason: String,
     },
+    /// Result of a SearchRoom command. `event_ids` is in server-ranked
+    /// order (most relevant first); the GTK side merges these into the
+    /// in-room search match cursor so prev/next can navigate them via
+    /// the existing scroll_to_event / SeekToEvent fallback. `query` is
+    /// echoed so a stale response (user has typed past it) can be
+    /// detected and dropped.
+    SearchResults {
+        room_id: String,
+        query: String,
+        event_ids: Vec<String>,
+    },
+    /// SearchRoom failed (rate-limited, network, etc).
+    SearchFailed { error: String },
     /// Result of SetOwnAvatar. On success, `new_mxc` holds the mxc://
     /// URI the homeserver assigned (empty string if the avatar was
     /// removed). On failure, `error` holds a user-facing message.
@@ -495,6 +508,11 @@ pub enum MatrixCommand {
     /// presses Knock in the join bar) and as the auto-fallback when
     /// JoinRoom fails because the room's join rule is `knock`.
     KnockRoom { room_id_or_alias: String, reason: String, via_servers: Vec<String> },
+    /// In-room search tranche 2: server-side `/search` over a single
+    /// room's history. Used by Ctrl+F's "Search server" button after
+    /// local results are exhausted. `limit` caps the result count to
+    /// keep response sizes bounded; default 50 in callers.
+    SearchRoom { room_id: String, query: String, limit: u32 },
     /// Approve a pending inbound knock by inviting the user. Mirror of
     /// AcceptInvite but for the moderator side of MSC2403.
     ApproveKnock { room_id: String, user_id: String },
@@ -1354,6 +1372,13 @@ async fn matrix_task(
                         let bg_tx = event_tx.clone();
                         tokio::spawn(async move {
                             handle_decline_knock(&bg_client, &bg_tx, &room_id, &user_id, &reason).await;
+                        });
+                    }
+                    Ok(MatrixCommand::SearchRoom { room_id, query, limit }) => {
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_search_room(&bg_client, &bg_tx, &room_id, &query, limit).await;
                         });
                     }
                     Ok(MatrixCommand::DownloadMedia { url, filename, source_json }) => {
@@ -5553,6 +5578,87 @@ async fn handle_approve_knock(
             tracing::warn!("Failed to approve knock from {user_id} on {room_id}: {e}");
             let _ = event_tx.send(MatrixEvent::JoinFailed {
                 error: format!("Failed to approve knock: {e}"),
+            }).await;
+        }
+    }
+}
+
+/// Server-side `/search` scoped to a single room. Sends the request,
+/// extracts event_ids in result order, emits SearchResults. The GTK
+/// side merges these into its match cursor so prev/next navigates
+/// them — events outside the local message window fall back to the
+/// existing SeekToEvent path which fetches context on demand.
+async fn handle_search_room(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    query: &str,
+    limit: u32,
+) {
+    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
+    use matrix_sdk::ruma::api::client::search::search_events::v3::{
+        Categories, Criteria, Request,
+    };
+    use matrix_sdk::ruma::RoomId;
+    use matrix_sdk::ruma::UInt;
+
+    let Ok(parsed_room) = RoomId::parse(room_id) else {
+        let _ = event_tx.send(MatrixEvent::SearchFailed {
+            error: format!("Invalid room id: {room_id}"),
+        }).await;
+        return;
+    };
+    if query.trim().is_empty() {
+        let _ = event_tx.send(MatrixEvent::SearchResults {
+            room_id: room_id.to_string(),
+            query: query.to_string(),
+            event_ids: Vec::new(),
+        }).await;
+        return;
+    }
+
+    // Scope to this single room via RoomEventFilter.rooms — without it
+    // the server searches every joined room and returns mixed results.
+    let mut filter = RoomEventFilter::default();
+    filter.rooms = Some(vec![parsed_room.to_owned()]);
+    filter.limit = Some(UInt::from(limit.max(1).min(200)));
+
+    let mut criteria = Criteria::new(query.to_string());
+    criteria.filter = filter;
+
+    let mut categories = Categories::new();
+    categories.room_events = Some(criteria);
+    let request = Request::new(categories);
+
+    match client.send(request).await {
+        Ok(response) => {
+            let event_ids: Vec<String> = response
+                .search_categories
+                .room_events
+                .results
+                .into_iter()
+                .filter_map(|sr| sr.result.and_then(|raw| raw.deserialize().ok()))
+                .filter_map(|ev| match ev {
+                    matrix_sdk::ruma::events::AnyTimelineEvent::MessageLike(m) => {
+                        Some(m.event_id().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            tracing::info!(
+                "search_room {room_id}: {} event(s) for query={:?}",
+                event_ids.len(), query
+            );
+            let _ = event_tx.send(MatrixEvent::SearchResults {
+                room_id: room_id.to_string(),
+                query: query.to_string(),
+                event_ids,
+            }).await;
+        }
+        Err(e) => {
+            tracing::warn!("search_room {room_id} failed: {e}");
+            let _ = event_tx.send(MatrixEvent::SearchFailed {
+                error: format!("{e}"),
             }).await;
         }
     }

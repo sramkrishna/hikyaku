@@ -286,11 +286,19 @@ mod imp {
         pub search_counter: std::cell::OnceCell<gtk::Label>,
         /// Ordered list of event_ids in the current room's list_store
         /// that match the active query. Populated on search-changed;
-        /// prev/next navigate this vector.
+        /// prev/next navigate this vector. Server-side results merge
+        /// into the same vector via merge_server_search_results.
         pub search_matches: RefCell<Vec<String>>,
         /// Cursor into `search_matches` for prev/next navigation. -1 when
         /// no match is selected yet.
         pub search_cursor: Cell<i32>,
+        /// Most recent query the user submitted to the server. Echoed
+        /// by SearchResults; used to drop stale responses.
+        pub server_search_query: RefCell<String>,
+        /// Callback registered by MxWindow to dispatch a server-side
+        /// search request. Takes (room_id, query, limit). Lives here
+        /// rather than on each row because the search bar is per-view.
+        pub on_server_search: RefCell<Option<Box<dyn Fn(String, String, u32)>>>,
     }
 
     impl Default for MessageView {
@@ -412,6 +420,8 @@ mod imp {
                 search_counter: std::cell::OnceCell::new(),
                 search_matches: RefCell::new(Vec::new()),
                 search_cursor: Cell::new(-1),
+                server_search_query: RefCell::new(String::new()),
+                on_server_search: RefCell::new(None),
             }
         }
     }
@@ -1864,6 +1874,44 @@ impl MessageView {
         self.imp().on_react.replace(Some(Box::new(f)));
     }
 
+    /// Register the dispatcher MxWindow uses to send a server-side
+    /// search request. Called once on window construction.
+    pub fn connect_server_search<F: Fn(String, String, u32) + 'static>(&self, f: F) {
+        self.imp().on_server_search.replace(Some(Box::new(f)));
+    }
+
+    /// Merge server-side search results into the local match cursor.
+    /// Stale responses (query no longer matches the recorded one) are
+    /// dropped. New event_ids are appended after the local matches so
+    /// the user navigates locals first, then server-only hits.
+    pub fn merge_server_search_results(&self, query: &str, event_ids: &[String]) {
+        let imp = self.imp();
+        if *imp.server_search_query.borrow() != query {
+            tracing::debug!(
+                "merge_server_search_results: stale response for {:?} (current={:?})",
+                query, imp.server_search_query.borrow()
+            );
+            return;
+        }
+        let mut matches = imp.search_matches.borrow_mut();
+        let existing: std::collections::HashSet<String> = matches.iter().cloned().collect();
+        let mut added = 0u32;
+        for eid in event_ids {
+            if eid.is_empty() || existing.contains(eid) { continue; }
+            matches.push(eid.clone());
+            added += 1;
+        }
+        let total = matches.len();
+        drop(matches);
+        if let Some(c) = imp.search_counter.get() {
+            c.set_text(&format!("{total} server"));
+        }
+        tracing::info!(
+            "merge_server_search_results: +{added} server hits for {:?}, total now {total}",
+            query
+        );
+    }
+
     pub fn connect_edit<F: Fn(String, String) + 'static>(&self, f: F) {
         self.imp().on_edit.replace(Some(Box::new(f)));
     }
@@ -2029,6 +2077,14 @@ impl MessageView {
             .tooltip_text("Next match (Enter)")
             .css_classes(["flat"])
             .build();
+        // Tranche 2: ask the server for matches outside the local
+        // window. Results merge into the same prev/next cursor; events
+        // not in list_store fall through to SeekToEvent on jump.
+        let server_btn = gtk::Button::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Search this room on the server")
+            .css_classes(["flat"])
+            .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(4)
@@ -2037,6 +2093,7 @@ impl MessageView {
         row.append(&counter);
         row.append(&prev_btn);
         row.append(&next_btn);
+        row.append(&server_btn);
 
         let bar = gtk::SearchBar::builder()
             .child(&row)
@@ -2073,6 +2130,41 @@ impl MessageView {
             if let Some(view) = view_weak_prev.upgrade() {
                 view.search_step(false);
             }
+        });
+        // Server-search trigger: dispatch via the callback (registered
+        // by MxWindow). Records the query so SearchResults can be
+        // matched against the in-flight request.
+        let view_weak_server = self.downgrade();
+        server_btn.connect_clicked(move |_| {
+            let Some(view) = view_weak_server.upgrade() else { return };
+            // Read everything into owned values up front so the
+            // RefCell borrow on `on_server_search` doesn't outlive
+            // the upgraded view (the closure can be re-entered via
+            // the cb dispatch chain — clone-and-drop avoids the issue).
+            let (room_id, query, cb_clone) = {
+                let imp = view.imp();
+                let query = imp.search_entry.get()
+                    .map(|e| e.text().to_string())
+                    .unwrap_or_default();
+                let room_id = imp.current_room_id.borrow().clone();
+                if query.trim().is_empty() || room_id.is_empty() {
+                    return;
+                }
+                *imp.server_search_query.borrow_mut() = query.clone();
+                // The `Box<dyn Fn>` is not clone-able, so call the
+                // callback inside the borrow scope via a flag-and-call
+                // pattern. The cb_clone here is just a Some/None flag.
+                let has_cb = imp.on_server_search.borrow().is_some();
+                (room_id, query, has_cb)
+            };
+            if !cb_clone { return; }
+            // Re-borrow briefly to invoke the callback. The trailing
+            // semicolon drops the temporary Ref before `view` does,
+            // satisfying the borrow checker.
+            let imp = view.imp();
+            if let Some(ref cb) = *imp.on_server_search.borrow() {
+                cb(room_id, query, 50);
+            };
         });
         // Bar close → clear match state so the next open starts fresh.
         let view_weak_close = self.downgrade();

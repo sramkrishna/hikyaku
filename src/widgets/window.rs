@@ -1445,6 +1445,15 @@ impl MxWindow {
         });
 
         // Wire up react callback → send reaction command + local update.
+        // Server-side in-room search dispatcher (#8 tranche 2).
+        let cmd_tx_search = command_tx.clone();
+        imp.message_view.connect_server_search(move |room_id, query, limit| {
+            let tx = cmd_tx_search.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::SearchRoom { room_id, query, limit }).await;
+            });
+        });
+
         let cmd_tx_react = command_tx.clone();
         let window_weak_react = window.downgrade();
         let msg_view_react = imp.message_view.clone();
@@ -2779,6 +2788,15 @@ impl MxWindow {
                     }
                     MatrixEvent::KnockFailed { error } => {
                         toast_error(&toast_overlay, "Knock failed", &error);
+                    }
+                    MatrixEvent::SearchResults { room_id, query, event_ids } => {
+                        let current = window.imp().current_room_id.borrow().clone();
+                        if current.as_deref() == Some(&room_id) {
+                            message_view.merge_server_search_results(&query, &event_ids);
+                        }
+                    }
+                    MatrixEvent::SearchFailed { error } => {
+                        toast_error(&toast_overlay, "Server search failed", &error);
                     }
                     MatrixEvent::KnockReceived {
                         room_id, room_name, user_id, display_name, reason,
