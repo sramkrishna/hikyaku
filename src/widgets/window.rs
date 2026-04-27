@@ -2771,6 +2771,68 @@ impl MxWindow {
                     MatrixEvent::InviteFailed { error } => {
                         toast_error(&toast_overlay, "Invite failed", &error);
                     }
+                    MatrixEvent::KnockSent { room_id: _, room_name } => {
+                        toast(
+                            &toast_overlay,
+                            &format!("Knock sent to {room_name} — awaiting approval"),
+                        );
+                    }
+                    MatrixEvent::KnockFailed { error } => {
+                        toast_error(&toast_overlay, "Knock failed", &error);
+                    }
+                    MatrixEvent::KnockReceived {
+                        room_id, room_name, user_id, display_name, reason,
+                    } => {
+                        // Bell-log entry so the moderator can revisit later.
+                        let knock_event_id = format!("__knock__{room_id}__{user_id}");
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let body = if reason.is_empty() {
+                            format!("{display_name} is knocking on {room_name}")
+                        } else {
+                            format!("{display_name} is knocking on {room_name}: {reason}")
+                        };
+                        window.push_notification(
+                            &room_id, &knock_event_id, &display_name,
+                            &room_name, &body, ts,
+                        );
+
+                        // Toast with Approve button. Decline isn't surfaced
+                        // here yet — moderator can ignore (knock persists)
+                        // or kick from another client until we add an
+                        // explicit decline UI in user-info on the knocker.
+                        let approve_tx = window.imp().command_tx.get().unwrap().clone();
+                        let approve_rid = room_id.clone();
+                        let approve_uid = user_id.clone();
+                        let title = if reason.is_empty() {
+                            format!("{display_name} wants to join {room_name}")
+                        } else {
+                            format!(
+                                "{display_name} wants to join {room_name}: {reason}",
+                            )
+                        };
+                        let t = adw::Toast::builder()
+                            .title(&title)
+                            .button_label("Approve")
+                            .timeout(0)
+                            .build();
+                        t.connect_button_clicked(move |toast| {
+                            toast.dismiss();
+                            let tx = approve_tx.clone();
+                            let rid = approve_rid.clone();
+                            let uid = approve_uid.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = tx.send(
+                                    crate::matrix::MatrixCommand::ApproveKnock {
+                                        room_id: rid, user_id: uid,
+                                    }
+                                ).await;
+                            });
+                        });
+                        toast_overlay.add_toast(t);
+                    }
                     MatrixEvent::UserSearchResults { results } => {
                         if let Some(cb) = window.imp().user_search_cb.borrow().as_ref() {
                             cb(results);
@@ -4392,6 +4454,12 @@ impl MxWindow {
             .label("Join")
             .css_classes(["suggested-action"])
             .build();
+        // Knock button (MSC2403) for invite-only rooms with knock rule.
+        // Visually subordinate to Join — most attempts go through Join.
+        let knock_btn = gtk::Button::builder()
+            .label("Knock")
+            .tooltip_text("Request access if the room is invite-only")
+            .build();
         let cancel_btn = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .tooltip_text("Cancel")
@@ -4408,6 +4476,7 @@ impl MxWindow {
             .build();
         bar.append(&entry);
         bar.append(&join_btn);
+        bar.append(&knock_btn);
         bar.append(&cancel_btn);
 
         let revealer = gtk::Revealer::builder()
@@ -4459,6 +4528,28 @@ impl MxWindow {
         let join_fn = do_join.clone();
         join_btn.connect_clicked(move |_| join_fn());
         entry.connect_activate(move |_| do_join());
+
+        // Knock dispatch: same parsing as join, but routed through
+        // KnockRoom instead. Reason field is omitted for now — it can
+        // be added as a second optional Entry once the basic flow ships.
+        let tx_knock = tx.clone();
+        let entry_knock = entry.clone();
+        let dismiss_knock = dismiss.clone();
+        knock_btn.connect_clicked(move |_| {
+            let raw = entry_knock.text().to_string();
+            if raw.is_empty() { return; }
+            let room_id_or_alias = parse_matrix_link_or_id(&raw).unwrap_or(raw);
+            let tx = tx_knock.clone();
+            let dismiss = dismiss_knock.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.send(MatrixCommand::KnockRoom {
+                    room_id_or_alias,
+                    reason: String::new(),
+                    via_servers: vec![],
+                }).await;
+                dismiss();
+            });
+        });
 
         cancel_btn.connect_clicked(move |_| dismiss());
     }

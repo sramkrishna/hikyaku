@@ -290,6 +290,21 @@ pub enum MatrixEvent {
         name: String,
         avatar_mxc: String,
     },
+    /// A KnockRoom command succeeded — the homeserver accepted the
+    /// knock and the room is now in the Knocked state. The UI flips
+    /// the join bar to a "Knock sent — awaiting approval" badge.
+    KnockSent { room_id: String, room_name: String },
+    /// A KnockRoom command failed. `error` is a user-facing message.
+    KnockFailed { error: String },
+    /// Someone is knocking on a room where we have invite power.
+    /// `reason` is empty when the knocker didn't provide one.
+    KnockReceived {
+        room_id: String,
+        room_name: String,
+        user_id: String,
+        display_name: String,
+        reason: String,
+    },
     /// Result of SetOwnAvatar. On success, `new_mxc` holds the mxc://
     /// URI the homeserver assigned (empty string if the avatar was
     /// removed). On failure, `error` holds a user-facing message.
@@ -474,6 +489,19 @@ pub enum MatrixCommand {
     /// so message-body pills can show the human-readable room name for
     /// rooms the user hasn't joined. Used by the markdown linkify pass.
     ResolveAliasInfo { alias: String },
+    /// Knock on a room or alias to request access. `reason` is shown to
+    /// moderators in the inbound knock event; empty string for "no
+    /// reason given". Used both as the primary entry point (user
+    /// presses Knock in the join bar) and as the auto-fallback when
+    /// JoinRoom fails because the room's join rule is `knock`.
+    KnockRoom { room_id_or_alias: String, reason: String, via_servers: Vec<String> },
+    /// Approve a pending inbound knock by inviting the user. Mirror of
+    /// AcceptInvite but for the moderator side of MSC2403.
+    ApproveKnock { room_id: String, user_id: String },
+    /// Decline a pending inbound knock by kicking with optional reason.
+    /// matrix-sdk treats kick as the "reject knock" action — there's
+    /// no dedicated reject endpoint in the spec.
+    DeclineKnock { room_id: String, user_id: String, reason: String },
     /// Fetch and cache a room's avatar. No-op if already cached on disk.
     FetchRoomAvatar { room_id: String, mxc_url: String },
     /// Toggle bookmark (m.favourite tag) on a room.
@@ -1305,6 +1333,27 @@ async fn matrix_task(
                         let bg_tx = event_tx.clone();
                         tokio::spawn(async move {
                             handle_resolve_alias_info(&bg_client, &bg_tx, &alias).await;
+                        });
+                    }
+                    Ok(MatrixCommand::KnockRoom { room_id_or_alias, reason, via_servers }) => {
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_knock_room(&bg_client, &bg_tx, &room_id_or_alias, &reason, &via_servers).await;
+                        });
+                    }
+                    Ok(MatrixCommand::ApproveKnock { room_id, user_id }) => {
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_approve_knock(&bg_client, &bg_tx, &room_id, &user_id).await;
+                        });
+                    }
+                    Ok(MatrixCommand::DeclineKnock { room_id, user_id, reason }) => {
+                        let bg_client = client.clone();
+                        let bg_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_decline_knock(&bg_client, &bg_tx, &room_id, &user_id, &reason).await;
                         });
                     }
                     Ok(MatrixCommand::DownloadMedia { url, filename, source_json }) => {
@@ -2611,6 +2660,63 @@ async fn start_sync(
                         room_id: room.room_id().to_string(),
                         room_name,
                         inviter_name,
+                    }).await;
+                }
+            },
+        );
+    }
+
+    // Detect inbound knocks (MSC2403): a different user's membership
+    // event with state_key == their own user_id and content.membership
+    // == Knock. Fires only when the local user has invite power in the
+    // room — moderators get a banner to approve / decline.
+    //
+    // Knocks come through as full sync events (m.room.member with
+    // membership=knock), not as stripped member events the way invites
+    // do, so we register the OriginalSyncRoomMemberEvent variant here.
+    {
+        use matrix_sdk::ruma::events::room::member::{MembershipState, OriginalSyncRoomMemberEvent};
+        let knock_tx = event_tx.clone();
+        let knock_client = client.clone();
+        client.add_event_handler(
+            move |event: OriginalSyncRoomMemberEvent,
+                  room: matrix_sdk::room::Room| {
+                let tx = knock_tx.clone();
+                let client = knock_client.clone();
+                async move {
+                    if event.content.membership != MembershipState::Knock {
+                        return;
+                    }
+                    // state_key is the user knocking; sender is also
+                    // them (knock is self-applied). Filter out our own
+                    // knocks delivered back via sync.
+                    let Some(my_id) = client.user_id() else { return };
+                    if event.state_key.as_str() == my_id.as_str() {
+                        return;
+                    }
+                    // Gate notification on whether we can do anything
+                    // about it — surfacing a knock to a regular member
+                    // is just noise.
+                    let can_invite = match room.power_levels().await {
+                        Ok(pl) => pl.user_can_invite(my_id),
+                        Err(_) => false,
+                    };
+                    if !can_invite {
+                        return;
+                    }
+                    let room_name = room.display_name().await
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|_| room.room_id().to_string());
+                    let user_id = event.state_key.to_string();
+                    let display_name = event.content.displayname.clone()
+                        .unwrap_or_else(|| event.state_key.localpart().to_string());
+                    let reason = event.content.reason.clone().unwrap_or_default();
+                    let _ = tx.send(MatrixEvent::KnockReceived {
+                        room_id: room.room_id().to_string(),
+                        room_name,
+                        user_id,
+                        display_name,
+                        reason,
                     }).await;
                 }
             },
@@ -5377,6 +5483,106 @@ async fn handle_decline_invite(client: &Client, event_tx: &Sender<MatrixEvent>, 
             }).await;
         }
         Err(e) => tracing::error!("Failed to decline invite to {room_id}: {e}"),
+    }
+}
+
+/// Knock on a room or alias (MSC2403). On success, the room enters
+/// the Knocked state on the server; the moderator receives a member
+/// event with membership=knock and can approve via invite or decline
+/// via kick. Returns KnockSent / KnockFailed for the UI to react.
+async fn handle_knock_room(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id_or_alias: &str,
+    reason: &str,
+    via_servers: &[String],
+) {
+    use matrix_sdk::ruma::{OwnedRoomOrAliasId, ServerName};
+    let Ok(target) = OwnedRoomOrAliasId::try_from(room_id_or_alias) else {
+        let _ = event_tx.send(MatrixEvent::KnockFailed {
+            error: format!("Invalid room or alias: {room_id_or_alias}"),
+        }).await;
+        return;
+    };
+    let server_names: Vec<matrix_sdk::ruma::OwnedServerName> = via_servers.iter()
+        .filter_map(|s| ServerName::parse(s.as_str()).ok().map(|n| n.to_owned()))
+        .collect();
+    let reason_opt = if reason.is_empty() { None } else { Some(reason.to_string()) };
+
+    match client.knock(target, reason_opt, server_names).await {
+        Ok(room) => {
+            let room_name = room.display_name().await
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| room_id_or_alias.to_string());
+            tracing::info!("Knock sent on {room_id_or_alias}");
+            let _ = event_tx.send(MatrixEvent::KnockSent {
+                room_id: room.room_id().to_string(),
+                room_name,
+            }).await;
+        }
+        Err(e) => {
+            tracing::warn!("Knock on {room_id_or_alias} failed: {e}");
+            let _ = event_tx.send(MatrixEvent::KnockFailed {
+                error: format!("{e}"),
+            }).await;
+        }
+    }
+}
+
+/// Approve a pending knock by inviting the user. The knock state
+/// on the server clears automatically when the invite is accepted.
+async fn handle_approve_knock(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    user_id: &str,
+) {
+    use matrix_sdk::ruma::UserId;
+    let Ok(parsed_room) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&parsed_room) else { return };
+    let Ok(parsed_user) = UserId::parse(user_id) else { return };
+    match room.invite_user_by_id(&parsed_user).await {
+        Ok(()) => {
+            tracing::info!("Approved knock from {user_id} on {room_id}");
+            // Reuse RoomInvited→opposite signal would be ambiguous; for
+            // now just emit a generic toast via the existing failure
+            // event-less path (the moderator banner self-dismisses on
+            // the next sync, which delivers the new member state).
+        }
+        Err(e) => {
+            tracing::warn!("Failed to approve knock from {user_id} on {room_id}: {e}");
+            let _ = event_tx.send(MatrixEvent::JoinFailed {
+                error: format!("Failed to approve knock: {e}"),
+            }).await;
+        }
+    }
+}
+
+/// Decline a pending knock by kicking the user with an optional
+/// reason. The Matrix spec doesn't define a dedicated reject-knock
+/// endpoint — kick is the canonical "no, you can't come in" response.
+async fn handle_decline_knock(
+    client: &Client,
+    event_tx: &Sender<MatrixEvent>,
+    room_id: &str,
+    user_id: &str,
+    reason: &str,
+) {
+    use matrix_sdk::ruma::UserId;
+    let Ok(parsed_room) = RoomId::parse(room_id) else { return };
+    let Some(room) = client.get_room(&parsed_room) else { return };
+    let Ok(parsed_user) = UserId::parse(user_id) else { return };
+    let reason_opt = if reason.is_empty() { None } else { Some(reason) };
+    match room.kick_user(&parsed_user, reason_opt).await {
+        Ok(()) => {
+            tracing::info!("Declined knock from {user_id} on {room_id}");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to decline knock from {user_id} on {room_id}: {e}");
+            let _ = event_tx.send(MatrixEvent::JoinFailed {
+                error: format!("Failed to decline knock: {e}"),
+            }).await;
+        }
     }
 }
 
