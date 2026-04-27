@@ -85,6 +85,23 @@ flatpak-build-only:
 flatpak-run:
     flatpak run {{ app_id }}
 
+# Run the BETA flatpak with debug env vars + log capture to /tmp/hikyaku.log
+debug-flatpak:
+    # RUST_BACKTRACE=full      → Rust frames in any abort backtrace
+    # RUST_LOG=hikyaku=info    → tracing::info! lines, incl. scroll-diag:
+    # G_DEBUG=fatal-criticals  → first GLib/GTK CRITICAL aborts so we
+    #                            get a backtrace pointing at the bad
+    #                            call site instead of just symptoms
+    # GSK_DEBUG=full-redraw    → flash the window red on every full
+    #                            repaint — distinguishes render-path
+    #                            from layout-path bugs
+    flatpak run \
+        --env=RUST_BACKTRACE=full \
+        --env=RUST_LOG=hikyaku=info \
+        --env=G_DEBUG=fatal-criticals \
+        --env=GSK_DEBUG=full-redraw \
+        {{ app_id }}/x86_64/beta 2>&1 | tee /tmp/hikyaku.log
+
 # Uninstall the user-installed flatpak
 flatpak-uninstall:
     flatpak uninstall --user {{ app_id }}
