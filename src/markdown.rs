@@ -604,6 +604,33 @@ fn linkify_aliases(text: &str) -> String {
 ///
 /// Pure — no directory lookup, no side effects. Caller filters against
 /// `crate::directory::room_id_for_alias` to decide which to resolve.
+/// Extract the first `https://matrix.to/#/<room>/<event>` link in `text`,
+/// returning `(room_part, event_id)` where `room_part` is the
+/// percent-decoded room id or alias (`!id:server` or `#alias:server`).
+/// Returns `None` for any URL shape that isn't a matrix.to *event*
+/// link — room-only matrix.to URLs, user links, and bare URLs are all
+/// rejected here so the caller doesn't need to second-guess.
+///
+/// Used by the link-preview card path: when the message body cites a
+/// specific Matrix event, the bound row tries to look the event up
+/// in the local cache and renders a Discord-style preview under the
+/// body. The pill itself (`matrix_to_pill_text`) still handles the
+/// inline rendering — this helper just teases out the structured pair.
+pub(crate) fn extract_first_matrix_to_event_link(text: &str) -> Option<(String, String)> {
+    for word in text.split_whitespace() {
+        let url = word.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | '!' | '?' | ';' | ':'));
+        let Some(rest) = url.strip_prefix("https://matrix.to/#/") else { continue };
+        let path = rest.split('?').next().unwrap_or(rest);
+        let Some((room_enc, event)) = path.split_once('/') else { continue };
+        if event.is_empty() || !event.starts_with('$') { continue; }
+        let room = room_enc.replace("%21", "!").replace("%23", "#");
+        if room.starts_with('!') || room.starts_with('#') {
+            return Some((room, event.to_string()));
+        }
+    }
+    None
+}
+
 pub(crate) fn extract_aliases(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out: Vec<String> = Vec::new();
@@ -845,5 +872,55 @@ mod tests {
         // Trailing slash, whitespace, and angle brackets all terminate the server name.
         let got = extract_aliases("goto #foo:server.tld/path next");
         assert_eq!(got, vec!["#foo:server.tld"]);
+    }
+
+    // ── extract_first_matrix_to_event_link (link-preview card) ────────
+
+    #[test]
+    fn extract_event_link_basic_room_id() {
+        let body = "see https://matrix.to/#/%21abc:example.org/$evt123 for context";
+        let got = extract_first_matrix_to_event_link(body);
+        assert_eq!(got, Some(("!abc:example.org".to_string(), "$evt123".to_string())));
+    }
+
+    #[test]
+    fn extract_event_link_basic_alias() {
+        let body = "https://matrix.to/#/%23room:example.org/$evt456";
+        let got = extract_first_matrix_to_event_link(body);
+        assert_eq!(got, Some(("#room:example.org".to_string(), "$evt456".to_string())));
+    }
+
+    #[test]
+    fn extract_event_link_strips_via_query() {
+        let body = "https://matrix.to/#/%21abc:example.org/$evt789?via=other.org";
+        let got = extract_first_matrix_to_event_link(body);
+        assert_eq!(got, Some(("!abc:example.org".to_string(), "$evt789".to_string())));
+    }
+
+    #[test]
+    fn extract_event_link_rejects_room_only() {
+        // No /$event suffix → room-only link, not an event reference.
+        let body = "join https://matrix.to/#/%23room:example.org";
+        assert_eq!(extract_first_matrix_to_event_link(body), None);
+    }
+
+    #[test]
+    fn extract_event_link_rejects_user_link() {
+        let body = "ping https://matrix.to/#/@alice:example.org";
+        assert_eq!(extract_first_matrix_to_event_link(body), None);
+    }
+
+    #[test]
+    fn extract_event_link_returns_first() {
+        let body = "https://matrix.to/#/%21a:s.tld/$one and https://matrix.to/#/%21b:s.tld/$two";
+        let got = extract_first_matrix_to_event_link(body);
+        assert_eq!(got, Some(("!a:s.tld".to_string(), "$one".to_string())));
+    }
+
+    #[test]
+    fn extract_event_link_handles_trailing_punctuation() {
+        let body = "see https://matrix.to/#/%21abc:example.org/$evt123, please";
+        let got = extract_first_matrix_to_event_link(body);
+        assert_eq!(got, Some(("!abc:example.org".to_string(), "$evt123".to_string())));
     }
 }

@@ -182,6 +182,39 @@ template $MxMessageRow : Gtk.Box {
       }
     }
 
+    // Linked-message preview card — shown under body_label when the
+    // message body contains a matrix.to event link AND the linked
+    // event is in our local cache. Discord-style: small avatar +
+    // sender + truncated body. Click navigates to the linked event.
+    // Hidden when the link can't be resolved locally; the existing
+    // pill in the body still renders as before.
+    Gtk.Box link_preview {
+      orientation: horizontal;
+      spacing: 8;
+      visible: false;
+      margin-top: 4;
+      margin-start: 4;
+      styles ["link-preview-card"]
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 0;
+        hexpand: true;
+
+        Gtk.Label link_preview_sender {
+          halign: start;
+          ellipsize: end;
+          styles ["caption-heading", "dim-label"]
+        }
+
+        Gtk.Label link_preview_body {
+          halign: start;
+          ellipsize: end;
+          styles ["caption"]
+        }
+      }
+    }
+
     // Reactions row — emoji pills.
     Gtk.Box reactions_box {
       orientation: horizontal;

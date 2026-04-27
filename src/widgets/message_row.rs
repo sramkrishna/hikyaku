@@ -121,6 +121,12 @@ mod imp {
         #[template_child]
         pub sender_flair_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub link_preview: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub link_preview_sender: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub link_preview_body: TemplateChild<gtk::Label>,
+        #[template_child]
         pub timestamp_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub body_label: TemplateChild<gtk::Label>,
@@ -1433,6 +1439,57 @@ impl MessageRow {
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
         self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+
+        // Link preview card: if the body cites a matrix.to event link
+        // and the linked event is in our local cache, render a small
+        // sender + body-snippet card under the body. The matrix.to
+        // pill in the body still does its thing — this is additive.
+        // No server fetch; out-of-cache events leave the card hidden.
+        {
+            let link = crate::markdown::extract_first_matrix_to_event_link(&body)
+                .or_else(|| {
+                    if formatted_body.is_empty() {
+                        None
+                    } else {
+                        crate::markdown::extract_first_matrix_to_event_link(&formatted_body)
+                    }
+                });
+            let mut shown = false;
+            if let Some((room, event_id)) = link {
+                use gtk::prelude::*;
+                if let Some(app) = gtk::gio::Application::default() {
+                    if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
+                        if let Some(window) = gtk_app.active_window() {
+                            if let Some(win) = window.downcast_ref::<crate::widgets::MxWindow>() {
+                                let view = win.imp().message_view.clone();
+                                if let Some(linked) = view.lookup_message(&room, &event_id) {
+                                    let preview_sender = linked.sender();
+                                    let preview_body = linked.body();
+                                    // Truncate at ~140 chars and add an
+                                    // ellipsis when longer; ellipsize on
+                                    // the label gives the *displayed*
+                                    // ellipsis but we still want to bound
+                                    // the *string* so very long bodies
+                                    // don't blow up Pango layout cost.
+                                    let snippet: String = preview_body
+                                        .char_indices()
+                                        .nth(140)
+                                        .map(|(i, _)| format!("{}…", &preview_body[..i]))
+                                        .unwrap_or(preview_body);
+                                    imp.link_preview_sender.set_text(&preview_sender);
+                                    imp.link_preview_body.set_text(&snippet);
+                                    imp.link_preview.set_visible(true);
+                                    shown = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !shown {
+                imp.link_preview.set_visible(false);
+            }
+        }
 
         // Sender avatar — 32px next to the sender name. Image from the
         // window's avatar_cache if we've downloaded it; initials-on-

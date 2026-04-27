@@ -2255,6 +2255,48 @@ impl MessageView {
         self.scroll_to_event(&eid);
     }
 
+    /// Look up a message by `(room_id_or_alias, event_id)` across every
+    /// per-room ListStore the view has cached. Returns the first match.
+    ///
+    /// Used by the link-preview card path: when bind sees a matrix.to
+    /// event link in the body, it asks here whether we have the linked
+    /// event locally — if so, the row renders a Discord-style preview
+    /// underneath. No server fetch is attempted; rooms we haven't
+    /// visited are silently absent and the preview stays hidden.
+    pub fn lookup_message(&self, room_id_or_alias: &str, event_id: &str) -> Option<MessageObject> {
+        if event_id.is_empty() { return None; }
+        // Resolve alias → room_id via the directory; otherwise the
+        // input is already a room id (or unresolvable, in which case we
+        // fall through to the per-room scan below).
+        let target_room_id: Option<String> = if room_id_or_alias.starts_with('!') {
+            Some(room_id_or_alias.to_string())
+        } else if room_id_or_alias.starts_with('#') {
+            crate::directory::room_id_for_alias(room_id_or_alias)
+        } else {
+            None
+        };
+        let imp = self.imp();
+        let target = target_room_id.as_deref();
+        let cache = imp.list_store_cache.borrow();
+        for (rid, store) in cache.iter() {
+            if target.is_some() && Some(rid.as_str()) != target { continue; }
+            let n = gio::prelude::ListModelExt::n_items(store);
+            for i in 0..n {
+                if let Some(obj) = gio::prelude::ListModelExt::item(store, i)
+                    .and_downcast::<MessageObject>()
+                {
+                    if obj.event_id() == event_id {
+                        return Some(obj);
+                    }
+                }
+            }
+            // If we narrowed to a specific room and didn't find the
+            // event in its store, no point scanning the rest.
+            if target.is_some() { return None; }
+        }
+        None
+    }
+
     pub fn refresh_alias_references(&self, alias: &str) {
         if alias.is_empty() { return; }
         let imp = self.imp();
