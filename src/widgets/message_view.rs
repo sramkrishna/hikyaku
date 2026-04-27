@@ -2509,8 +2509,11 @@ impl MessageView {
         let msg = match imp.event_index.borrow().get(event_id).cloned() {
             Some(m) => m,
             None => {
-                tracing::debug!("update_message_in_place: {event_id} not in event_index (room={})",
-                    imp.current_room_id.borrow());
+                tracing::info!(
+                    "update-diag: {event_id} not in event_index for room={} — \
+                     mutation dropped (visible row would not refresh)",
+                    imp.current_room_id.borrow()
+                );
                 return;
             }
         };
@@ -2519,16 +2522,25 @@ impl MessageView {
         // the full list_store). Identify the right row by its stored event_id
         // rather than by absolute position, which is correct across virtual scroll.
         let eid = event_id.to_string();
+        let mut walked: u32 = 0;
+        let mut found = false;
         let mut child = imp.list_view().first_child();
         while let Some(ref widget) = child {
             if let Some(row) = Self::find_message_row(widget) {
+                walked += 1;
                 if *row.imp().event_id.borrow() == eid {
                     row.bind_message_object(&msg, &self.row_context());
+                    found = true;
                     break;
                 }
             }
             child = widget.next_sibling();
         }
+        tracing::info!(
+            "update-diag: {event_id} mutate-and-rebind: walked={walked} \
+             found_visible_row={found} room={}",
+            imp.current_room_id.borrow()
+        );
     }
 
     /// Toggle an emoji reaction on a message. If "You" already reacted,
