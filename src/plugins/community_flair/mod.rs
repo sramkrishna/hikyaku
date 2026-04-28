@@ -76,8 +76,13 @@ fn user_flairs_path() -> PathBuf {
 
 impl FlairStore {
     pub fn new() -> Self {
-        let path_flairs = flairs_path();
-        let path_user_flairs = user_flairs_path();
+        Self::new_at(flairs_path(), user_flairs_path())
+    }
+
+    /// Construct a store at explicit paths. Production code uses
+    /// `new()` (which routes to data_dir); tests use this to keep
+    /// disk state isolated to a tempdir.
+    pub fn new_at(path_flairs: PathBuf, path_user_flairs: PathBuf) -> Self {
 
         let mut inner = Inner::default();
 
@@ -378,5 +383,124 @@ mod tests {
         let m = flair_markup(&f);
         assert!(m.contains("#66a0ea"),
             "bad color stored should still render; default covers it");
+    }
+
+    // ── store CRUD (edit + delete features) ──────────────────────────
+
+    /// Build a FlairStore against unique tempdir paths so tests don't
+    /// touch the user's real flair library.
+    fn temp_store() -> FlairStore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("hikyaku-flair-test-{pid}-{n}"));
+        let _ = std::fs::create_dir_all(&dir);
+        FlairStore::new_at(
+            dir.join("flairs.json"),
+            dir.join("user_flairs.json"),
+        )
+    }
+
+    #[test]
+    fn create_then_update_renames_and_recolours() {
+        let s = temp_store();
+        let id = s.create_flair("coworker", "#3584e4");
+        s.update_flair(id, "ex-coworker", "#a51d2d");
+        let f = s.get_flair(id).expect("flair must still exist");
+        assert_eq!(f.name, "ex-coworker");
+        assert_eq!(f.color, "#a51d2d");
+    }
+
+    #[test]
+    fn update_flair_normalises_garbage_color() {
+        let s = temp_store();
+        let id = s.create_flair("x", "#3584e4");
+        s.update_flair(id, "x", "definitely not a hex");
+        let f = s.get_flair(id).expect("flair must exist");
+        assert_eq!(f.color, "#66a0ea", "garbage colour should fall back to default");
+    }
+
+    #[test]
+    fn update_missing_flair_is_noop() {
+        let s = temp_store();
+        // Library empty, id=42 doesn't exist — must not panic.
+        s.update_flair(42, "ghost", "#3584e4");
+        assert!(s.get_flair(42).is_none());
+    }
+
+    #[test]
+    fn delete_flair_removes_from_library() {
+        let s = temp_store();
+        let id = s.create_flair("temp", "#3584e4");
+        assert!(s.get_flair(id).is_some());
+        s.delete_flair(id);
+        assert!(s.get_flair(id).is_none());
+    }
+
+    #[test]
+    fn delete_flair_unassigns_every_user() {
+        let s = temp_store();
+        let id = s.create_flair("workmate", "#26a269");
+        s.set_user_flair("@alice:example.org", Some(id));
+        s.set_user_flair("@bob:example.org", Some(id));
+        assert!(s.get_user_flair("@alice:example.org").is_some());
+        assert!(s.get_user_flair("@bob:example.org").is_some());
+        s.delete_flair(id);
+        assert!(s.get_user_flair("@alice:example.org").is_none(),
+            "delete must unassign all carriers");
+        assert!(s.get_user_flair("@bob:example.org").is_none(),
+            "delete must unassign all carriers");
+    }
+
+    #[test]
+    fn delete_missing_flair_is_noop() {
+        let s = temp_store();
+        s.delete_flair(99);
+        assert!(s.list_flairs().is_empty());
+    }
+
+    #[test]
+    fn ids_are_not_reused_across_deletes() {
+        let s = temp_store();
+        let a = s.create_flair("a", "#3584e4");
+        s.delete_flair(a);
+        let b = s.create_flair("b", "#26a269");
+        assert_ne!(a, b, "next_id must keep advancing — re-use would silently \
+                          retarget stale per-user assignments to a new flair");
+    }
+
+    // ── theme-aware palette ──────────────────────────────────────────
+
+    #[test]
+    fn dark_palette_entries_are_all_valid_hex() {
+        for hex in DARK_PALETTE {
+            assert!(is_valid_hex_color(hex),
+                "DARK_PALETTE entry {hex} is not a valid hex");
+        }
+    }
+
+    #[test]
+    fn light_palette_entries_are_all_valid_hex() {
+        for hex in LIGHT_PALETTE {
+            assert!(is_valid_hex_color(hex),
+                "LIGHT_PALETTE entry {hex} is not a valid hex");
+        }
+    }
+
+    #[test]
+    fn palettes_are_not_trivial() {
+        assert!(DARK_PALETTE.len() >= 4, "need a meaningful range of dark choices");
+        assert!(LIGHT_PALETTE.len() >= 4, "need a meaningful range of light choices");
+    }
+
+    #[test]
+    fn palettes_have_distinct_colors() {
+        let dark: std::collections::HashSet<_> = DARK_PALETTE.iter().collect();
+        assert_eq!(dark.len(), DARK_PALETTE.len(),
+            "duplicate colour in dark palette would waste a swatch slot");
+        let light: std::collections::HashSet<_> = LIGHT_PALETTE.iter().collect();
+        assert_eq!(light.len(), LIGHT_PALETTE.len(),
+            "duplicate colour in light palette would waste a swatch slot");
     }
 }
