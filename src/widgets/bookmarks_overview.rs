@@ -400,8 +400,36 @@ impl BookmarksOverview {
             .css_classes(["unread-badge", "caption"])
             .build();
 
+        // Community-health dot — same colours and tooltip as the
+        // sidebar room row so the meaning carries over to the
+        // bookmarks overview. Closure holds a WeakRef to the dot so
+        // it no-ops cleanly once the card is dropped; the signal
+        // handler on the room is left in place (cheap, room outlives
+        // any single card and the cost is one orphaned closure that
+        // upgrades to None forever).
+        #[cfg(feature = "community-health")]
+        let health_dot = {
+            let dot = gtk::Box::builder()
+                .width_request(8)
+                .height_request(8)
+                .valign(gtk::Align::Center)
+                .visible(false)
+                .css_classes(["health-dot"])
+                .build();
+            apply_health_to_dot(&dot, room.health_alert());
+            let dot_weak = dot.downgrade();
+            room.connect_notify_local(Some("health-alert"), move |obj, _| {
+                if let Some(d) = dot_weak.upgrade() {
+                    apply_health_to_dot(&d, obj.health_alert());
+                }
+            });
+            dot
+        };
+
         badge_row.append(&mention_icon);
         badge_row.append(&unread_badge);
+        #[cfg(feature = "community-health")]
+        badge_row.append(&health_dot);
 
         // Bind unread-count → badge label + visibility.
         bindings.push(
@@ -619,5 +647,23 @@ impl BookmarksOverview {
         fb_child.set_widget_name(&format!("{}\t{}", event_id, searchable));
         fb_child.set_child(Some(&overlay));
         fb_child.upcast()
+    }
+}
+
+/// Update a community-health dot widget for a given alert level.
+/// Mirrors the logic in `room_row::set_health` so the bookmark cards
+/// pick up the same colour conventions and tooltip as the sidebar.
+#[cfg(feature = "community-health")]
+fn apply_health_to_dot(dot: &gtk::Box, alert: u8) {
+    use gtk::prelude::*;
+    dot.remove_css_class("health-none");
+    dot.remove_css_class("health-watch");
+    dot.remove_css_class("health-warning");
+    dot.set_tooltip_text(Some(crate::widgets::room_row::health_tooltip(alert)));
+    match alert {
+        1 => { dot.add_css_class("health-none"); dot.set_visible(true); }
+        2 => { dot.add_css_class("health-watch"); dot.set_visible(true); }
+        3 => { dot.add_css_class("health-warning"); dot.set_visible(true); }
+        _ => { dot.set_visible(false); }
     }
 }

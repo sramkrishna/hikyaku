@@ -270,11 +270,56 @@ impl RoomRow {
         dot.remove_css_class("health-none");
         dot.remove_css_class("health-watch");
         dot.remove_css_class("health-warning");
+        dot.set_tooltip_text(Some(health_tooltip(alert)));
         match alert {
             1 => { dot.add_css_class("health-none"); dot.set_visible(true); }
             2 => { dot.add_css_class("health-watch"); dot.set_visible(true); }
             3 => { dot.add_css_class("health-warning"); dot.set_visible(true); }
             _ => { dot.set_visible(false); }
         }
+    }
+}
+
+/// Tooltip text for the community-health dot. Pure — kept outside
+/// `RoomRow` so it can be unit-tested without a GTK harness.
+#[cfg(feature = "community-health")]
+pub(crate) fn health_tooltip(alert: u8) -> &'static str {
+    match alert {
+        1 => "Community health: healthy — no tension detected in recent messages",
+        2 => "Community health: watch — sentiment elevated",
+        3 => "Community health: warning — sustained tension detected",
+        _ => "",
+    }
+}
+
+#[cfg(all(test, feature = "community-health"))]
+mod tests {
+    use super::health_tooltip;
+
+    #[test]
+    fn tooltip_distinguishes_three_alert_levels() {
+        let g = health_tooltip(1);
+        let a = health_tooltip(2);
+        let r = health_tooltip(3);
+        assert!(g.contains("healthy"));
+        assert!(a.contains("watch") || a.contains("elevated"));
+        assert!(r.contains("warning") || r.contains("tension"));
+        assert_ne!(g, a);
+        assert_ne!(a, r);
+    }
+
+    #[test]
+    fn tooltip_empty_when_hidden() {
+        // alert == 0 hides the dot; empty tooltip prevents stale text
+        // from a prior visible state lingering when GTK shows it.
+        assert_eq!(health_tooltip(0), "");
+    }
+
+    #[test]
+    fn tooltip_unknown_alert_falls_back_to_empty() {
+        // Future-proofing: unrecognised alert numbers should never
+        // panic, just suppress the tooltip.
+        assert_eq!(health_tooltip(7), "");
+        assert_eq!(health_tooltip(255), "");
     }
 }
