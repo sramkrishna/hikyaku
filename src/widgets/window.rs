@@ -3312,8 +3312,12 @@ impl MxWindow {
             .vexpand(true)
             .width_request(280)
             .build();
+        // Left-pointing chevron — points back toward the main message
+        // view that the user returns to when the panel collapses.
+        // (The earlier go-next-symbolic pointed away from the chat,
+        // which read more like "expand outward" than "go back".)
         let user_info_close_btn = gtk::Button::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("go-previous-symbolic")
             .tooltip_text("Close")
             .css_classes(["flat", "circular"])
             .halign(gtk::Align::End)
@@ -4810,7 +4814,18 @@ impl MxWindow {
         // user sees the effect without a second click.
         #[cfg(feature = "community-flair")]
         let flair_widgets = {
-            use crate::plugins::community_flair::FLAIR_STORE;
+            use crate::plugins::community_flair::{
+                FLAIR_STORE, current_palette,
+            };
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            #[derive(Clone, Copy)]
+            enum FlairEditorMode {
+                Create,
+                Edit(u32),
+            }
+
             let flair_label = gtk::Label::builder()
                 .label("Flair")
                 .halign(gtk::Align::Start)
@@ -4819,19 +4834,19 @@ impl MxWindow {
                 .build();
             content.append(&flair_label);
 
-            let flairs = FLAIR_STORE.list_flairs();
+            let flairs_initial = FLAIR_STORE.list_flairs();
             let prior_flair_id = FLAIR_STORE.get_user_flair(user_id).map(|f| f.id);
 
             let items = gtk::StringList::new(&["(none)"]);
-            for f in &flairs {
+            for f in &flairs_initial {
                 items.append(&f.name);
             }
             // Last entry opens the inline create-new editor.
             items.append("+ Create new flair…");
-            let create_idx: u32 = items.n_items() - 1;
+            let create_idx: Rc<Cell<u32>> = Rc::new(Cell::new(items.n_items() - 1));
 
             let selected_idx: u32 = match prior_flair_id {
-                Some(pfid) => flairs.iter().position(|f| f.id == pfid)
+                Some(pfid) => flairs_initial.iter().position(|f| f.id == pfid)
                     .map(|p| (p + 1) as u32)
                     .unwrap_or(0),
                 None => 0,
@@ -4846,102 +4861,302 @@ impl MxWindow {
             flair_group.add(&flair_row);
             content.append(&flair_group);
 
-            // Inline create-new editor, collapsed by default.
+            // Edit / Delete actions for the currently-selected flair —
+            // surface only when the combo has an existing flair (1..create_idx).
+            let manage_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .halign(gtk::Align::End)
+                .margin_top(4)
+                .build();
+            let edit_btn = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Edit this flair")
+                .css_classes(["flat", "circular"])
+                .build();
+            let delete_btn = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Delete this flair (unassigns from everyone)")
+                .css_classes(["flat", "circular"])
+                .build();
+            manage_row.append(&edit_btn);
+            manage_row.append(&delete_btn);
+            content.append(&manage_row);
+
+            // Inline editor — used by both Create and Edit modes. The
+            // mode cell tells the Save handler which flow to invoke.
+            let editor_mode: Rc<Cell<FlairEditorMode>> =
+                Rc::new(Cell::new(FlairEditorMode::Create));
             let editor_revealer = gtk::Revealer::builder()
                 .transition_type(gtk::RevealerTransitionType::SlideDown)
                 .reveal_child(false)
                 .build();
             let editor_box = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(8)
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(6)
                 .margin_top(4)
                 .margin_bottom(8)
                 .build();
-            let new_name_entry = gtk::Entry::builder()
+            let name_entry = gtk::Entry::builder()
                 .placeholder_text("Flair name")
                 .hexpand(true)
                 .build();
-            let color_dialog = gtk::ColorDialog::builder()
-                .title("Pick flair colour")
+            editor_box.append(&name_entry);
+
+            // Curated palette swatches — picks light/dark variant by
+            // current style. Each swatch is a small flat circular
+            // button with its hex stored as widget-name and its
+            // background painted via a per-swatch CSS provider.
+            let palette = current_palette();
+            let selected_hex: Rc<std::cell::RefCell<String>> =
+                Rc::new(std::cell::RefCell::new(palette[0].to_string()));
+            let palette_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .halign(gtk::Align::Start)
                 .build();
-            let color_btn = gtk::ColorDialogButton::builder()
-                .dialog(&color_dialog)
+            let swatch_buttons: Rc<std::cell::RefCell<Vec<gtk::Button>>> =
+                Rc::new(std::cell::RefCell::new(Vec::with_capacity(palette.len())));
+            for (i, hex) in palette.iter().enumerate() {
+                let btn = gtk::Button::builder()
+                    .css_classes(["flat", "circular", "flair-swatch"])
+                    .tooltip_text(*hex)
+                    .build();
+                btn.set_widget_name(hex);
+                let provider = gtk::CssProvider::new();
+                provider.load_from_string(&format!(
+                    "button.flair-swatch {{\
+                       min-width: 24px; min-height: 24px;\
+                       padding: 0;\
+                       background-color: {hex};\
+                     }}\
+                     button.flair-swatch.selected {{\
+                       outline: 2px solid @accent_bg_color;\
+                       outline-offset: 2px;\
+                     }}"
+                ));
+                gtk::prelude::WidgetExt::style_context(&btn).add_provider(
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+                if i == 0 { btn.add_css_class("selected"); }
+                let selected = selected_hex.clone();
+                let swatch_buttons_for_click = swatch_buttons.clone();
+                let hex_owned = hex.to_string();
+                btn.connect_clicked(move |_| {
+                    *selected.borrow_mut() = hex_owned.clone();
+                    // Update the visual selection ring on all swatches.
+                    for sb in swatch_buttons_for_click.borrow().iter() {
+                        if sb.widget_name().as_str() == hex_owned {
+                            sb.add_css_class("selected");
+                        } else {
+                            sb.remove_css_class("selected");
+                        }
+                    }
+                });
+                swatch_buttons.borrow_mut().push(btn.clone());
+                palette_row.append(&btn);
+            }
+            editor_box.append(&palette_row);
+
+            let editor_actions = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .halign(gtk::Align::End)
                 .build();
-            // Default to the pill's fallback colour so the user sees
-            // what they'd get if they skip picking.
-            color_btn.set_rgba(&gtk::gdk::RGBA::new(
-                0x66 as f32 / 255.0,
-                0xa0 as f32 / 255.0,
-                0xea as f32 / 255.0,
-                1.0,
-            ));
-            let create_flair_btn = gtk::Button::builder()
+            let save_btn = gtk::Button::builder()
                 .label("Create")
                 .css_classes(["suggested-action"])
                 .build();
-            let cancel_flair_btn = gtk::Button::builder()
+            let cancel_btn = gtk::Button::builder()
                 .label("Cancel")
                 .css_classes(["flat"])
                 .build();
-            editor_box.append(&new_name_entry);
-            editor_box.append(&color_btn);
-            editor_box.append(&create_flair_btn);
-            editor_box.append(&cancel_flair_btn);
+            editor_actions.append(&cancel_btn);
+            editor_actions.append(&save_btn);
+            editor_box.append(&editor_actions);
+
             editor_revealer.set_child(Some(&editor_box));
             content.append(&editor_revealer);
 
-            // Combo selection → toggle the editor for "Create new flair…".
-            let editor_reveal_for_combo = editor_revealer.clone();
-            flair_row.connect_selected_notify(move |row| {
-                editor_reveal_for_combo.set_reveal_child(row.selected() == create_idx);
-            });
+            // Helper closures for state transitions (need to be
+            // Rc<Box<dyn Fn()>> so multiple call sites can share).
+            let toggle_manage_visible = {
+                let edit_btn = edit_btn.clone();
+                let delete_btn = delete_btn.clone();
+                let create_idx = create_idx.clone();
+                let flair_row = flair_row.clone();
+                Rc::new(move || {
+                    let idx = flair_row.selected();
+                    let is_existing = idx > 0 && idx < create_idx.get();
+                    edit_btn.set_visible(is_existing);
+                    delete_btn.set_visible(is_existing);
+                })
+            };
+            // Initial visibility.
+            toggle_manage_visible();
 
-            // Cancel: collapse editor, snap combo back to "(none)" so
-            // save doesn't persist the placeholder selection.
-            let flair_row_for_cancel = flair_row.clone();
-            let editor_reveal_for_cancel = editor_revealer.clone();
-            let name_entry_for_cancel = new_name_entry.clone();
-            cancel_flair_btn.connect_clicked(move |_| {
-                flair_row_for_cancel.set_selected(0);
-                editor_reveal_for_cancel.set_reveal_child(false);
-                name_entry_for_cancel.set_text("");
-            });
+            // Helper that selects the swatch matching `hex`. Falls
+            // back to the first swatch when the stored colour isn't
+            // in the current palette (e.g. user changed themes).
+            let select_swatch_for_hex = {
+                let swatch_buttons = swatch_buttons.clone();
+                let selected_hex = selected_hex.clone();
+                Rc::new(move |hex: &str| {
+                    let mut matched = false;
+                    for sb in swatch_buttons.borrow().iter() {
+                        if sb.widget_name().as_str() == hex {
+                            sb.add_css_class("selected");
+                            matched = true;
+                        } else {
+                            sb.remove_css_class("selected");
+                        }
+                    }
+                    if matched {
+                        *selected_hex.borrow_mut() = hex.to_string();
+                    } else if let Some(first) = swatch_buttons.borrow().first() {
+                        first.add_css_class("selected");
+                        *selected_hex.borrow_mut() = first.widget_name().to_string();
+                    }
+                })
+            };
 
-            // Create: persist the new flair, insert before the "+ Create…"
-            // trailer, select it, and assign to this user immediately so
-            // the flair renders without waiting for the save closure.
-            let flair_row_for_create = flair_row.clone();
-            let items_for_create = items.clone();
-            let name_entry_for_create = new_name_entry.clone();
-            let color_btn_for_create = color_btn.clone();
-            let editor_reveal_for_create = editor_revealer.clone();
-            let uid_for_create = user_id.to_string();
-            let window_weak_create = self.downgrade();
-            create_flair_btn.connect_clicked(move |_| {
-                let name = name_entry_for_create.text().trim().to_string();
-                if name.is_empty() { return; }
-                let rgba = color_btn_for_create.rgba();
-                let hex = format!(
-                    "#{:02x}{:02x}{:02x}",
-                    (rgba.red() * 255.0).round() as u8,
-                    (rgba.green() * 255.0).round() as u8,
-                    (rgba.blue() * 255.0).round() as u8,
-                );
-                let new_id = FLAIR_STORE.create_flair(&name, &hex);
-                FLAIR_STORE.set_user_flair(&uid_for_create, Some(new_id));
-                // Insert the new name BEFORE the "+ Create new flair…" trailer.
-                let n = items_for_create.n_items();
-                let insert_at = n.saturating_sub(1);
-                items_for_create.splice(insert_at, 0, &[name.as_str()]);
-                flair_row_for_create.set_selected(insert_at);
-                editor_reveal_for_create.set_reveal_child(false);
-                name_entry_for_create.set_text("");
-                // Refresh existing visible rows so the pill appears
-                // without waiting for a room switch or bg_refresh.
-                if let Some(win) = window_weak_create.upgrade() {
-                    win.imp().message_view.refresh_flair_for_user(&uid_for_create);
-                }
-            });
+            // Combo selection: show editor for "Create new flair…",
+            // hide it for any other selection. Re-evaluate manage-row
+            // visibility too.
+            {
+                let editor_revealer = editor_revealer.clone();
+                let create_idx = create_idx.clone();
+                let editor_mode = editor_mode.clone();
+                let toggle = toggle_manage_visible.clone();
+                let save_btn = save_btn.clone();
+                let name_entry = name_entry.clone();
+                flair_row.connect_selected_notify(move |row| {
+                    let idx = row.selected();
+                    if idx == create_idx.get() {
+                        editor_mode.set(FlairEditorMode::Create);
+                        save_btn.set_label("Create");
+                        name_entry.set_text("");
+                        editor_revealer.set_reveal_child(true);
+                    } else {
+                        editor_revealer.set_reveal_child(false);
+                    }
+                    toggle();
+                });
+            }
+
+            // Edit: pre-fill the editor with the selected flair's
+            // current values, switch save_btn to "Save" mode.
+            {
+                let flair_row = flair_row.clone();
+                let create_idx = create_idx.clone();
+                let editor_mode = editor_mode.clone();
+                let editor_revealer = editor_revealer.clone();
+                let name_entry = name_entry.clone();
+                let save_btn = save_btn.clone();
+                let select_swatch = select_swatch_for_hex.clone();
+                edit_btn.connect_clicked(move |_| {
+                    let idx = flair_row.selected();
+                    if idx == 0 || idx >= create_idx.get() { return; }
+                    let flairs_now = FLAIR_STORE.list_flairs();
+                    let Some(f) = flairs_now.get((idx - 1) as usize) else { return };
+                    name_entry.set_text(&f.name);
+                    select_swatch(&f.color);
+                    editor_mode.set(FlairEditorMode::Edit(f.id));
+                    save_btn.set_label("Save");
+                    editor_revealer.set_reveal_child(true);
+                });
+            }
+
+            // Delete: yank the flair from the library and from every
+            // user that carried it; collapse to "(none)" and refresh
+            // visible rows so missing pills disappear immediately.
+            {
+                let flair_row = flair_row.clone();
+                let create_idx = create_idx.clone();
+                let items_for_delete = items.clone();
+                let toast_overlay = self.imp().toast_overlay.clone();
+                let window_weak = self.downgrade();
+                delete_btn.connect_clicked(move |_| {
+                    let idx = flair_row.selected();
+                    if idx == 0 || idx >= create_idx.get() { return; }
+                    let flairs_now = FLAIR_STORE.list_flairs();
+                    let Some(f) = flairs_now.get((idx - 1) as usize) else { return };
+                    let name = f.name.clone();
+                    let id = f.id;
+                    FLAIR_STORE.delete_flair(id);
+                    // Remove from the combo and shift create_idx down.
+                    items_for_delete.splice(idx, 1, &[]);
+                    create_idx.set(create_idx.get().saturating_sub(1));
+                    flair_row.set_selected(0);
+                    toast(&toast_overlay, &format!("Deleted flair “{name}”"));
+                    if let Some(win) = window_weak.upgrade() {
+                        win.imp().message_view.refresh_all_flairs();
+                    }
+                });
+            }
+
+            // Cancel: snap back to (none) for Create, or to the
+            // currently-stored selection for Edit. Hide the editor.
+            {
+                let flair_row_for_cancel = flair_row.clone();
+                let editor_revealer = editor_revealer.clone();
+                let name_entry = name_entry.clone();
+                let editor_mode = editor_mode.clone();
+                cancel_btn.connect_clicked(move |_| {
+                    if matches!(editor_mode.get(), FlairEditorMode::Create) {
+                        flair_row_for_cancel.set_selected(0);
+                    }
+                    editor_revealer.set_reveal_child(false);
+                    name_entry.set_text("");
+                });
+            }
+
+            // Save: dispatches based on editor_mode. Both modes refresh
+            // visible rows so any pill change shows up live.
+            {
+                let editor_mode = editor_mode.clone();
+                let editor_revealer = editor_revealer.clone();
+                let name_entry = name_entry.clone();
+                let selected_hex = selected_hex.clone();
+                let items_for_save = items.clone();
+                let create_idx = create_idx.clone();
+                let flair_row_for_save = flair_row.clone();
+                let uid_for_save = user_id.to_string();
+                let window_weak = self.downgrade();
+                save_btn.connect_clicked(move |_| {
+                    let name = name_entry.text().trim().to_string();
+                    if name.is_empty() { return; }
+                    let hex = selected_hex.borrow().clone();
+                    match editor_mode.get() {
+                        FlairEditorMode::Create => {
+                            let new_id = FLAIR_STORE.create_flair(&name, &hex);
+                            FLAIR_STORE.set_user_flair(&uid_for_save, Some(new_id));
+                            let insert_at = create_idx.get();
+                            items_for_save.splice(insert_at, 0, &[name.as_str()]);
+                            create_idx.set(create_idx.get() + 1);
+                            flair_row_for_save.set_selected(insert_at);
+                            if let Some(win) = window_weak.upgrade() {
+                                win.imp().message_view.refresh_flair_for_user(&uid_for_save);
+                            }
+                        }
+                        FlairEditorMode::Edit(id) => {
+                            FLAIR_STORE.update_flair(id, &name, &hex);
+                            // Rewrite the matching combo entry in place.
+                            let idx = flair_row_for_save.selected();
+                            if idx > 0 && idx < create_idx.get() {
+                                items_for_save.splice(idx, 1, &[name.as_str()]);
+                                flair_row_for_save.set_selected(idx);
+                            }
+                            if let Some(win) = window_weak.upgrade() {
+                                win.imp().message_view.refresh_all_flairs();
+                            }
+                        }
+                    }
+                    editor_revealer.set_reveal_child(false);
+                    name_entry.set_text("");
+                });
+            }
 
             Some((flair_row, create_idx))
         };
@@ -5027,9 +5242,10 @@ impl MxWindow {
                     let idx = flair_row.selected();
                     let flairs_now = FLAIR.list_flairs();
                     let prior_flair_id = FLAIR.get_user_flair(&uid_for_save).map(|f| f.id);
+                    let create_idx_now = flair_create_idx.get();
                     let new_flair_id: Option<u32> = if idx == 0 {
                         None
-                    } else if idx < flair_create_idx {
+                    } else if idx < create_idx_now {
                         // Bounds check the index against the fresh list;
                         // an in-flight create/delete could have shifted
                         // positions (rare — combo mutations happen on

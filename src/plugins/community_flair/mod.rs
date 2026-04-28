@@ -225,6 +225,46 @@ impl FlairStore {
 /// Process-wide singleton. Lazily initialised on first access.
 pub static FLAIR_STORE: LazyLock<FlairStore> = LazyLock::new(FlairStore::new);
 
+/// Curated swatch palette for dark mode — saturated mid-tones that
+/// stand out against the dark sidebar / message body without being
+/// eye-searing, while staying dark enough for white pill text to
+/// pass WCAG AA. Order is roughly hue-cycled (blue → green → orange
+/// → red → purple → pink → teal → gray).
+pub const DARK_PALETTE: &[&str] = &[
+    "#62a0ea", // blue
+    "#57e389", // green
+    "#ffa348", // orange
+    "#f66151", // red
+    "#c061cb", // purple
+    "#dc8add", // pink
+    "#62afd5", // teal
+    "#9a9996", // gray
+];
+
+/// Curated swatch palette for light mode — deeper / more saturated
+/// versions of the same hues so pills still pop against a white
+/// surface and white pill text reads cleanly.
+pub const LIGHT_PALETTE: &[&str] = &[
+    "#1c71d8", // blue
+    "#26a269", // green
+    "#c64600", // orange
+    "#a51d2d", // red
+    "#813d9c", // purple
+    "#cb2c8a", // pink
+    "#1f7c8c", // teal
+    "#5e5c64", // gray
+];
+
+/// Pick the palette appropriate to the current adw style mode.
+/// Caller is responsible for rebuilding the swatch row when the
+/// user toggles dark/light — we don't auto-listen here because the
+/// flair editor only renders when the user-info panel opens, and
+/// we just re-check the mode on each open.
+pub fn current_palette() -> &'static [&'static str] {
+    let manager = adw::StyleManager::default();
+    if manager.is_dark() { DARK_PALETTE } else { LIGHT_PALETTE }
+}
+
 /// Coerce a user-supplied color to a valid `#rrggbb` or `#rgb` hex
 /// string. Falls back to a readable blue (#66a0ea) when the input
 /// doesn't match — the pill still renders; the user sees the default
