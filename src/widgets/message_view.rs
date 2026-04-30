@@ -2579,24 +2579,22 @@ impl MessageView {
         };
         mutate(&msg);
 
-        // Two-pronged rebind so the visible row picks up the mutation
-        // regardless of which path GTK accepts:
+        // Walk visible rows. When we find the matching row, FORCE-reset
+        // its body_hash + reactions_hash caches to 0 so the bind path
+        // can't take its skip-rebuild fast path. Then call bind. The
+        // hash caches are an optimisation for scroll-recycle binds
+        // (same content → skip set_markup); during an in-place update
+        // the content has *changed* and the cache lies. Resetting them
+        // to 0 (a value the FNV-1a output never produces for a non-
+        // empty body) guarantees the inequality check inside bind
+        // forces a full re-render of body markup and reaction pills.
         //
-        // (1) Direct walk-and-bind on visible MessageRows. This is the
-        //     fast path and always worked for own-action reactions in
-        //     prior sessions (toggle_reaction, edit). Cheap when it
-        //     hits — no listmodel churn.
-        //
-        // (2) gio::ListStore::items_changed(pos, 1, 1) — GTK's
-        //     canonical "this item changed, please re-bind" signal.
-        //     ListView routes it through the factory's bind closure,
-        //     which is the same path that ran when the message was
-        //     first displayed. Belt-and-suspenders for the case where
-        //     the direct walk doesn't visibly refresh — observed in
-        //     the field for incoming reactions to the user's own
-        //     message and for inbound m.replace edits, where the
-        //     mutation lands but the pill / body markup don't repaint
-        //     until a quit-and-restart.
+        // This is the fix for the user-observed bug: editing one's own
+        // message landed the mutation on the MessageObject (others saw
+        // the edit just fine via sync) but the local row's pre-edit
+        // text persisted because the hash check matched the prior bind
+        // and skipped re-rendering. Same shape as the inbound-reaction
+        // bug.
         let eid = event_id.to_string();
         let mut walked: u32 = 0;
         let mut found = false;
@@ -2605,6 +2603,8 @@ impl MessageView {
             if let Some(row) = Self::find_message_row(widget) {
                 walked += 1;
                 if *row.imp().event_id.borrow() == eid {
+                    row.imp().last_body_hash.set(0);
+                    row.imp().last_reactions_hash.set(0);
                     row.bind_message_object(&msg, &self.row_context());
                     found = true;
                     break;
@@ -2613,21 +2613,9 @@ impl MessageView {
             child = widget.next_sibling();
         }
 
-        // (2) Always emit items_changed on the message's position too.
-        // O(n) over list_store to find the position is bounded by
-        // MAX_STORE_SIZE = 400; a HashMap event_id → pos cache would
-        // be tighter but the cost on a single emit is negligible
-        // versus the bug of stale rendering. find() returns Option<u32>.
-        let store = imp.list_store();
-        let store_pos = store.find(&msg);
-        if let Some(pos) = store_pos {
-            store.items_changed(pos, 1, 1);
-        }
-
         tracing::info!(
             "update-diag: {event_id} mutate+rebind: walked={walked} \
-             found_visible_row={found} store_pos={:?} room={}",
-            store_pos,
+             found_visible_row={found} room={}",
             imp.current_room_id.borrow()
         );
     }
