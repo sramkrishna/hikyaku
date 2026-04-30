@@ -2547,9 +2547,25 @@ impl MessageView {
             }
         };
         mutate(&msg);
-        // Walk only the currently-visible rows (typically ~10-20 widgets, not
-        // the full list_store). Identify the right row by its stored event_id
-        // rather than by absolute position, which is correct across virtual scroll.
+
+        // Two-pronged rebind so the visible row picks up the mutation
+        // regardless of which path GTK accepts:
+        //
+        // (1) Direct walk-and-bind on visible MessageRows. This is the
+        //     fast path and always worked for own-action reactions in
+        //     prior sessions (toggle_reaction, edit). Cheap when it
+        //     hits — no listmodel churn.
+        //
+        // (2) gio::ListStore::items_changed(pos, 1, 1) — GTK's
+        //     canonical "this item changed, please re-bind" signal.
+        //     ListView routes it through the factory's bind closure,
+        //     which is the same path that ran when the message was
+        //     first displayed. Belt-and-suspenders for the case where
+        //     the direct walk doesn't visibly refresh — observed in
+        //     the field for incoming reactions to the user's own
+        //     message and for inbound m.replace edits, where the
+        //     mutation lands but the pill / body markup don't repaint
+        //     until a quit-and-restart.
         let eid = event_id.to_string();
         let mut walked: u32 = 0;
         let mut found = false;
@@ -2565,9 +2581,22 @@ impl MessageView {
             }
             child = widget.next_sibling();
         }
+
+        // (2) Always emit items_changed on the message's position too.
+        // O(n) over list_store to find the position is bounded by
+        // MAX_STORE_SIZE = 400; a HashMap event_id → pos cache would
+        // be tighter but the cost on a single emit is negligible
+        // versus the bug of stale rendering. find() returns Option<u32>.
+        let store = imp.list_store();
+        let store_pos = store.find(&msg);
+        if let Some(pos) = store_pos {
+            store.items_changed(pos, 1, 1);
+        }
+
         tracing::info!(
-            "update-diag: {event_id} mutate-and-rebind: walked={walked} \
-             found_visible_row={found} room={}",
+            "update-diag: {event_id} mutate+rebind: walked={walked} \
+             found_visible_row={found} store_pos={:?} room={}",
+            store_pos,
             imp.current_room_id.borrow()
         );
     }
