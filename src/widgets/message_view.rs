@@ -267,6 +267,13 @@ mod imp {
         /// maintain the store cap.  The vadjustment scroll handler uses this to
         /// trigger a bg_refresh when the user scrolls back to the bottom.
         pub tail_evicted: Cell<bool>,
+        /// Wall-clock timestamp of the most recent user-driven scroll event
+        /// (wheel, touchpad, drag, key navigation). Used to suppress
+        /// programmatic scroll_to_bottom calls during active user
+        /// scrolling — the snap-back was perceived as "the app keeps
+        /// trying to find the right position." `None` until the user
+        /// actually interacts with a scroll surface.
+        pub last_user_scroll_at: Cell<Option<std::time::Instant>>,
         /// Cached row-binding context — rebuilt once per room switch by the setters
         /// (set_highlight_names, set_user_id, set_is_dm_room, set_no_media).
         /// The bind callback reads this instead of calling config::settings() per recycle.
@@ -412,6 +419,7 @@ mod imp {
                     .build(),
                 scroll_to_bottom_pending: Cell::new(false),
                 tail_evicted: Cell::new(false),
+                last_user_scroll_at: Cell::new(None),
                 cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
                 pending_appends: RefCell::new(Vec::new()),
                 append_flush_pending: Cell::new(false),
@@ -489,6 +497,29 @@ mod imp {
                 .child(&lv)
                 .css_classes(["mx-tinted-bg"])
                 .build();
+
+            // User-input scroll detector: stamps last_user_scroll_at on
+            // every wheel / touchpad / kinetic event so programmatic
+            // scroll calls (e.g. scroll_to_bottom on incoming-message
+            // append) can suppress themselves while the user is
+            // actively scrolling. Without this, the user perceives the
+            // view as "hunting for a position" — every new arrival in
+            // a busy room would snap-back to the bottom mid-scroll.
+            {
+                let scroll_ctrl = gtk::EventControllerScroll::new(
+                    gtk::EventControllerScrollFlags::VERTICAL
+                        | gtk::EventControllerScrollFlags::KINETIC,
+                );
+                let view_weak_input = self.obj().downgrade();
+                scroll_ctrl.connect_scroll(move |_, _, _| {
+                    if let Some(view) = view_weak_input.upgrade() {
+                        view.imp().last_user_scroll_at
+                            .set(Some(std::time::Instant::now()));
+                    }
+                    glib::Propagation::Proceed
+                });
+                sw.add_controller(scroll_ctrl);
+            }
 
             // Scroll handler: backpagination (top) and tail-eviction refresh (bottom).
             // Guard on current_room_id so hidden rooms don't accidentally trigger this.
@@ -4218,6 +4249,18 @@ impl MessageView {
     fn scroll_to_bottom(&self) {
         let imp = self.imp();
         if gio::prelude::ListModelExt::n_items(&imp.list_store()) == 0 { return; }
+        // User-scroll suppression: if the user has touched the scroll
+        // surface in the last 500 ms, don't programmatically jump them
+        // to the bottom. Otherwise an incoming message in a busy room
+        // snap-backs them mid-scroll and they perceive the view as
+        // "hunting for a position." 500 ms covers the GTK kinetic
+        // settle window without locking out the auto-scroll for too
+        // long after the user truly stops touching the surface.
+        if let Some(t) = imp.last_user_scroll_at.get() {
+            if t.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
         // Do NOT call list_view.scroll_to() — with GTK_LIST_SCROLL_NONE it has
         // undefined behaviour when the item is already partially visible and can
         // scroll the last row to the *top* of the viewport, overriding us.

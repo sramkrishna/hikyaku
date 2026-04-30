@@ -119,6 +119,19 @@ pub fn apply_result(id: u64, markup: String) {
     let weak = PENDING.with(|p| p.borrow_mut().remove(&id));
     let Some(weak) = weak else { return };
     if let Some(obj) = weak.upgrade() {
+        // Don't overwrite the plain-text fallback (set in info_to_obj)
+        // with an empty result. Pathological HTML that html_to_pango
+        // can't parse produces a "" string here; clobbering would
+        // leave the row visually blank ("see the nick but no
+        // content"). Keep the fallback so the user at least reads
+        // the raw text.
+        if markup.is_empty() {
+            tracing::warn!(
+                "markup_worker: html_to_pango returned empty for id={id}; \
+                 keeping plain-text fallback to avoid blank row"
+            );
+            return;
+        }
         obj.set_rendered_markup(markup);
     }
 }

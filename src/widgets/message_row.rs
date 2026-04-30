@@ -1692,6 +1692,39 @@ impl MessageRow {
             if *row.imp().event_id.borrow() != bound_eid { return; }
             let markup = msg.rendered_markup();
             if markup.is_empty() { return; }
+
+            // If the user is actively scrolling, defer the apply.
+            // set_markup changes the label's measured text → row
+            // height re-measure → vadj jitter. We schedule the apply
+            // for 500 ms later and let the row's next bind (or this
+            // delayed call) refresh the label when the user pauses.
+            // Walk up the widget tree to find the MessageView so we
+            // can read its last_user_scroll_at.
+            use gtk::prelude::*;
+            let view_anc = row.ancestor(crate::widgets::MessageView::static_type())
+                .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok());
+            let scroll_active = view_anc.as_ref().and_then(|v| {
+                v.imp().last_user_scroll_at.get().map(|t| t.elapsed())
+            }).map(|d| d < std::time::Duration::from_millis(500))
+                .unwrap_or(false);
+
+            if scroll_active {
+                // Defer; same-row guard re-checked on the timer fire.
+                let row_weak2 = row.downgrade();
+                let markup_owned = markup.clone();
+                let eid_owned = bound_eid.clone();
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(500),
+                    move || {
+                        let Some(row) = row_weak2.upgrade() else { return };
+                        if *row.imp().event_id.borrow() != eid_owned { return; }
+                        row.imp().body_label.set_markup(&markup_owned);
+                        row.imp().body_label.set_visible(true);
+                    },
+                );
+                return;
+            }
+
             tracing::info!(
                 "scroll-diag: async markup applied eid={} markup_len={}",
                 bound_eid, markup.len()
