@@ -1394,7 +1394,8 @@ impl MessageRow {
         // the expensive path, so we grow the pool only when a row needs more
         // pills than any previous bind demanded.
         let reactions_hash = msg.reactions_hash();
-        if imp.last_reactions_hash.get() != reactions_hash {
+        let prev_hash = imp.last_reactions_hash.get();
+        if prev_hash != reactions_hash {
             let _g = crate::perf::scope("bind::reactions_rebuild");
             imp.last_reactions_hash.set(reactions_hash);
             let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
@@ -1403,6 +1404,7 @@ impl MessageRow {
 
             let mut pills = imp.reaction_pills.borrow_mut();
             let need = reactions.len();
+            let pool_before = pills.len();
             while pills.len() < need {
                 let pill = gtk::Label::builder()
                     .css_classes(["reaction-pill"])
@@ -1432,7 +1434,19 @@ impl MessageRow {
             for pill in pills.iter().skip(need) {
                 pill.set_visible(false);
             }
-            imp.reactions_box.set_visible(need > 0);
+            let box_visible = need > 0;
+            imp.reactions_box.set_visible(box_visible);
+            let eid_for_log = imp.event_id.borrow().clone();
+            let parent_visible = imp.reactions_box.parent().map(|p| p.is_visible()).unwrap_or(false);
+            let row_mapped = self.is_mapped();
+            tracing::info!(
+                "reactions-diag: rebuild eid={eid_for_log} prev_hash={prev_hash} new_hash={reactions_hash} need={need} pool_before={pool_before} box_visible={box_visible} parent_visible={parent_visible} row_mapped={row_mapped}"
+            );
+        } else {
+            let eid_for_log = imp.event_id.borrow().clone();
+            tracing::info!(
+                "reactions-diag: skip eid={eid_for_log} hash={reactions_hash} (no change)"
+            );
         }
 
         // Delegate to text rendering with highlights.
