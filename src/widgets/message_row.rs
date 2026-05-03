@@ -815,6 +815,57 @@ use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
+thread_local! {
+    /// Pending async-markup applies queued during a scroll-active window.
+    /// Each entry is `(row_weak, expected_event_id, markup)`. The eid check
+    /// at drain time guards against the row having been recycled to a
+    /// different MessageObject in the meantime.
+    ///
+    /// Coalesces N per-notification timers into one drain so a burst of
+    /// markup-worker deliveries during a scroll causes a single layout
+    /// pass instead of N. Without this, a 30-message unread block with
+    /// HTML bodies fires 30 separate `set_markup` calls staggered over
+    /// ~30 ms, each one re-measuring its row and shifting vadj.upper.
+    static PENDING_MARKUP_APPLIES: std::cell::RefCell<Vec<(
+        glib::WeakRef<MessageRow>, String, String
+    )>> = std::cell::RefCell::new(Vec::new());
+
+    /// True between scheduling the drain timer and its fire. Prevents
+    /// stacking parallel timers while many notifications are queueing.
+    static MARKUP_DRAIN_SCHEDULED: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+/// Queue an async-markup apply to run after a 500 ms scroll-quiet window.
+/// Multiple calls before the timer fires share the same drain pass.
+fn schedule_coalesced_markup_apply(row: &MessageRow, eid: String, markup: String) {
+    PENDING_MARKUP_APPLIES.with(|p| {
+        p.borrow_mut().push((row.downgrade(), eid, markup));
+    });
+    let already = MARKUP_DRAIN_SCHEDULED.with(|c| c.replace(true));
+    if already {
+        return;
+    }
+    glib::timeout_add_local_once(std::time::Duration::from_millis(500), || {
+        MARKUP_DRAIN_SCHEDULED.with(|c| c.set(false));
+        let pending: Vec<_> = PENDING_MARKUP_APPLIES.with(|p| {
+            p.borrow_mut().drain(..).collect()
+        });
+        let n = pending.len();
+        let mut applied = 0u32;
+        for (row_weak, eid, markup) in pending {
+            let Some(row) = row_weak.upgrade() else { continue };
+            if *row.imp().event_id.borrow() != eid { continue }
+            row.imp().body_label.set_markup(&markup);
+            row.imp().body_label.set_visible(true);
+            applied += 1;
+        }
+        tracing::info!(
+            "scroll-diag: coalesced markup drain queued={n} applied={applied}"
+        );
+    });
+}
+
 /// Pre-render the sender label markup string for use in MessageObject.
 /// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load
 /// time so bind() never calls nick_color/markup_escape_text/format! per row.
@@ -1723,19 +1774,7 @@ impl MessageRow {
                 .unwrap_or(false);
 
             if scroll_active {
-                // Defer; same-row guard re-checked on the timer fire.
-                let row_weak2 = row.downgrade();
-                let markup_owned = markup.clone();
-                let eid_owned = bound_eid.clone();
-                glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(500),
-                    move || {
-                        let Some(row) = row_weak2.upgrade() else { return };
-                        if *row.imp().event_id.borrow() != eid_owned { return; }
-                        row.imp().body_label.set_markup(&markup_owned);
-                        row.imp().body_label.set_visible(true);
-                    },
-                );
+                schedule_coalesced_markup_apply(&row, bound_eid.clone(), markup);
                 return;
             }
 
