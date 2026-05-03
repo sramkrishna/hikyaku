@@ -178,6 +178,12 @@ mod imp {
         /// fallback). Disconnected in clear_flash_handler alongside the
         /// other per-bind notify handlers.
         pub markup_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        /// Handler for notify::event-id — refreshes `imp.event_id` when the
+        /// bound MessageObject's event_id changes. The patch_echo path
+        /// flips a local-echo's empty event_id to the server-assigned one;
+        /// without this notify, the row keeps its stale empty cache and the
+        /// edit/delete/react buttons fire with `event_id=""`.
+        pub event_id_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
     }
 
     #[glib::object_subclass]
@@ -1378,6 +1384,26 @@ impl MessageRow {
         imp.reply_to.replace(reply_to.clone());
         imp.timestamp_val.replace(timestamp);
 
+        // Track future event_id changes on the bound MessageObject so the
+        // cached `imp.event_id` stays in sync. patch_echo_event_id flips a
+        // local echo's empty event_id to the server-assigned one and emits
+        // notify::event-id; without this handler, only the row that
+        // patch_echo's heuristic walk happened to bind sees the new id, and
+        // any other row currently displaying this MessageObject keeps its
+        // stale empty cache. Edit/delete/react buttons then fire with
+        // `event_id=""` and the action drops on the floor.
+        if let Some((obj, id)) = imp.event_id_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        let event_id_cell = imp.event_id.clone();
+        let eid_handler = msg.connect_notify_local(Some("event-id"), move |obj, _| {
+            use crate::models::MessageObject;
+            if let Some(msg) = obj.downcast_ref::<MessageObject>() {
+                event_id_cell.replace(msg.event_id());
+            }
+        });
+        *imp.event_id_handler.borrow_mut() = Some((msg.clone().upcast(), eid_handler));
+
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
         let reply_label = msg.reply_label();
         if !reply_to.is_empty() {
@@ -1800,6 +1826,9 @@ impl MessageRow {
             obj.disconnect(id);
         }
         if let Some((obj, id)) = self.imp().markup_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        if let Some((obj, id)) = self.imp().event_id_handler.borrow_mut().take() {
             obj.disconnect(id);
         }
     }

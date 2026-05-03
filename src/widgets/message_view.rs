@@ -4185,27 +4185,16 @@ impl MessageView {
             let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
             if msg.event_id().is_empty() && msg.body() == echo_body {
                 tracing::info!("patch_echo_event_id: patched echo at pos={} body={:?} → {}", i, body_preview(echo_body), event_id);
+                // set_event_id fires notify::event-id on the MessageObject;
+                // every MessageRow bound to this msg has an event_id_handler
+                // that refreshes its cached `imp.event_id`. The previous
+                // implementation walked the widget tree to find a row to
+                // rebind, but with off-screen recycled rows that walk
+                // routinely picked the wrong row, leaving the visible row's
+                // cache stale and breaking edit/delete/react clicks.
                 msg.set_event_id(event_id.to_string());
-                // The echo now has a real id, so decrement the guard counter.
                 imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_sub(1));
-                // Add to event_index now that it has a real ID.
                 imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
-                // Rebind the visible row so MessageRow's Rc cells get updated.
-                let eid_str = event_id.to_string();
-                let mut child = imp.list_view().first_child();
-                while let Some(ref widget) = child {
-                    if let Some(row) = Self::find_message_row(widget) {
-                        // Echo row had empty event_id — match by checking if row
-                        // still has empty event_id (it hasn't been reused yet).
-                        if row.imp().event_id.borrow().is_empty()
-                            || *row.imp().event_id.borrow() == eid_str
-                        {
-                            row.bind_message_object(msg, &self.row_context());
-                            break;
-                        }
-                    }
-                    child = widget.next_sibling();
-                }
                 return true;
             } else if msg.event_id().is_empty() {
                 tracing::debug!("patch_echo_event_id: found echo at pos={} with DIFFERENT body={:?} (wanted {:?})", i, body_preview(&msg.body()), body_preview(echo_body));
