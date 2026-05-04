@@ -2677,9 +2677,22 @@ impl MessageView {
         emoji: &str,
         sender: &str,
     ) {
-        if event_id.is_empty() || room_id.is_empty() { return; }
+        if event_id.is_empty() || room_id.is_empty() {
+            tracing::info!(
+                "react-diag: apply_reaction_in_room early-return; \
+                 room_id_empty={} event_id_empty={}",
+                room_id.is_empty(), event_id.is_empty()
+            );
+            return;
+        }
         let imp = self.imp();
         let current_rid = imp.current_room_id.borrow().clone();
+        let in_event_index = imp.event_index.borrow().contains_key(event_id);
+        tracing::info!(
+            "react-diag: apply_reaction_in_room enter room={room_id} eid={event_id} \
+             emoji={emoji:?} sender={sender:?} current={current_rid:?} \
+             in_event_index={in_event_index}"
+        );
 
         if current_rid == room_id {
             // Current room: mutate + rebind any visible row.
@@ -2692,8 +2705,8 @@ impl MessageView {
             .get(room_id)
             .and_then(|idx| idx.get(event_id).cloned());
         let Some(msg) = msg else {
-            tracing::debug!(
-                "apply_reaction_in_room: {event_id} not in saved_event_indices[{room_id}] \
+            tracing::info!(
+                "react-diag: apply_reaction_in_room missed saved_event_indices[{room_id}][{event_id}] \
                  (room never visited or message not loaded)"
             );
             return;
@@ -4318,8 +4331,23 @@ impl MessageView {
 /// (`add_reaction`) and the non-current-room mutation path
 /// (`apply_reaction_in_room`).
 fn apply_reaction_delta(msg: &MessageObject, emoji: &str, sender: &str) {
-    let merged = merge_reaction_delta_json(&msg.reactions_json(), emoji, sender);
+    let before = msg.reactions_json();
+    let before_hash = msg.reactions_hash();
+    let merged = merge_reaction_delta_json(&before, emoji, sender);
+    let merged_changed = before != merged;
     msg.update_reactions_json(merged);
+    tracing::info!(
+        "react-diag: apply_reaction_delta eid={} emoji={:?} sender={:?} \
+         before_len={} after_len={} changed={} prev_hash={} new_hash={}",
+        msg.event_id(),
+        emoji,
+        sender,
+        before.len(),
+        msg.reactions_json().len(),
+        merged_changed,
+        before_hash,
+        msg.reactions_hash(),
+    );
 }
 
 /// Pure JSON-level version of `apply_reaction_delta` — takes a
