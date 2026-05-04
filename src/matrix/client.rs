@@ -1116,6 +1116,38 @@ async fn matrix_task(
 
                         // Apply any pending messages (arrived while cache was cold).
                         if !pending_msgs.is_empty() {
+                            // Seed memory if it's still cold — append_memory is a no-op
+                            // when the room has no memory entry yet. This used to
+                            // silently drop pending DM messages on a brand-new room
+                            // (no memory, no disk) — user got a notification but the
+                            // room timeline showed empty. insert_memory_if_absent is
+                            // idempotent: if a parallel disk-load just seeded, this
+                            // call is a no-op.
+                            if !has_mem {
+                                let seed_meta = if let Ok(rid) = RoomId::parse(&room_id) {
+                                    if let Some(r) = client.get_room(&rid) {
+                                        let sdk_unread = r.unread_notification_counts().notification_count as u32;
+                                        RoomMeta {
+                                            unread_count: sdk_unread.max(known_unread),
+                                            ..Default::default()
+                                        }
+                                    } else {
+                                        RoomMeta { unread_count: known_unread, ..Default::default() }
+                                    }
+                                } else {
+                                    RoomMeta { unread_count: known_unread, ..Default::default() }
+                                };
+                                timeline_cache.insert_memory_if_absent(
+                                    &room_id,
+                                    Vec::new(),
+                                    None,
+                                    seed_meta,
+                                );
+                                tracing::info!(
+                                    "SelectRoom {room_id}: seeded cold memory cache before draining {} pending msgs",
+                                    pending_msgs.len()
+                                );
+                            }
                             for msg in &pending_msgs {
                                 timeline_cache.append_memory(&room_id, msg.clone());
                             }

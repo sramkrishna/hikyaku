@@ -3339,8 +3339,14 @@ impl MxWindow {
         let _ = imp.user_info_container.set(user_info_scroll);
 
         // Notification sidebar contents.
+        // activate-on-single-click so the click-to-navigate handler fires
+        // on a normal click rather than only on Enter or double-click —
+        // matches the user's expectation that clicking a notification
+        // opens that room. selection_mode=None still applies; activation
+        // is independent of selection.
         let notif_list_box = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
+            .activate_on_single_click(true)
             .css_classes(["navigation-sidebar"])
             .build();
         let _ = imp.notif_list_box.set(notif_list_box.clone());
