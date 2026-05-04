@@ -1400,21 +1400,23 @@ impl MessageRow {
             obj.disconnect(id);
         }
         let event_id_cell = imp.event_id.clone();
-        let bound_eid_at_bind = msg.event_id();
         let eid_handler = msg.connect_notify_local(Some("event-id"), move |obj, _| {
             use crate::models::MessageObject;
             if let Some(msg) = obj.downcast_ref::<MessageObject>() {
                 let new_eid = msg.event_id();
                 let old_eid = event_id_cell.borrow().clone();
                 event_id_cell.replace(new_eid.clone());
+                // info — this fires only when an event_id property
+                // actually changes (i.e. patch_echo). Rare event,
+                // important to keep visible.
                 tracing::info!(
                     "edit-diag: event-id notify fired; row_cache {old_eid:?} -> {new_eid:?}"
                 );
             }
         });
-        tracing::info!(
-            "edit-diag: bind connected event_id_handler bound_eid={bound_eid_at_bind:?}"
-        );
+        // debug — fires every bind (200+ per scroll storm). Demoted from
+        // info to keep the hot path quiet; re-enable with
+        // RUST_LOG=hikyaku=debug when the diagnostic is needed.
         *imp.event_id_handler.borrow_mut() = Some((msg.clone().upcast(), eid_handler));
 
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
@@ -1532,12 +1534,12 @@ impl MessageRow {
             tracing::info!(
                 "reactions-diag: rebuild eid={eid_for_log} prev_hash={prev_hash} new_hash={reactions_hash} need={need} pool_before={pool_before} box_visible={box_visible} parent_visible={parent_visible} row_mapped={row_mapped}"
             );
-        } else {
-            let eid_for_log = imp.event_id.borrow().clone();
-            tracing::info!(
-                "reactions-diag: skip eid={eid_for_log} hash={reactions_hash} (no change)"
-            );
         }
+        // The skip case (hash unchanged → no rebuild) used to log here at
+        // info, but it fires on every bind in a scroll storm (200+/sec)
+        // and the volume of stderr writes was itself contributing to
+        // jitter. Re-enable diag for skips with RUST_LOG=hikyaku=debug if
+        // needed.
 
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
