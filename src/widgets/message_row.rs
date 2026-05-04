@@ -647,6 +647,10 @@ mod imp {
             edit_button.connect_clicked(move |_| {
                 let eid = event_id.borrow().clone();
                 let body = body_text.borrow().clone();
+                tracing::info!(
+                    "edit-diag: edit button clicked; row_cache eid={eid:?} body_preview={:?}",
+                    body.char_indices().nth(40).map(|(i,_)| &body[..i]).unwrap_or(&body)
+                );
                 if let Some(ref cb) = *on_edit.borrow() {
                     cb(eid, body);
                 }
@@ -1396,12 +1400,21 @@ impl MessageRow {
             obj.disconnect(id);
         }
         let event_id_cell = imp.event_id.clone();
+        let bound_eid_at_bind = msg.event_id();
         let eid_handler = msg.connect_notify_local(Some("event-id"), move |obj, _| {
             use crate::models::MessageObject;
             if let Some(msg) = obj.downcast_ref::<MessageObject>() {
-                event_id_cell.replace(msg.event_id());
+                let new_eid = msg.event_id();
+                let old_eid = event_id_cell.borrow().clone();
+                event_id_cell.replace(new_eid.clone());
+                tracing::info!(
+                    "edit-diag: event-id notify fired; row_cache {old_eid:?} -> {new_eid:?}"
+                );
             }
         });
+        tracing::info!(
+            "edit-diag: bind connected event_id_handler bound_eid={bound_eid_at_bind:?}"
+        );
         *imp.event_id_handler.borrow_mut() = Some((msg.clone().upcast(), eid_handler));
 
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.

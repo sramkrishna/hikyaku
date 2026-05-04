@@ -4193,6 +4193,10 @@ impl MessageView {
                 // routinely picked the wrong row, leaving the visible row's
                 // cache stale and breaking edit/delete/react clicks.
                 msg.set_event_id(event_id.to_string());
+                tracing::info!(
+                    "edit-diag: patch_echo set_event_id done; msg.event_id()={:?}",
+                    msg.event_id()
+                );
                 imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_sub(1));
                 imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
                 return true;
