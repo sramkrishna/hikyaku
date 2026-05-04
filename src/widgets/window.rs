@@ -411,13 +411,37 @@ fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
             .build();
 
         let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let header = adw::HeaderBar::new();
 
-        if mime.starts_with("video/") || mime == "image/gif" {
-            let media_file = gtk::MediaFile::for_filename(path);
-            if mime == "image/gif" {
-                media_file.set_loop(true);
+        // Open-externally action — for any media type. Especially needed for
+        // image/gif, which renders as a static first-frame in GTK4 Picture
+        // (no native animated-GIF paintable). Animation requires the system
+        // default app (Loupe, image viewer, etc.).
+        let open_btn = gtk::Button::builder()
+            .icon_name("external-link-symbolic")
+            .tooltip_text("Open in default application")
+            .build();
+        let open_path = path.to_string();
+        open_btn.connect_clicked(move |_| {
+            let uri = format!("file://{}", open_path);
+            if let Err(e) = gio::AppInfo::launch_default_for_uri(
+                &uri, gio::AppLaunchContext::NONE,
+            ) {
+                tracing::warn!("Failed to open {uri} with default app: {e}");
+                let _ = std::process::Command::new("xdg-open").arg(&open_path).spawn();
             }
+        });
+        header.pack_end(&open_btn);
+        toolbar.add_top_bar(&header);
+
+        if mime.starts_with("video/") {
+            // Video playback uses gtk::Video + MediaFile, which routes through
+            // GStreamer. The pipeline can SIGABRT if libGLESv2 (GL ES) isn't
+            // installed on the host — uncatchable from Rust. We accept the
+            // risk for video/* since static-frame fallback isn't useful for
+            // video content; users on systems missing GLES will need to
+            // install it or use the open-externally button before clicking.
+            let media_file = gtk::MediaFile::for_filename(path);
             media_file.play();
             let video = gtk::Video::new();
             video.set_media_stream(Some(&media_file));
@@ -425,6 +449,10 @@ fn show_media_preview(window: &MxWindow, _anchor: &gtk::Widget, path: &str) {
             video.set_hexpand(true);
             toolbar.set_content(Some(&video));
         } else {
+            // image/* including image/gif. Picture shows the first frame for
+            // animated GIFs without needing GStreamer — sidesteps the GLES
+            // crash. The open-externally button in the header lets users
+            // play the animation in their default image viewer.
             let file = gio::File::for_path(path);
             let picture = gtk::Picture::for_file(&file);
             picture.set_can_shrink(true);
