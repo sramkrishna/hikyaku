@@ -184,6 +184,15 @@ mod imp {
         /// without this notify, the row keeps its stale empty cache and the
         /// edit/delete/react buttons fire with `event_id=""`.
         pub event_id_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        /// Last two event_ids this row was bound to, oldest first. When the
+        /// new bind matches `bind_history[0]` and the entries differ, GTK is
+        /// recycling this widget between two adjacent items in a feedback
+        /// loop driven by row-height changes (typical: one item has
+        /// reactions and is taller, the other doesn't and is shorter; each
+        /// rebind triggers queue_resize → ListView re-measures → recycles
+        /// back to the other item). Detecting this lets bind_message_object
+        /// skip the height-affecting reactions rebuild and break the loop.
+        pub bind_history: std::cell::RefCell<[String; 2]>,
     }
 
     #[glib::object_subclass]
@@ -1388,6 +1397,36 @@ impl MessageRow {
         imp.reply_to.replace(reply_to.clone());
         imp.timestamp_val.replace(timestamp);
 
+        // Detect height-driven recycle oscillation: if we're being bound
+        // back to the same eid we were bound to two binds ago (A → B → A
+        // pattern with A != B), GTK is in a feedback loop where one
+        // item's taller height (e.g. has reactions) keeps causing
+        // ListView to re-measure and rebind to the other (shorter)
+        // item. Skipping the reactions rebuild on the oscillation
+        // bind keeps the row's measured height stable so the loop
+        // converges. Body/sender content still updates so the row
+        // briefly shows mismatched reactions, but the loop ends within
+        // 1–2 frames and the next stable bind syncs everything.
+        let new_eid = msg.event_id();
+        let oscillating = {
+            let hist = imp.bind_history.borrow();
+            !new_eid.is_empty()
+                && !hist[1].is_empty()
+                && hist[0] == new_eid
+                && hist[0] != hist[1]
+        };
+        {
+            let mut hist = imp.bind_history.borrow_mut();
+            let prev_last = std::mem::replace(&mut hist[1], new_eid.clone());
+            hist[0] = prev_last;
+        }
+        if oscillating {
+            tracing::info!(
+                "scroll-diag: bind oscillation detected on row eid={new_eid:?}; \
+                 skipping reactions rebuild to break height feedback loop"
+            );
+        }
+
         // Track future event_id changes on the bound MessageObject so the
         // cached `imp.event_id` stays in sync. patch_echo_event_id flips a
         // local echo's empty event_id to the server-assigned one and emits
@@ -1487,7 +1526,13 @@ impl MessageRow {
         // pills than any previous bind demanded.
         let reactions_hash = msg.reactions_hash();
         let prev_hash = imp.last_reactions_hash.get();
-        if prev_hash != reactions_hash {
+        // Oscillation gate: if this rebind is the third leg of an A→B→A
+        // recycle loop, skip the reactions rebuild — its visibility
+        // toggle and pill-count change are what's driving the row-height
+        // delta that keeps the loop alive. The row will briefly display
+        // the previous bind's reactions, but the next non-oscillating
+        // bind (within 1–2 frames after the loop converges) syncs it.
+        if prev_hash != reactions_hash && !oscillating {
             let _g = crate::perf::scope("bind::reactions_rebuild");
             imp.last_reactions_hash.set(reactions_hash);
             let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
