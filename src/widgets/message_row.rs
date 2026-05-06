@@ -1410,10 +1410,7 @@ impl MessageRow {
         let new_eid = msg.event_id();
         let oscillating = {
             let hist = imp.bind_history.borrow();
-            !new_eid.is_empty()
-                && !hist[1].is_empty()
-                && hist[0] == new_eid
-                && hist[0] != hist[1]
+            is_recycle_oscillation(&hist[0], &hist[1], &new_eid)
         };
         {
             let mut hist = imp.bind_history.borrow_mut();
@@ -2003,6 +2000,24 @@ impl MessageRow {
     }
 }
 
+/// Detect the third leg of a `prev_prev → prev → new = prev_prev` recycle
+/// oscillation in MessageRow's bind history.
+///
+/// Returns true when the row is being bound back to an event_id it was
+/// bound to two binds ago (with the immediately previous bind being a
+/// distinct, non-empty id). That pattern is GTK ListView's signal that
+/// the same widget is being recycled between two adjacent items in a
+/// height-driven feedback loop. Empty event_ids never count — a freshly
+/// created row's `bind_history` is `["", ""]` and the first two binds
+/// must not be flagged.
+pub(crate) fn is_recycle_oscillation(
+    prev_prev: &str,
+    prev: &str,
+    new: &str,
+) -> bool {
+    !new.is_empty() && !prev.is_empty() && prev_prev == new && prev_prev != prev
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,5 +2069,52 @@ mod tests {
         let result = format_timestamp(now - 10 * 86400);
         assert!(result.len() > 5, "old date should include month/day, got: {result}");
         assert!(!result.contains("Yesterday"));
+    }
+
+    // The MessageRow oscillation gate is built on this predicate. The
+    // height-driven feedback loop only fires the gate's defenses when
+    // these tests' assertions hold — getting the corner cases wrong
+    // either misses real loops or over-fires and leaves rows showing
+    // stale reactions.
+
+    #[test]
+    fn oscillation_fresh_row_first_bind_not_flagged() {
+        // Brand-new row: bind_history is ["", ""]. First bind to any eid
+        // must not flag — empty entries can never be the third leg.
+        assert!(!is_recycle_oscillation("", "", "$a"));
+    }
+
+    #[test]
+    fn oscillation_second_bind_after_one_not_flagged() {
+        // bind_history advanced once: ["", "$a"]. Second bind to a
+        // different eid still has empty `prev_prev` → not the loop.
+        assert!(!is_recycle_oscillation("", "$a", "$b"));
+    }
+
+    #[test]
+    fn oscillation_three_distinct_eids_not_flagged() {
+        // A → B → C is normal scroll, not oscillation.
+        assert!(!is_recycle_oscillation("$a", "$b", "$c"));
+    }
+
+    #[test]
+    fn oscillation_aba_pattern_flagged() {
+        // The actual loop: A → B → A with A != B and both non-empty.
+        assert!(is_recycle_oscillation("$a", "$b", "$a"));
+    }
+
+    #[test]
+    fn oscillation_aaa_repeated_not_flagged() {
+        // Same eid bound three times in a row — not an oscillation,
+        // just a property update or recycle-to-same. prev_prev == prev
+        // disqualifies.
+        assert!(!is_recycle_oscillation("$a", "$a", "$a"));
+    }
+
+    #[test]
+    fn oscillation_empty_new_eid_never_flagged() {
+        // Local echoes have empty event_id. Don't pattern-match on "".
+        assert!(!is_recycle_oscillation("", "$a", ""));
+        assert!(!is_recycle_oscillation("$a", "$b", ""));
     }
 }
