@@ -525,19 +525,31 @@ mod imp {
             // Guard on current_room_id so hidden rooms don't accidentally trigger this.
             let view_weak = self.obj().downgrade();
             let guard_rid = room_id.to_string();
+            // Per-room threshold-crossing latch so we log the pagination decision
+            // once per scroll-into-top-zone, not on every value-notify tick.
+            let was_at_top = std::cell::Cell::new(false);
             sw.vadjustment().connect_value_notify(move |adj| {
                 let Some(view) = view_weak.upgrade() else { return };
                 let imp = view.imp();
                 if *imp.current_room_id.borrow() != guard_rid { return; }
                 // Backpagination: near the top → load older messages.
-                if adj.value() < 50.0 {
-                    if !imp.fetching_older.get() && imp.prev_batch_token.borrow().is_some() {
+                let at_top = adj.value() < 50.0;
+                if at_top && !was_at_top.get() {
+                    let fetching = imp.fetching_older.get();
+                    let has_token = imp.prev_batch_token.borrow().is_some();
+                    tracing::info!(
+                        "scroll-diag: top-zone entered room={guard_rid} value={:.1} \
+                         fetching_older={fetching} has_token={has_token} n_items={}",
+                        adj.value(), imp.list_store().n_items()
+                    );
+                    if !fetching && has_token {
                         imp.fetching_older.set(true);
                         if let Some(ref cb) = *imp.on_scroll_top.borrow() {
                             cb();
                         }
                     }
                 }
+                was_at_top.set(at_top);
                 // Tail-refresh: user scrolled back to bottom after prepend_messages()
                 // evicted the newest messages — fire on_scroll_bottom so window.rs
                 // can trigger a bg_refresh to reload the live tail.
@@ -3088,8 +3100,9 @@ impl MessageView {
         let _t3 = std::time::Instant::now();
         let bc = crate::widgets::message_view::BIND_COUNT.load(Ordering::Relaxed);
         let bt = crate::widgets::message_view::BIND_TOTAL_US.load(Ordering::Relaxed);
-        tracing::info!("set_messages: info_to_obj(n={})={:?} splice(prev={n},first_load={first_load})={:?} binds={bc} bind_total={}µs",
-            objs.len(), _t2-_t1, _t3-_t2, bt);
+        tracing::info!("set_messages: info_to_obj(n={})={:?} splice(prev={n},first_load={first_load})={:?} binds={bc} bind_total={}µs token={}",
+            objs.len(), _t2-_t1, _t3-_t2, bt,
+            if prev_batch.is_some() { "Some" } else { "None" });
         // Rebuild event_index from scratch for the new room.
         // Also clear divider_obj — the splice removed the old room's messages,
         // so any is_first_unread property on them is now stale.

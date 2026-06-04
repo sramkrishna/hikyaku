@@ -4571,8 +4571,14 @@ async fn handle_fetch_older(
 
     let (messages, prev_batch_token) = match room.messages(options).await {
         Ok(response) => {
+            let chunk_len = response.chunk.len();
             let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
             let token = response.end.map(|t| t.to_string());
+            tracing::info!(
+                "scroll-diag: FetchOlder {room_id} chunk={chunk_len} extracted={} end_token={}",
+                msgs.len(),
+                if token.is_some() { "Some" } else { "None" }
+            );
             (msgs, token)
         }
         Err(e) => {
