@@ -1400,13 +1400,22 @@ impl MessageRow {
         // Detect height-driven recycle oscillation: if we're being bound
         // back to the same eid we were bound to two binds ago (A → B → A
         // pattern with A != B), GTK is in a feedback loop where one
-        // item's taller height (e.g. has reactions) keeps causing
-        // ListView to re-measure and rebind to the other (shorter)
-        // item. Skipping the reactions rebuild on the oscillation
-        // bind keeps the row's measured height stable so the loop
-        // converges. Body/sender content still updates so the row
-        // briefly shows mismatched reactions, but the loop ends within
-        // 1–2 frames and the next stable bind syncs everything.
+        // item's taller height (e.g. has reactions, or different body
+        // wrap, or reply box toggling) keeps causing ListView to
+        // re-measure and rebind to the other item.
+        //
+        // The earlier gate only skipped the reactions rebuild, but body
+        // markup, reply box visibility, edit/delete button visibility,
+        // and media button presence all still updated — any of which
+        // can shift row height. The loop survived for 5–15 seconds per
+        // pagination because the height delta never actually went away.
+        //
+        // Return early instead: do nothing during the oscillating bind,
+        // leaving the widget exactly as it was. The widget displays the
+        // previous bind's content for one frame while the model says it
+        // represents the new item, but with no height delta GTK's
+        // measurement converges immediately. The next non-oscillating
+        // bind (after the loop dies) syncs all content correctly.
         let new_eid = msg.event_id();
         let oscillating = {
             let hist = imp.bind_history.borrow();
@@ -1420,8 +1429,9 @@ impl MessageRow {
         if oscillating {
             tracing::info!(
                 "scroll-diag: bind oscillation detected on row eid={new_eid:?}; \
-                 skipping reactions rebuild to break height feedback loop"
+                 skipping bind entirely to break height feedback loop"
             );
+            return;
         }
 
         // Track future event_id changes on the bound MessageObject so the
@@ -1523,13 +1533,7 @@ impl MessageRow {
         // pills than any previous bind demanded.
         let reactions_hash = msg.reactions_hash();
         let prev_hash = imp.last_reactions_hash.get();
-        // Oscillation gate: if this rebind is the third leg of an A→B→A
-        // recycle loop, skip the reactions rebuild — its visibility
-        // toggle and pill-count change are what's driving the row-height
-        // delta that keeps the loop alive. The row will briefly display
-        // the previous bind's reactions, but the next non-oscillating
-        // bind (within 1–2 frames after the loop converges) syncs it.
-        if prev_hash != reactions_hash && !oscillating {
+        if prev_hash != reactions_hash {
             let _g = crate::perf::scope("bind::reactions_rebuild");
             imp.last_reactions_hash.set(reactions_hash);
             let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
