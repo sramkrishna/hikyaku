@@ -263,6 +263,16 @@ mod imp {
         /// trying to find the right position." `None` until the user
         /// actually interacts with a scroll surface.
         pub last_user_scroll_at: Cell<Option<std::time::Instant>>,
+        /// True while a pending-markup viewport refresh timer is armed.
+        /// See MessageView::request_pending_markup_refresh — the async
+        /// markup worker fires notify::rendered-markup on each delivered
+        /// msg, and each notify sets this flag + arms a scroll-quiet
+        /// timer. On expiry the timer walks visible rows and force-rebinds
+        /// any whose cache is invalidated. This centralizes what used to
+        /// be N per-row async set_markup calls fighting the user's scroll
+        /// into a single coordinated pass fired only when the viewport is
+        /// stable.
+        pub pending_markup_refresh: Cell<bool>,
         /// Cached row-binding context — rebuilt once per room switch by the setters
         /// (set_highlight_names, set_user_id, set_is_dm_room, set_no_media).
         /// The bind callback reads this instead of calling config::settings() per recycle.
@@ -405,6 +415,7 @@ mod imp {
                 scroll_to_bottom_pending: Cell::new(false),
                 tail_evicted: Cell::new(false),
                 last_user_scroll_at: Cell::new(None),
+                pending_markup_refresh: Cell::new(false),
                 cached_row_ctx: RefCell::new(crate::widgets::MessageRowContext::default()),
                 pending_appends: RefCell::new(Vec::new()),
                 append_flush_pending: Cell::new(false),
@@ -2582,6 +2593,77 @@ impl MessageView {
         let rid = imp.current_room_id.borrow().clone();
         if rid.is_empty() { return None; }
         imp.timelines.borrow().get(&rid).and_then(|t| t.get_event(event_id))
+    }
+
+    /// Central shepherd for async markup delivery from the worker.
+    ///
+    /// Called by `MessageRow`'s notify::rendered-markup handler whenever the
+    /// worker delivers HTML markup for a currently-bound msg. Rather than
+    /// have each row fight the user's scroll with its own set_markup call
+    /// (which forces GtkListView to re-measure that row mid-scroll and
+    /// produces visible jitter), this method coalesces all deliveries into
+    /// a single scroll-quiet-window refresh pass.
+    ///
+    /// The refresh walks the ListView's currently-visible children and, for
+    /// each MessageRow whose body cache is invalidated (i.e., worker has
+    /// delivered fresh markup since the last bind), calls bind_message_object
+    /// once. All height changes happen in one coordinated GTK layout pass
+    /// instead of N scattered ones.
+    ///
+    /// Fires ~500ms after the LAST scroll input. If new deliveries arrive
+    /// during that window, the timer stays armed; the flag prevents parallel
+    /// timers from stacking up.
+    pub fn request_pending_markup_refresh(&self) {
+        let imp = self.imp();
+        if imp.pending_markup_refresh.get() { return; }
+        imp.pending_markup_refresh.set(true);
+        self.schedule_markup_refresh_attempt();
+    }
+
+    fn schedule_markup_refresh_attempt(&self) {
+        let view_weak = self.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            let Some(view) = view_weak.upgrade() else { return };
+            let imp = view.imp();
+            // Re-check scroll activity — if still scrolling, defer another
+            // 500ms. Applies during kinetic decay produce visible jitter.
+            let scroll_active = imp.last_user_scroll_at.get()
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+                .unwrap_or(false);
+            if scroll_active {
+                view.schedule_markup_refresh_attempt();
+                return;
+            }
+            imp.pending_markup_refresh.set(false);
+            // Walk visible rows and rebind any whose body-hash cache was
+            // invalidated (set to 0 by notify::rendered-markup handler).
+            // The rebind picks up the fresh rendered_markup. One pass →
+            // one GTK layout pass over the viewport, applied in a single
+            // frame budget instead of scattered.
+            let ctx = view.row_context();
+            let list_view = imp.list_view();
+            let mut child = list_view.first_child();
+            let mut refreshed = 0u32;
+            while let Some(ref widget) = child {
+                if let Some(row) = Self::find_message_row(widget) {
+                    if row.imp().last_body_hash.get() == 0 {
+                        // Find the msg this row is bound to. Look up via
+                        // Timeline using the row's cached event_id.
+                        let eid = row.imp().event_id.borrow().clone();
+                        if !eid.is_empty() {
+                            if let Some(msg) = view.current_timeline_lookup(&eid) {
+                                row.bind_message_object(&msg, &ctx);
+                                refreshed += 1;
+                            }
+                        }
+                    }
+                }
+                child = widget.next_sibling();
+            }
+            if refreshed > 0 {
+                tracing::debug!("markup-refresh: rebound {} visible rows", refreshed);
+            }
+        });
     }
 
     /// Update a message in the timeline by event_id. The `mutate` closure

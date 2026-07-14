@@ -843,86 +843,6 @@ use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
-thread_local! {
-    /// Pending async-markup applies queued during a scroll-active window.
-    /// Each entry is `(row_weak, expected_event_id, markup)`. The eid check
-    /// at drain time guards against the row having been recycled to a
-    /// different MessageObject in the meantime.
-    ///
-    /// Coalesces N per-notification timers into one drain so a burst of
-    /// markup-worker deliveries during a scroll causes a single layout
-    /// pass instead of N. Without this, a 30-message unread block with
-    /// HTML bodies fires 30 separate `set_markup` calls staggered over
-    /// ~30 ms, each one re-measuring its row and shifting vadj.upper.
-    static PENDING_MARKUP_APPLIES: std::cell::RefCell<Vec<(
-        glib::WeakRef<MessageRow>, String, String
-    )>> = std::cell::RefCell::new(Vec::new());
-
-    /// True between scheduling the drain timer and its fire. Prevents
-    /// stacking parallel timers while many notifications are queueing.
-    static MARKUP_DRAIN_SCHEDULED: std::cell::Cell<bool> =
-        std::cell::Cell::new(false);
-}
-
-/// Queue an async-markup apply that will drain during a scroll-quiet window.
-/// The drain re-checks scroll activity when it fires; if the user is still
-/// scrolling, it defers itself another 300ms. This prevents the "little jumps"
-/// pattern where a periodic 500ms drain would keep firing mid-scroll and each
-/// batched set_markup would re-measure rows during kinetic decay. Only drains
-/// once scroll has been quiet for the full window — then all pending applies
-/// land in one layout pass instead of scattered ones.
-fn schedule_coalesced_markup_apply(row: &MessageRow, eid: String, markup: String) {
-    PENDING_MARKUP_APPLIES.with(|p| {
-        p.borrow_mut().push((row.downgrade(), eid, markup));
-    });
-    let already = MARKUP_DRAIN_SCHEDULED.with(|c| c.replace(true));
-    if already {
-        return;
-    }
-    schedule_markup_drain_attempt();
-}
-
-/// Try to drain pending markups. If scroll is active, reschedule another
-/// attempt. Called from schedule_coalesced_markup_apply and from itself
-/// (re-scheduling on scroll conflict). Keeps MARKUP_DRAIN_SCHEDULED true
-/// throughout the retry chain so parallel notify bursts don't spawn a second
-/// drain lane.
-fn schedule_markup_drain_attempt() {
-    glib::timeout_add_local_once(std::time::Duration::from_millis(300), || {
-        // Re-check scroll activity: if the user is still scrolling (input within
-        // the last 300ms), defer another 300ms. Applying markup mid-scroll shows
-        // up as row-height changes during kinetic decay → visible jumps.
-        let scroll_active = PENDING_MARKUP_APPLIES.with(|p| {
-            p.borrow().first().and_then(|(row_weak, _, _)| row_weak.upgrade())
-        }).and_then(|row| {
-            row.ancestor(crate::widgets::MessageView::static_type())
-                .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok())
-        }).and_then(|v| v.imp().last_user_scroll_at.get().map(|t| t.elapsed()))
-            .map(|d| d < std::time::Duration::from_millis(300))
-            .unwrap_or(false);
-        if scroll_active {
-            schedule_markup_drain_attempt();
-            return;
-        }
-        MARKUP_DRAIN_SCHEDULED.with(|c| c.set(false));
-        let pending: Vec<_> = PENDING_MARKUP_APPLIES.with(|p| {
-            p.borrow_mut().drain(..).collect()
-        });
-        let n = pending.len();
-        let mut applied = 0u32;
-        for (row_weak, eid, markup) in pending {
-            let Some(row) = row_weak.upgrade() else { continue };
-            if *row.imp().event_id.borrow() != eid { continue }
-            row.imp().body_label.set_markup(&markup);
-            row.imp().body_label.set_visible(true);
-            applied += 1;
-        }
-        tracing::info!(
-            "scroll-diag: coalesced markup drain queued={n} applied={applied}"
-        );
-    });
-}
-
 /// Pre-render the sender label markup string for use in MessageObject.
 /// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load
 /// time so bind() never calls nick_color/markup_escape_text/format! per row.
@@ -1876,62 +1796,31 @@ impl MessageRow {
             use crate::models::MessageObject;
             let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>())
                 else { return };
-            // Same-message check — the row may have been bound to a
-            // different message by the time the worker returned.
             if *row.imp().event_id.borrow() != bound_eid { return; }
-            let markup = msg.rendered_markup();
-            if markup.is_empty() { return; }
+            if msg.rendered_markup().is_empty() { return; }
 
-            use gtk::prelude::*;
-
-            // Off-screen rows: don't apply now. The row is bound but
-            // not currently composited into the viewport (pool slot
-            // ahead/behind the visible window). Paying Pango layout
-            // for an invisible row still costs GTK-thread time and
-            // shows up in the next frame's layout pass — which lands
-            // exactly when the user is scrolling those rows into
-            // view.
+            // NEVER live-mutate a bound row from this handler. The old
+            // "apply set_markup on visible rows immediately (or via
+            // coalesced drain)" pattern was the root cause of the
+            // scroll jitter storm reported after backpagination loads:
+            // async worker deliveries kept forcing GTK to re-measure
+            // rows that the user was actively scrolling through, and
+            // each height change nudged vadj.value → visible jitter.
             //
-            // IMPORTANT: invalidate the body-hash cache before
-            // returning. Otherwise the next bind for this msg would
-            // see body_hash unchanged (body/formatted_body haven't
-            // changed — only rendered_markup did) and skip the render,
-            // leaving the row with its stale plain-text fallback
-            // forever. Setting to 0 forces the next bind to re-render
-            // with the freshly-delivered rendered_markup. 0 is not a
-            // legal FNV-1a output for a non-empty input, so this is
-            // safely distinguishable from any real hash.
-            if !row.is_mapped() {
-                row.imp().last_body_hash.set(0);
-                return;
+            // New model: invalidate the row's body-hash cache and
+            // register the msg with MessageView's central "pending
+            // markup refresh" queue. MessageView drains the queue on a
+            // scroll-quiet idle by force-rebinding those visible rows
+            // in one coordinated pass, rather than N async notifies
+            // fighting the user's scroll. Off-screen rows also get
+            // cache-invalidated so their next scroll-recycle bind picks
+            // up the fresh markup.
+            row.imp().last_body_hash.set(0);
+            if let Some(view) = row.ancestor(crate::widgets::MessageView::static_type())
+                .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok())
+            {
+                view.request_pending_markup_refresh();
             }
-
-            // Visible row: if the user is actively scrolling, defer
-            // so set_markup doesn't trigger a row-height change mid-
-            // scroll. last_user_scroll_at is bumped on every wheel /
-            // touchpad event AND on every vadj-value change from
-            // kinetic decay (see MessageView wiring), so this gate
-            // stays held through the kinetic phase, not just the
-            // input phase.
-            let view_anc = row.ancestor(crate::widgets::MessageView::static_type())
-                .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok());
-            let scroll_active = view_anc.as_ref().and_then(|v| {
-                v.imp().last_user_scroll_at.get().map(|t| t.elapsed())
-            }).map(|d| d < std::time::Duration::from_millis(500))
-                .unwrap_or(false);
-
-            // Route ALL applies through the coalescing drain — even when the
-            // user isn't scrolling. The markup worker delivers messages in
-            // bursts (30+ formatted bodies over ~2s after set_messages loads
-            // a room), and applying each set_markup as it arrives forces one
-            // GTK layout pass per delivery — visible as small row-height jumps
-            // stacking up. The drain batches whatever landed in its window
-            // into one layout pass. When scroll IS active, the drain re-checks
-            // and defers until scroll settles, so applies never happen during
-            // kinetic decay. Cost: up to 300ms of plain-text fallback visible
-            // after msg first binds. Acceptable — the fallback is legible.
-            let _ = scroll_active; // no longer branches, but keep the diag intent
-            schedule_coalesced_markup_apply(&row, bound_eid.clone(), markup);
         });
         *self.imp().markup_handler.borrow_mut() = Some((msg.clone().upcast(), mu_id));
     }
