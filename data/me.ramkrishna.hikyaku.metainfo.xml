@@ -46,6 +46,20 @@
   </content_rating>
 
   <releases>
+    <release version="0.3.0" date="2026-07-14">
+      <description>
+        <p>Timeline architecture overhaul plus a swathe of jitter and reactions fixes.</p>
+        <ul>
+          <li>New Timeline GObject as the single chokepoint for per-room state: sort-by-timestamp, dedup-by-event-id, and index-in-sync invariants are now enforced at every mutation, eliminating an entire class of "reactions vanish, messages out of order, echoes duplicate" bugs.</li>
+          <li>Reactions now render live via a reactive notify handler — previously reactions arriving via sync could land on the message but never repaint the visible pill row if the row was off-screen or belonged to a cached non-current room.</li>
+          <li>Scroll jitter substantially reduced: bulk-splice tail eviction, single-splice room switch, coalesced async-markup drain that defers itself if scroll is still active, and a per-room per-row height estimate for pagination scroll restore.</li>
+          <li>Pagination is snappier: prefetch fires when scrolled within one viewport of the top instead of exactly at the top; the fetching-older cooldown dropped from 3000 ms to 300 ms.</li>
+          <li>Historical timeline loads correctly past the local-cache overlap window: the server-side pagination now loops with the running end token until it returns a chunk genuinely older than what the UI already has.</li>
+          <li>New-message tint applies on dedup-hit so the "unread while unfocused" highlight isn't silently dropped when bg_refresh pre-populates the timeline before the live sync event arrives.</li>
+          <li>Rust dependencies now build at opt-level 1 in debug (via .cargo/config.toml.example), removing a major contributor to release-build-only smoothness.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-04-22">
       <description>
         <p>Major performance overhaul.</p>
