@@ -3549,11 +3549,14 @@ impl MessageView {
             let escaped = gtk::glib::markup_escape_text(&body).to_string();
             obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
         } else {
-            // Fallback visible until the worker replies — keeps the message
-            // readable rather than empty during the parse window.
+            // HTML-bodied msg: leave rendered_markup as plain-text fallback for
+            // now, and mark the msg as needing markup. The markup worker
+            // enqueue happens lazily at row-bind time — msgs that never enter
+            // the viewport (deep history the user paginates past) never pay
+            // for html_to_pango. Just-in-time work only.
             let escaped = gtk::glib::markup_escape_text(&body).to_string();
             obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
-            crate::markup_worker::try_enqueue(&obj, formatted_body.to_string());
+            obj.set_needs_markup(true);
         }
         obj.set_sender_markup(crate::widgets::message_row::prerender_sender_markup(&m.sender, &m.sender_id));
         obj.set_reactions_hash(fnv1a_str(&reactions_json));

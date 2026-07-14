@@ -1360,6 +1360,24 @@ impl MessageRow {
     ) {
         let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
+
+        // Just-in-time HTML markup: enqueue the worker only when the row is
+        // actually being bound (i.e. GtkListView is about to display this
+        // msg). Msgs paginated deep into history that the user never scrolls
+        // to never pay for html_to_pango. The needs_markup flag is set true
+        // in info_to_obj for HTML-bearing msgs and cleared here on enqueue
+        // (defensive: also cleared in markup_worker::apply_result) so a
+        // rebind for the same msg doesn't re-queue.
+        if msg.needs_markup() {
+            let fb = msg.formatted_body();
+            if !fb.is_empty() {
+                msg.set_needs_markup(false);
+                crate::markup_worker::try_enqueue(msg, fb);
+            } else {
+                msg.set_needs_markup(false);
+            }
+        }
+
         // Reset the on-demand selectable flag if it somehow leaked from
         // a prior bind (focus-leave on body_label normally handles this,
         // but a new message arriving into the same row while the label
@@ -1872,12 +1890,19 @@ impl MessageRow {
             // for an invisible row still costs GTK-thread time and
             // shows up in the next frame's layout pass — which lands
             // exactly when the user is scrolling those rows into
-            // view. Bind reads rendered_markup directly when this
-            // row's slot is next recycled to display this message,
-            // so dropping the apply here is safe: the markup still
-            // ends up on the label, just at bind time when we
-            // already paid layout cost.
+            // view.
+            //
+            // IMPORTANT: invalidate the body-hash cache before
+            // returning. Otherwise the next bind for this msg would
+            // see body_hash unchanged (body/formatted_body haven't
+            // changed — only rendered_markup did) and skip the render,
+            // leaving the row with its stale plain-text fallback
+            // forever. Setting to 0 forces the next bind to re-render
+            // with the freshly-delivered rendered_markup. 0 is not a
+            // legal FNV-1a output for a non-empty input, so this is
+            // safely distinguishable from any real hash.
             if !row.is_mapped() {
+                row.imp().last_body_hash.set(0);
                 return;
             }
 

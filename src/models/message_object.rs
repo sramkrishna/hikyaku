@@ -115,6 +115,13 @@ mod imp {
         pub(super) media_url_str: RefCell<String>,
         pub(super) media_filename_str: RefCell<String>,
         pub(super) media_source_json_str: RefCell<String>,
+
+        /// True when the msg has an HTML formatted_body that still needs
+        /// the markup worker to produce Pango markup. Starts true for HTML
+        /// msgs, set false once enqueued so bind doesn't queue duplicates
+        /// when a row is rebound repeatedly to the same msg (scroll recycle).
+        /// Also set false in apply_result once the worker delivers.
+        pub(super) needs_markup: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -178,6 +185,14 @@ impl MessageObject {
 
     pub fn set_body_hash(&self, h: u64) {
         self.imp().body_hash.set(h);
+    }
+
+    pub fn needs_markup(&self) -> bool {
+        self.imp().needs_markup.get()
+    }
+
+    pub fn set_needs_markup(&self, v: bool) {
+        self.imp().needs_markup.set(v);
     }
 
     pub fn sender_markup(&self) -> String {

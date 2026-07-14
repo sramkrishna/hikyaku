@@ -130,8 +130,10 @@ pub fn apply_result(id: u64, markup: String) {
                 "markup_worker: html_to_pango returned empty for id={id}; \
                  keeping plain-text fallback to avoid blank row"
             );
+            obj.set_needs_markup(false); // don't retry pathological HTML
             return;
         }
         obj.set_rendered_markup(markup);
+        obj.set_needs_markup(false);
     }
 }
