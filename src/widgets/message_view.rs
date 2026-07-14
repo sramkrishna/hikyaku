@@ -3306,39 +3306,24 @@ impl MessageView {
         }
         tl.set_prev_batch_token(prev_batch);
 
-        // Try to restore scroll position so the previously-top item stays
-        // in view. Best-effort: GTK measures new rows lazily on scroll,
-        // so `upper` typically does NOT grow by the time the idle fires
-        // and we have to fall back to a heuristic. Even when we do call
-        // set_value with a positive target, GtkListBase's post-splice
-        // layout often clamps `value` back toward 0 because `upper`
-        // hasn't accounted for the unmeasured prepended rows.
-        let sw = imp.scrolled_window().clone();
-        // Estimate per-row height from the pre-splice list — before the new
-        // items have been measured, `upper` reflects only the already-measured
-        // rows. Divide by their count to get a per-row average that adapts to
-        // this room's actual content mix (short DMs vs long HTML with images
-        // read very differently). Previously a hard-coded 60px guess produced
-        // small correction jumps as each newly-measured row's true height
-        // differed from the guess.
-        let pre_splice_n = if n_prepended > 0 {
-            tl.n_items() - n_prepended as u32
-        } else { 0 };
-        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
-            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
-        } else { 60.0 };
+        // Anchor-based scroll restore. Before the splice the user was
+        // looking at the previously-topmost item (they had scrolled to the
+        // top to trigger pagination). That item is now at position
+        // n_prepended. Ask GtkListView to make it visible — it internally
+        // measures rows as needed and positions accurately, without the
+        // vadj-value heuristics that used to leave the user stranded at
+        // position 0 whenever GTK hadn't yet grown `upper` to account for
+        // the prepended content. Uses ScrollFlags::NONE (no select/focus),
+        // scroll_info=None (default alignment — minimal scroll to make
+        // visible; since the anchor is above the current viewport top, GTK
+        // pins it to the viewport top).
+        let _ = (old_upper, old_value); // heuristic locals no longer used
+        let lv = imp.list_view();
+        let anchor_pos = n_prepended as u32;
         glib::idle_add_local_once(move || {
-            let vadj = sw.vadjustment();
-            let delta = vadj.upper() - old_upper;
-            let target = if delta > 50.0 {
-                // Measurement caught up — shift by exact delta to keep the
-                // previously-top item in place.
-                old_value + delta
-            } else {
-                // Fallback: estimate from the room's own per-row average.
-                old_value + (n_prepended as f64) * per_row_est
-            };
-            vadj.set_value(target);
+            if anchor_pos > 0 {
+                lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
+            }
         });
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
