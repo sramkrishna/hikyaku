@@ -1301,10 +1301,15 @@ impl MxWindow {
                 .upgrade()
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             let token = msg_view_for_scroll.prev_batch_token();
+            let oldest_known_ts = msg_view_for_scroll.oldest_message_timestamp();
             if let (Some(room_id), Some(from_token)) = (room_id, token) {
                 let tx = cmd_tx.clone();
                 glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::FetchOlderMessages { room_id, from_token }).await;
+                    let _ = tx.send(MatrixCommand::FetchOlderMessages {
+                        room_id,
+                        from_token,
+                        oldest_known_ts,
+                    }).await;
                 });
             }
         });

@@ -65,18 +65,21 @@ mod imp {
         /// Blueprint placeholder where room_view_stack is inserted.
         #[template_child]
         pub room_list_placeholder: TemplateChild<gtk::Box>,
-        /// room_id → gio::ListStore (lightweight GObjects, no widget overhead).
-        pub list_store_cache: RefCell<HashMap<String, gio::ListStore>>,
+        /// room_id → Timeline. The Timeline owns the underlying gio::ListStore
+        /// (retrieved via `Timeline::model()`), the `event_id → MessageObject`
+        /// index, cached oldest/newest timestamps, and the `prev_batch_token`
+        /// for pagination. All timeline mutations MUST go through the Timeline
+        /// API — no direct `list_store.splice()` calls anywhere else.
+        pub timelines: RefCell<HashMap<String, crate::models::Timeline>>,
         /// Normalized scroll position (0.0–1.0) saved per room on switch-away.
         /// Restored in an idle after model swap so users return to where they were.
         pub saved_scroll_frac: RefCell<HashMap<String, f64>>,
         /// Currently visible room id (empty string = no room selected).
         pub current_room_id: RefCell<String>,
         /// Current room's list_store — updated by switch_room() for O(1) access.
+        /// This is an alias of `timelines[current_room_id].model()`; the Timeline
+        /// remains the authoritative owner of the store contents.
         pub cur_list_store: RefCell<gio::ListStore>,
-        /// Saved event_index per room — restored on return visit so bg_refresh
-        /// can detect "nothing changed" without a full splice.
-        pub saved_event_indices: RefCell<HashMap<String, HashMap<String, crate::models::MessageObject>>>,
         /// Saved messages_loaded flag per room — restored so return visits
         /// don't trigger first-load auto-scroll.
         pub saved_messages_loaded: RefCell<HashMap<String, bool>>,
@@ -186,7 +189,6 @@ mod imp {
         /// Fired when the user scrolls back to the bottom after prepend_messages()
         /// evicted the newest messages.  window.rs uses this to trigger a bg_refresh.
         pub on_scroll_bottom: RefCell<Option<Box<dyn Fn()>>>,
-        pub prev_batch_token: RefCell<Option<String>>,
         pub fetching_older: Cell<bool>,
         /// Names to highlight in message bodies (user's own name + friends).
         /// Rc<[String]> so row_context() clones only the pointer, not the data.
@@ -216,20 +218,6 @@ mod imp {
         pub nick_list: gtk::ListBox,
         /// Original prefix and @ position when nick completion started.
         pub nick_completion_state: RefCell<Option<(usize, String, String)>>, // (at_pos, prefix, text_after)
-        /// O(1) event_id → MessageObject index. Kept in sync with list_store.
-        /// Eliminates linear scans in update/scroll/remove/has_event.
-        pub event_index: RefCell<HashMap<String, MessageObject>>,
-        /// Count of local-echo MessageObjects (event_id == "") currently in the
-        /// list_store. Bumps when append_message adds an echo; decrements when
-        /// patch_echo_event_id successfully replaces the empty id with a real
-        /// one. When zero, patch_echo_event_id short-circuits to O(1) instead
-        /// of doing a backwards scan — important in busy rooms where dozens of
-        /// remote-sender messages arrive and each one would otherwise trigger
-        /// a full list_store walk. Approximate: room switches reset it; stale
-        /// echoes that never get patched would cause slight drift. Acceptable
-        /// because the counter is a hint for the fast path, never for
-        /// correctness. (See issue: perf: guard patch_echo_event_id scan.)
-        pub pending_echo_count: Cell<u32>,
         /// The event_id stored in m.fully_read for this room — used for precise
         /// divider placement.  None until set_room_meta is called.
         pub fully_read_event_id: RefCell<Option<String>>,
@@ -250,8 +238,9 @@ mod imp {
         pub seek_target_event_id: RefCell<Option<String>>,
         /// Callback fired when the user clicks "Jump to latest" in seek mode.
         pub on_seek_cancelled: RefCell<Option<Box<dyn Fn()>>>,
-        /// The live event_index saved while seek mode is active (restored on cancel).
-        pub seek_saved_event_index: RefCell<Option<std::collections::HashMap<String, crate::models::MessageObject>>>,
+        /// Event index for the seek_store. Populated by load_seek_result, cleared
+        /// by cancel_seek. Non-empty iff we're in seek mode.
+        pub seek_event_index: RefCell<std::collections::HashMap<String, crate::models::MessageObject>>,
         /// Inline banner shown when the timeline is in seek (historical context) mode.
         pub seek_banner: gtk::Box,
         /// Spinner inside seek_banner — spinning while the seek is in flight.
@@ -319,11 +308,10 @@ mod imp {
                 factory: std::cell::OnceCell::new(),
                 seek_store: gio::ListStore::new::<crate::models::MessageObject>(),
                 room_list_placeholder: Default::default(),
-                list_store_cache: RefCell::new(HashMap::new()),
+                timelines: RefCell::new(HashMap::new()),
                 saved_scroll_frac: RefCell::new(HashMap::new()),
                 current_room_id: RefCell::new(String::new()),
                 cur_list_store: RefCell::new(gio::ListStore::new::<MessageObject>()),
-                saved_event_indices: RefCell::new(HashMap::new()),
                 saved_messages_loaded: RefCell::new(HashMap::new()),
                 view_stack: Default::default(),
                 room_loading_overlay: Default::default(),
@@ -377,7 +365,6 @@ mod imp {
                 on_reply: RefCell::new(None),
                 on_scroll_top: RefCell::new(None),
                 on_scroll_bottom: RefCell::new(None),
-                prev_batch_token: RefCell::new(None),
                 fetching_older: Cell::new(false),
                 highlight_names: RefCell::new(std::rc::Rc::from([])),
                 user_id: RefCell::new(String::new()),
@@ -394,8 +381,6 @@ mod imp {
                     .build(),
                 pending_mentions: RefCell::new(std::collections::HashMap::new()),
                 nick_completion_state: RefCell::new(None),
-                event_index: RefCell::new(HashMap::new()),
-                pending_echo_count: Cell::new(0),
                 fully_read_event_id: RefCell::new(None),
                 send_history: RefCell::new(Vec::new()),
                 history_cursor: Cell::new(0),
@@ -404,7 +389,7 @@ mod imp {
                 seek_before_token: RefCell::new(None),
                 seek_target_event_id: RefCell::new(None),
                 on_seek_cancelled: RefCell::new(None),
-                seek_saved_event_index: RefCell::new(None),
+                seek_event_index: RefCell::new(HashMap::new()),
                 seek_spinner: gtk::Spinner::builder().visible(false).build(),
                 seek_banner_label: gtk::Label::builder()
                     .label("Finding message…")
@@ -458,16 +443,23 @@ mod imp {
                 .expect("scrolled_window() called before room is set up")
         }
 
+        /// Get or create the per-room Timeline. Owns the ListStore + event_index
+        /// + pagination state for one Matrix room. Cheap to clone (GObject
+        /// handle). See `crate::models::Timeline` for the mutation contract.
+        pub fn ensure_timeline(&self, room_id: &str) -> crate::models::Timeline {
+            if let Some(t) = self.timelines.borrow().get(room_id) {
+                return t.clone();
+            }
+            let t = crate::models::Timeline::new(room_id);
+            self.timelines.borrow_mut().insert(room_id.to_string(), t.clone());
+            t
+        }
+
         /// Get or create the per-room gio::ListStore.  Only stores data — no
         /// widgets created here; the widget tree stays constant size regardless
-        /// of how many rooms are visited.
+        /// of how many rooms are visited. Backed by Timeline.model().
         pub fn ensure_room_store(&self, room_id: &str) -> gio::ListStore {
-            if let Some(store) = self.list_store_cache.borrow().get(room_id) {
-                return store.clone();
-            }
-            let store = gio::ListStore::new::<crate::models::MessageObject>();
-            self.list_store_cache.borrow_mut().insert(room_id.to_string(), store.clone());
-            store
+            self.ensure_timeline(room_id).model().clone()
         }
 
         /// Get or create the per-room ScrolledWindow+ListView in room_view_stack.
@@ -502,57 +494,82 @@ mod imp {
             // every wheel / touchpad / kinetic event so programmatic
             // scroll calls (e.g. scroll_to_bottom on incoming-message
             // append) can suppress themselves while the user is
-            // actively scrolling. Without this, the user perceives the
-            // view as "hunting for a position" — every new arrival in
-            // a busy room would snap-back to the bottom mid-scroll.
+            // actively scrolling. Also drives backpagination directly —
+            // see comment on the connect_scroll callback for why this
+            // path is preferred over the vadj.value-notify approach.
             {
                 let scroll_ctrl = gtk::EventControllerScroll::new(
                     gtk::EventControllerScrollFlags::VERTICAL
                         | gtk::EventControllerScrollFlags::KINETIC,
                 );
                 let view_weak_input = self.obj().downgrade();
-                scroll_ctrl.connect_scroll(move |_, _, _| {
-                    if let Some(view) = view_weak_input.upgrade() {
-                        view.imp().last_user_scroll_at
-                            .set(Some(std::time::Instant::now()));
+                let input_rid = room_id.to_string();
+                scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                    let Some(view) = view_weak_input.upgrade() else {
+                        return glib::Propagation::Proceed;
+                    };
+                    let imp = view.imp();
+                    imp.last_user_scroll_at
+                        .set(Some(std::time::Instant::now()));
+                    // Backpagination trigger lives here, not in
+                    // value-notify. Reason: after a fetch+prepend, GTK
+                    // clamps vadj.value back to 0 because `upper`
+                    // hasn't accounted for the unmeasured prepended
+                    // rows; that leaves `value` stuck at 0, so any
+                    // "value crossed N" latch never re-arms and a
+                    // single fetch is all the user ever gets per room
+                    // visit. Scroll-up *input events* keep arriving on
+                    // each wheel tick / touchpad pan regardless of
+                    // whether vadj.value can actually decrease, so
+                    // this signal survives the clamp. The
+                    // `fetching_older` 3-second cooldown handles
+                    // intra-burst suppression — the first event after
+                    // a real cooldown expiry fires a fresh fetch.
+                    if dy < 0.0 && *imp.current_room_id.borrow() == input_rid {
+                        let vadj = imp.scrolled_window().vadjustment();
+                        // Prefetch on approach — trigger backpagination when
+                        // scrolled into the top viewport-height's worth of
+                        // content, not only at the exact top. By the time the
+                        // user actually reaches the top, the server round-trip
+                        // has usually completed and the messages splice in
+                        // without a visible stall. Falls back to a fixed
+                        // threshold when page_size is 0 (early startup).
+                        let page = vadj.page_size();
+                        let threshold = if page > 0.0 { page } else { 400.0 };
+                        let near_top = vadj.value() < threshold;
+                        let fetching = imp.fetching_older.get();
+                        let has_token = imp.timelines.borrow().get(&input_rid)
+                            .map(|t| t.has_prev_batch()).unwrap_or(false);
+                        if near_top && !fetching && has_token {
+                            tracing::info!(
+                                "scroll-diag: input-driven backpaginate room={input_rid} \
+                                 value={:.1} threshold={:.1} n_items={}",
+                                vadj.value(), threshold, imp.list_store().n_items()
+                            );
+                            imp.fetching_older.set(true);
+                            if let Some(ref cb) = *imp.on_scroll_top.borrow() {
+                                cb();
+                            }
+                        }
                     }
                     glib::Propagation::Proceed
                 });
                 sw.add_controller(scroll_ctrl);
             }
 
-            // Scroll handler: backpagination (top) and tail-eviction refresh (bottom).
-            // Guard on current_room_id so hidden rooms don't accidentally trigger this.
+            // Tail-eviction refresh: user scrolled back to bottom after
+            // prepend_messages() evicted the newest messages — fire
+            // on_scroll_bottom so window.rs can trigger a bg_refresh to
+            // reload the live tail. Backpagination is no longer
+            // triggered here; see the EventControllerScroll callback
+            // above for the rationale (post-splice value clamp would
+            // strand the user at value=0 with any latch-based trigger).
             let view_weak = self.obj().downgrade();
             let guard_rid = room_id.to_string();
-            // Per-room threshold-crossing latch so we log the pagination decision
-            // once per scroll-into-top-zone, not on every value-notify tick.
-            let was_at_top = std::cell::Cell::new(false);
             sw.vadjustment().connect_value_notify(move |adj| {
                 let Some(view) = view_weak.upgrade() else { return };
                 let imp = view.imp();
                 if *imp.current_room_id.borrow() != guard_rid { return; }
-                // Backpagination: near the top → load older messages.
-                let at_top = adj.value() < 50.0;
-                if at_top && !was_at_top.get() {
-                    let fetching = imp.fetching_older.get();
-                    let has_token = imp.prev_batch_token.borrow().is_some();
-                    tracing::info!(
-                        "scroll-diag: top-zone entered room={guard_rid} value={:.1} \
-                         fetching_older={fetching} has_token={has_token} n_items={}",
-                        adj.value(), imp.list_store().n_items()
-                    );
-                    if !fetching && has_token {
-                        imp.fetching_older.set(true);
-                        if let Some(ref cb) = *imp.on_scroll_top.borrow() {
-                            cb();
-                        }
-                    }
-                }
-                was_at_top.set(at_top);
-                // Tail-refresh: user scrolled back to bottom after prepend_messages()
-                // evicted the newest messages — fire on_scroll_bottom so window.rs
-                // can trigger a bg_refresh to reload the live tail.
                 let slack = 150.0_f64;
                 let near_bottom = adj.upper() - adj.page_size() - adj.value() < slack;
                 if near_bottom && imp.tail_evicted.get() {
@@ -604,8 +621,7 @@ mod imp {
                     stack.remove(&sw);
                 }
             }
-            self.list_store_cache.borrow_mut().remove(room_id);
-            self.saved_event_indices.borrow_mut().remove(room_id);
+            self.timelines.borrow_mut().remove(room_id);
             self.saved_messages_loaded.borrow_mut().remove(room_id);
             self.saved_scroll_frac.borrow_mut().remove(room_id);
             tracing::info!("evicted cold room widgets: room={room_id}");
@@ -2320,21 +2336,13 @@ impl MessageView {
         };
         let imp = self.imp();
         let target = target_room_id.as_deref();
-        let cache = imp.list_store_cache.borrow();
-        for (rid, store) in cache.iter() {
+        let timelines = imp.timelines.borrow();
+        for (rid, tl) in timelines.iter() {
             if target.is_some() && Some(rid.as_str()) != target { continue; }
-            let n = gio::prelude::ListModelExt::n_items(store);
-            for i in 0..n {
-                if let Some(obj) = gio::prelude::ListModelExt::item(store, i)
-                    .and_downcast::<MessageObject>()
-                {
-                    if obj.event_id() == event_id {
-                        return Some(obj);
-                    }
-                }
+            // O(1) via Timeline's event_index — no list_store scan.
+            if let Some(msg) = tl.get_event(event_id) {
+                return Some(msg);
             }
-            // If we narrowed to a specific room and didn't find the
-            // event in its store, no point scanning the rest.
             if target.is_some() { return None; }
         }
         None
@@ -2358,7 +2366,8 @@ impl MessageView {
         //   alias inside `<a href>` attributes, but the linkify pass
         //   handles outside-of-anchor matches only, so checking either
         //   string for the substring is sufficient as a candidate filter.
-        for store in imp.list_store_cache.borrow().values() {
+        for tl in imp.timelines.borrow().values() {
+            let store = tl.model();
             let n = gio::prelude::ListModelExt::n_items(store);
             for i in 0..n {
                 let Some(obj) = gio::prelude::ListModelExt::item(store, i)
@@ -2405,7 +2414,7 @@ impl MessageView {
             if let Some(row) = crate::widgets::MessageView::find_message_row(&node) {
                 let eid = row.imp().event_id.borrow().clone();
                 if !eid.is_empty() {
-                    if let Some(msg) = imp.event_index.borrow().get(&eid).cloned() {
+                    if let Some(msg) = self.current_timeline_lookup(&eid) {
                         row.bind_message_object(&msg, &self.row_context());
                     }
                 }
@@ -2438,7 +2447,7 @@ impl MessageView {
                 // no MessageObject property mutation required.
                 let eid = row.imp().event_id.borrow().clone();
                 if !eid.is_empty() {
-                    if let Some(msg) = imp.event_index.borrow().get(&eid).cloned() {
+                    if let Some(msg) = self.current_timeline_lookup(&eid) {
                         // Only rebind rows belonging to this user to
                         // keep the work proportional to matching rows
                         // rather than the full viewport.
@@ -2566,6 +2575,17 @@ impl MessageView {
         self.imp().on_media_click.replace(Some(Box::new(f)));
     }
 
+    /// O(1) lookup of a message in the current room's Timeline. Returns None if
+    /// no room is selected, no Timeline exists for the current room, or the
+    /// event_id is empty / not in the Timeline's event_index.
+    fn current_timeline_lookup(&self, event_id: &str) -> Option<MessageObject> {
+        if event_id.is_empty() { return None; }
+        let imp = self.imp();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return None; }
+        imp.timelines.borrow().get(&rid).and_then(|t| t.get_event(event_id))
+    }
+
     /// Update a message in the timeline by event_id. The `mutate` closure
     /// modifies the MessageObject's properties, then the row is rebound
     /// in-place without scrolling or flashing. This is the single entry
@@ -2577,16 +2597,33 @@ impl MessageView {
     ) {
         if event_id.is_empty() { return; }
         let imp = self.imp();
-        // O(1) lookup via event_index — no list_store scan.
-        let msg = match imp.event_index.borrow().get(event_id).cloned() {
+        // O(1) lookup via Timeline's event_index — no list_store scan.
+        let msg = match self.current_timeline_lookup(event_id) {
             Some(m) => m,
             None => {
-                tracing::info!(
-                    "update-diag: {event_id} not in event_index for room={} — \
-                     mutation dropped (visible row would not refresh)",
-                    imp.current_room_id.borrow()
-                );
-                return;
+                // Fallback: the message may still be in pending_appends
+                // (append_message → idle flush window). During the flush
+                // gap, Timeline is populated but the row hasn't been
+                // spliced into list_store yet. A reaction / edit arriving
+                // in that gap would otherwise be dropped. Also handles the
+                // rare case where patch_echo never fired and the message
+                // is still an echo — we match on the pending queue and
+                // let the mutation land on the object; subsequent flush
+                // splices the mutated object.
+                let pending = imp.pending_appends.borrow();
+                let found = pending.iter().find(|m| m.event_id() == event_id).cloned();
+                drop(pending);
+                match found {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(
+                            "update-diag: {event_id} not in event_index or pending_appends \
+                             for room={} — mutation dropped (visible row would not refresh)",
+                            imp.current_room_id.borrow()
+                        );
+                        return;
+                    }
+                }
             }
         };
         mutate(&msg);
@@ -2677,11 +2714,11 @@ impl MessageView {
     /// (the MessageObject never learns about them), so the panel shows
     /// stale state until the app restarts and reloads from cache.
     ///
-    /// For non-current rooms: look up the MessageObject in
-    /// `saved_event_indices[room_id]` and mutate it in place. The row
-    /// re-bind happens naturally when the user returns to the room and
-    /// the factory re-binds the cached ListView rows — the factory
-    /// reads `reactions_hash`, sees it changed, and rebuilds the pills.
+    /// For non-current rooms: look up the MessageObject in that room's
+    /// Timeline and mutate it in place. The row re-bind happens naturally
+    /// when the user returns to the room and the factory re-binds the
+    /// cached ListView rows — the factory reads `reactions_hash`, sees it
+    /// changed, and rebuilds the pills.
     pub fn apply_reaction_in_room(
         &self,
         room_id: &str,
@@ -2699,7 +2736,8 @@ impl MessageView {
         }
         let imp = self.imp();
         let current_rid = imp.current_room_id.borrow().clone();
-        let in_event_index = imp.event_index.borrow().contains_key(event_id);
+        let in_event_index = imp.timelines.borrow().get(room_id)
+            .map(|t| t.has_event(event_id)).unwrap_or(false);
         tracing::info!(
             "react-diag: apply_reaction_in_room enter room={room_id} eid={event_id} \
              emoji={emoji:?} sender={sender:?} current={current_rid:?} \
@@ -2712,13 +2750,13 @@ impl MessageView {
             return;
         }
 
-        // Non-current room: look up in saved_event_indices and mutate.
-        let msg = imp.saved_event_indices.borrow()
+        // Non-current room: look up in that room's Timeline and mutate.
+        let msg = imp.timelines.borrow()
             .get(room_id)
-            .and_then(|idx| idx.get(event_id).cloned());
+            .and_then(|t| t.get_event(event_id));
         let Some(msg) = msg else {
             tracing::info!(
-                "react-diag: apply_reaction_in_room missed saved_event_indices[{room_id}][{event_id}] \
+                "react-diag: apply_reaction_in_room missed timelines[{room_id}][{event_id}] \
                  (room never visited or message not loaded)"
             );
             return;
@@ -2772,14 +2810,22 @@ impl MessageView {
     pub fn scroll_to_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() { return false; }
         let imp = self.imp();
-        // O(1) lookup — no list_store scan.
-        let msg = match imp.event_index.borrow().get(event_id).cloned() {
-            Some(m) => m,
-            None => return false,
+        // In seek mode, look up via seek_event_index; otherwise use the
+        // current room's Timeline.
+        let in_seek = !imp.seek_event_index.borrow().is_empty();
+        let msg = if in_seek {
+            match imp.seek_event_index.borrow().get(event_id).cloned() {
+                Some(m) => m,
+                None => return false,
+            }
+        } else {
+            match self.current_timeline_lookup(event_id) {
+                Some(m) => m,
+                None => return false,
+            }
         };
         // The single shared ListView's model is already seek_store in seek mode
         // and the live room store otherwise — always use imp.list_view().
-        let in_seek = imp.seek_saved_event_index.borrow().is_some();
         let (store, list_view): (gio::ListStore, gtk::ListView) = if in_seek {
             (imp.seek_store.clone(), imp.list_view())
         } else {
@@ -2806,13 +2852,10 @@ impl MessageView {
     pub fn remove_message(&self, event_id: &str) {
         if event_id.is_empty() { return; }
         let imp = self.imp();
-        // O(1) lookup via event_index.
-        let msg = match imp.event_index.borrow_mut().remove(event_id) {
-            Some(m) => m,
-            None => return,
-        };
-        if let Some(i) = imp.list_store().find(&msg) {
-            imp.list_store().remove(i);
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return; }
+        if let Some(t) = imp.timelines.borrow().get(&rid) {
+            t.remove(event_id);
         }
     }
 
@@ -2903,23 +2946,29 @@ impl MessageView {
             return;
         }
 
+        // The current room's Timeline is the single owner of the store, event_index,
+        // and prev_batch_token. All mutations flow through it.
+        let rid = imp.current_room_id.borrow().clone();
+        let tl = imp.ensure_timeline(&rid);
+
         if !first_load {
             // bg_refresh: always do incremental updates — never a full-replace splice.
             //
             // Full splice (splice(0, N, &objs)) on an occupied list_store takes 300ms–3s
             // regardless of bind cost.  Instead:
-            //   • New messages  → append to end (server always returns latest-first).
+            //   • New messages  → Timeline.insert appends (with sort + dedup).
             //   • Edits/UTD     → update GObject properties in-place via update_message_body.
             //   • Redactions    → NOT detected here; handled by MatrixEvent::MessageRedacted.
             //     (The server fetch window may return fewer events than the disk cache holds —
             //      treating that difference as redactions was the original false-positive source.)
 
-            // Restore the pagination token if it was cleared by a room switch (clear()
-            // resets it to None).  We accept the server's latest-window token only when
-            // ours is None — if the user has already scrolled back via prepend_messages,
-            // their deeper token is kept so pagination can continue from where they are.
-            if imp.prev_batch_token.borrow().is_none() {
-                imp.prev_batch_token.replace(prev_batch);
+            // Restore the pagination token if it was cleared by a room switch (Timeline
+            // starts with no token). We accept the server's latest-window token only when
+            // Timeline's is empty — if the user has already scrolled back via
+            // prepend_messages, the deeper token is preserved so pagination can continue
+            // from where they are.
+            if tl.prev_batch_token().is_empty() {
+                tl.set_prev_batch_token(prev_batch.clone());
             }
 
             // UTD → decrypted patch: when bg_refresh returns a real body for a
@@ -2930,8 +2979,7 @@ impl MessageView {
             // messages stay locked forever.
             const UTD_BODY: &str = "\u{1f512} Unable to decrypt message";
             for m in messages.iter().filter(|m| !m.event_id.is_empty() && m.body != UTD_BODY) {
-                let currently_utd = imp.event_index.borrow()
-                    .get(&m.event_id)
+                let currently_utd = tl.get_event(&m.event_id)
                     .map(|obj| obj.body() == UTD_BODY)
                     .unwrap_or(false);
                 if currently_utd {
@@ -2940,10 +2988,19 @@ impl MessageView {
                 }
             }
 
-            // Collect new messages (not yet in the displayed list).
+            // Collect new messages (not yet in the Timeline OR in the
+            // pending_appends queue — the queue holds objects append_message
+            // added that haven't landed in Timeline yet).
+            let pending_eids: std::collections::HashSet<String> = imp.pending_appends
+                .borrow()
+                .iter()
+                .map(|o| o.event_id())
+                .filter(|e| !e.is_empty())
+                .collect();
             let new_msgs: Vec<&crate::matrix::MessageInfo> = messages.iter()
                 .filter(|m| !m.event_id.is_empty()
-                    && !imp.event_index.borrow().contains_key(&m.event_id))
+                    && !tl.has_event(&m.event_id)
+                    && !pending_eids.contains(&m.event_id))
                 .collect();
 
             // NOTE: we deliberately do NOT apply body/formatted_body/reaction diffs here.
@@ -2958,21 +3015,15 @@ impl MessageView {
             // edit.  The live-sync path handles all correctness; bg_refresh is only
             // responsible for gap-filling new messages.
 
-            // Insert new messages at the correct timestamp position.
-            // new_msgs is already sorted oldest→newest (inherited from the sorted `messages`
-            // parameter).  For each one, binary-search the list_store to find where its
-            // timestamp belongs so that gap-fill messages (older than the newest in the
-            // list) land in the right place rather than at the end.
-            // Common case: all new messages are newer → every insert is an O(1) append.
+            // Timeline.insert handles all placement (append / gap-fill / dedup) in
+            // one call, batching splices as it goes. Local echo patches for own
+            // messages still need to run first so the server copy patches the
+            // existing echo row rather than adding a duplicate.
             if !new_msgs.is_empty() {
-                let list_store = imp.list_store();
-                let mut any_at_end = false;
                 let my_id = imp.user_id.borrow().clone();
                 let today = glib::DateTime::now_local().ok();
 
                 // Pass 1: echo patches — update existing GObjects in place, no new rows.
-                // Kept separate so patch_echo_event_id can freely borrow event_index
-                // without the drop/reborrow dance that the old single-pass loop needed.
                 let mut echo_patched: std::collections::HashSet<String> = Default::default();
                 for m in &new_msgs {
                     tracing::debug!(
@@ -2984,66 +3035,34 @@ impl MessageView {
                         && m.sender_id == my_id;
                     if is_own && self.patch_echo_event_id(&m.body, &m.event_id) {
                         echo_patched.insert(m.event_id.clone());
-                        any_at_end = true;
                     }
                 }
 
-                // Pass 2: pre-compute insert positions on the ORIGINAL list (before any
-                // insertions) so all end-appends can be batched into a single
-                // splice(orig_n, 0, &batch) — one items_changed signal instead of N.
-                // Gap-fills (older messages inserted mid-list) are rare; they get
-                // individual splices inserted high-to-low so pre-computed positions
-                // stay valid after each insertion.
-                let orig_n = list_store.n_items();
-                let mut end_appends: Vec<MessageObject> = Vec::new();
-                let mut gap_fills: Vec<(u32, MessageObject)> = Vec::new();
-
+                // Pass 2: build the objects for everything that didn't patch an echo
+                // and hand them to Timeline in one call. Timeline picks the placement
+                // (end-append, prepend, or gap-fill) per-item and batches splices.
+                let mut to_insert: Vec<MessageObject> = Vec::new();
                 for m in &new_msgs {
                     if echo_patched.contains(&m.event_id) { continue; }
                     tracing::info!(
                         "set_messages incremental: inserting event_id={} (no echo found)",
                         m.event_id
                     );
-                    let obj = Self::info_to_obj(m, today.as_ref());
-                    let pos = Self::sorted_insert_pos(&list_store, m.timestamp);
-                    if pos >= orig_n {
-                        end_appends.push(obj);
-                    } else {
-                        gap_fills.push((pos, obj));
-                    }
+                    to_insert.push(Self::info_to_obj(m, today.as_ref()));
                 }
 
-                // One splice for all end-appends → one items_changed signal.
-                if !end_appends.is_empty() {
-                    let upcast: Vec<glib::Object> =
-                        end_appends.iter().map(|o| o.clone().upcast()).collect();
-                    list_store.splice(orig_n, 0, &upcast);
-                    any_at_end = true;
-                }
-
-                // Gap-fills high-to-low: each insert only shifts items above it,
-                // so positions computed on the original list remain correct.
-                gap_fills.sort_by_key(|(pos, _)| *pos);
-                for (pos, obj) in gap_fills.iter().rev() {
-                    list_store.splice(*pos, 0, &[obj.clone().upcast::<glib::Object>()]);
-                }
-
-                // Update event_index once for all newly inserted objects.
-                {
-                    let mut idx = imp.event_index.borrow_mut();
-                    for obj in end_appends.iter()
-                        .chain(gap_fills.iter().map(|(_, o)| o))
-                    {
-                        if !obj.event_id().is_empty() {
-                            idx.insert(obj.event_id(), obj.clone());
-                        }
-                    }
+                // Snapshot "was near bottom before insert" — after the insert the
+                // adjustment values are stale.
+                let was_near_bottom = self.is_near_bottom();
+                let newest_before = tl.newest_timestamp();
+                let any_at_end = !echo_patched.is_empty() || to_insert.iter().any(|o| o.timestamp() >= newest_before);
+                if !to_insert.is_empty() {
+                    tl.insert(to_insert);
                 }
 
                 // Only scroll to bottom when new messages arrived at the end AND
-                // the user is already near the bottom.  If they are scrolled up
-                // reading history, append silently without disturbing their position.
-                if any_at_end && self.is_near_bottom() {
+                // the user was already near the bottom before the insert.
+                if any_at_end && was_near_bottom {
                     let view_weak = self.downgrade();
                     glib::idle_add_local_once(move || {
                         let Some(view) = view_weak.upgrade() else { return };
@@ -3058,11 +3077,10 @@ impl MessageView {
                 imp.current_room_id.borrow()
             );
 
-            self.dedup_list_store("set_messages incremental");
-
             // Insert divider if needed (same logic as the no-change path).
             let unread = imp.room_unread_count.get();
-            let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
+            let divider_in_list = imp.divider_obj.borrow().is_some()
+                || tl.has_event("__unread_divider__");
             if !divider_in_list && unread > 0 {
                 let fully_read = imp.fully_read_event_id.borrow().clone();
                 tracing::info!(
@@ -3081,9 +3099,17 @@ impl MessageView {
 
         let _t1 = std::time::Instant::now();
         let today = glib::DateTime::now_local().ok();
-        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
+        // Sort by timestamp ascending: chronological invariant. Downstream
+        // (sorted_insert_pos, prepend_messages, oldest_message_timestamp)
+        // assumes list_store is sorted; if first_load lands a misordered
+        // chunk, every later mutation compounds the disorder.
+        // Timeline.replace_all sorts internally, so no need to pre-sort here;
+        // done for symmetry with the log line and info_to_obj timing.
+        let mut sorted_input: Vec<&crate::matrix::MessageInfo> = messages.iter().collect();
+        sorted_input.sort_by_key(|m| m.timestamp);
+        let objs: Vec<MessageObject> = sorted_input.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
         let _t2 = std::time::Instant::now();
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
+        let n = gio::prelude::ListModelExt::n_items(tl.model());
         use std::sync::atomic::Ordering;
         crate::widgets::message_view::BIND_COUNT.store(0, Ordering::Relaxed);
         crate::widgets::message_view::BIND_TOTAL_US.store(0, Ordering::Relaxed);
@@ -3096,36 +3122,25 @@ impl MessageView {
             // Detach model so GTK reads all N items in one shot on re-attach.
             imp.list_view().set_model(gtk::SelectionModel::NONE);
         }
-        imp.list_store().splice(0, n, &objs);
+        let n_objs = objs.len();
+        tl.replace_all(objs);
+        // Also clear divider_obj — the replace_all removed the old room's messages,
+        // so any is_first_unread property on them is now stale.
+        *imp.divider_obj.borrow_mut() = None;
         let _t3 = std::time::Instant::now();
         let bc = crate::widgets::message_view::BIND_COUNT.load(Ordering::Relaxed);
         let bt = crate::widgets::message_view::BIND_TOTAL_US.load(Ordering::Relaxed);
         tracing::info!("set_messages: info_to_obj(n={})={:?} splice(prev={n},first_load={first_load})={:?} binds={bc} bind_total={}µs token={}",
-            objs.len(), _t2-_t1, _t3-_t2, bt,
+            n_objs, _t2-_t1, _t3-_t2, bt,
             if prev_batch.is_some() { "Some" } else { "None" });
-        // Rebuild event_index from scratch for the new room.
-        // Also clear divider_obj — the splice removed the old room's messages,
-        // so any is_first_unread property on them is now stale.
-        *imp.divider_obj.borrow_mut() = None;
-        // Echoes in the old list are gone; reset the guard counter.
-        imp.pending_echo_count.set(0);
-        let mut idx = imp.event_index.borrow_mut();
-        idx.clear();
-        for obj in &objs {
-            let eid = obj.event_id();
-            if !eid.is_empty() {
-                idx.insert(eid, obj.clone());
-            }
-        }
-        drop(idx);
-        imp.prev_batch_token.replace(prev_batch);
+        tl.set_prev_batch_token(prev_batch);
         imp.fetching_older.set(false);
 
         // When the loaded batch is small (can fit on-screen), the scroll
         // threshold (adj.value < 50) never fires because the list is fully
         // visible and the user has no surface to scroll.  Auto-fetch older
         // messages immediately so the view fills with history.
-        if imp.list_store().n_items() < 20 && imp.prev_batch_token.borrow().is_some() {
+        if tl.n_items() < 20 && tl.has_prev_batch() {
             if !imp.fetching_older.get() {
                 if let Some(ref cb) = *imp.on_scroll_top.borrow() {
                     imp.fetching_older.set(true);
@@ -3154,7 +3169,8 @@ impl MessageView {
         // because the splice clears event_index (removing the divider sentinel).
         // Auto-scroll is still gated on first_load below so the user is not
         // yanked away from their reading position.
-        let divider_in_list = imp.event_index.borrow().contains_key("__unread_divider__");
+        let divider_in_list = imp.divider_obj.borrow().is_some()
+            || tl.has_event("__unread_divider__");
         let divider_inserted = if !divider_in_list && unread > 0 {
             let fully_read = imp.fully_read_event_id.borrow().clone();
             tracing::info!("Divider check: unread={unread}, fully_read={fully_read:?}");
@@ -3184,7 +3200,7 @@ impl MessageView {
             // immediately without blocking the GTK thread.  set_model(Some)
             // triggers height estimation for all visible rows (~129ms for 80+
             // variable-height rows); deferring it keeps the GTK frame budget.
-            let store = imp.list_store().clone();
+            let store = tl.model().clone();
             let lv = imp.list_view();
             let view_weak = self.downgrade();
             glib::idle_add_local_once(move || {
@@ -3205,35 +3221,63 @@ impl MessageView {
         const MAX_STORE_SIZE: u32 = 400;
         let imp = self.imp();
         let today = glib::DateTime::now_local().ok();
-        let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
-        let vadj_before = imp.scrolled_window().vadjustment();
-        tracing::info!(
-            "scroll-diag: prepend_messages n={} vadj_before value={:.1} upper={:.1}",
-            objs.len(), vadj_before.value(), vadj_before.upper()
-        );
-        imp.list_store().splice(0, 0, &objs);
-        tracing::info!(
-            "scroll-diag: prepend_messages post-splice vadj value={:.1} upper={:.1}",
-            vadj_before.value(), vadj_before.upper()
-        );
-        // Add new objects to the event_index.
-        {
-            let mut idx = imp.event_index.borrow_mut();
-            for obj in &objs {
-                let eid = obj.event_id();
-                if !eid.is_empty() {
-                    idx.insert(eid, obj.clone());
-                }
-            }
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() {
+            return;
         }
-        self.dedup_list_store("prepend_messages");
+        let tl = imp.ensure_timeline(&rid);
+
+        // Pre-filter: drop events already in the Timeline OR in pending_appends
+        // (Timeline.insert dedups against its own event_index but not against
+        // the pending queue; without this filter, a slow flush could re-add a
+        // recently-appended message via the pagination path).
+        let pending_eids: std::collections::HashSet<String> = imp.pending_appends
+            .borrow()
+            .iter()
+            .map(|o| o.event_id())
+            .filter(|e| !e.is_empty())
+            .collect();
+        let mut filtered: Vec<&crate::matrix::MessageInfo> = messages
+            .iter()
+            .filter(|m| m.event_id.is_empty()
+                || (!tl.has_event(&m.event_id) && !pending_eids.contains(&m.event_id)))
+            .collect();
+        filtered.sort_by_key(|m| m.timestamp);
+
+        // Build MessageObjects for the Timeline. Timeline handles the placement
+        // decision (prepend / append / gap-fill) internally based on timestamp.
+        let objs: Vec<MessageObject> = filtered
+            .iter()
+            .map(|m| Self::info_to_obj(m, today.as_ref()))
+            .collect();
+
+        let vadj_before = imp.scrolled_window().vadjustment();
+        let old_upper = vadj_before.upper();
+        let old_value = vadj_before.value();
+        let drop_count = messages.len() - filtered.len();
+        let model_oldest_ts_before = tl.oldest_timestamp();
+        tracing::info!(
+            "scroll-diag: prepend_messages input_n={} dedup_dropped={} to_insert={} \
+             vadj_before value={:.1} upper={:.1} model_oldest_ts_before={}",
+            messages.len(), drop_count, objs.len(),
+            old_value, old_upper, model_oldest_ts_before
+        );
+
+        let n_prepended = objs.len();
+        if !objs.is_empty() {
+            tl.insert(objs);
+        }
+
+        tracing::info!(
+            "scroll-diag: prepend_messages post-insert vadj value={:.1} upper={:.1} new_n={}",
+            vadj_before.value(), vadj_before.upper(), tl.n_items()
+        );
+
         // Cap the store at MAX_STORE_SIZE to keep GTK height-tracking bounded.
         // Items at the tail (high indices = newest messages) are evicted first
         // when the user loads deep history via prepend.
-        // IMPORTANT: never evict unconfirmed echoes (empty event_id) — they are
-        // in-flight messages the user sent, and evicting them would cause the message
-        // to vanish and then reappear at a different position when the server confirms it.
-        let store = imp.list_store();
+        // IMPORTANT: never evict unconfirmed echoes (empty event_id).
+        let store = tl.model().clone();
         let n = store.n_items();
         if n > MAX_STORE_SIZE {
             // Scan forward from MAX_STORE_SIZE; stop before the first echo.
@@ -3248,22 +3292,74 @@ impl MessageView {
             }
             let remove_count = evict_end - MAX_STORE_SIZE;
             if remove_count > 0 {
-                {
-                    let mut idx = imp.event_index.borrow_mut();
-                    for i in MAX_STORE_SIZE..evict_end {
-                        if let Some(obj) = store.item(i).and_downcast::<MessageObject>() {
-                            idx.remove(&obj.event_id());
-                        }
-                    }
-                }
-                store.splice(MAX_STORE_SIZE, remove_count, &[] as &[MessageObject]);
+                // Bulk tail eviction — one splice, one items_changed signal.
+                // Per-eid tl.remove() would fire N items_changed events which
+                // GtkListView processes on the frame boundary and shows as
+                // scroll jitter (measurable regression from Phase 2 migration).
+                let removed = tl.evict_range(MAX_STORE_SIZE, remove_count);
+                tracing::debug!(
+                    "prepend_messages: evicted {} newest via evict_range({}, {})",
+                    removed, MAX_STORE_SIZE, remove_count
+                );
                 // Signal that newest messages were evicted; the scroll handler
                 // will trigger a bg_refresh when the user returns to the bottom.
                 imp.tail_evicted.set(true);
             }
         }
-        imp.prev_batch_token.replace(prev_batch);
-        imp.fetching_older.set(false);
+        tl.set_prev_batch_token(prev_batch);
+
+        // Try to restore scroll position so the previously-top item stays
+        // in view. Best-effort: GTK measures new rows lazily on scroll,
+        // so `upper` typically does NOT grow by the time the idle fires
+        // and we have to fall back to a heuristic. Even when we do call
+        // set_value with a positive target, GtkListBase's post-splice
+        // layout often clamps `value` back toward 0 because `upper`
+        // hasn't accounted for the unmeasured prepended rows.
+        let sw = imp.scrolled_window().clone();
+        // Estimate per-row height from the pre-splice list — before the new
+        // items have been measured, `upper` reflects only the already-measured
+        // rows. Divide by their count to get a per-row average that adapts to
+        // this room's actual content mix (short DMs vs long HTML with images
+        // read very differently). Previously a hard-coded 60px guess produced
+        // small correction jumps as each newly-measured row's true height
+        // differed from the guess.
+        let pre_splice_n = if n_prepended > 0 {
+            tl.n_items() - n_prepended as u32
+        } else { 0 };
+        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
+            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
+        } else { 60.0 };
+        glib::idle_add_local_once(move || {
+            let vadj = sw.vadjustment();
+            let delta = vadj.upper() - old_upper;
+            let target = if delta > 50.0 {
+                // Measurement caught up — shift by exact delta to keep the
+                // previously-top item in place.
+                old_value + delta
+            } else {
+                // Fallback: estimate from the room's own per-row average.
+                old_value + (n_prepended as f64) * per_row_est
+            };
+            vadj.set_value(target);
+        });
+
+        // Cooldown for cascade suppression. Originally 3000ms after a user
+        // capture showed pagination cascades exhausting GTK's height-estimator
+        // and triggering bind-oscillation storms in the pre-Timeline days. That
+        // storm class is gone now — Timeline's bulk splices (evict_range +
+        // single-pass replace_all) and invariant-preserving inserts eliminated
+        // the row measurement thrash that used to compound. 300ms is enough to
+        // debounce the post-splice vadj bounce (0→N→0 as GTK reconciles) and
+        // still feels snappy when the user scrolls up multiple pages in
+        // succession. Combined with the "prefetch on approach" scroll trigger,
+        // consecutive pagination should now be limited by server round-trip,
+        // not this latch.
+        let view_weak = self.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            if let Some(view) = view_weak.upgrade() {
+                view.imp().fetching_older.set(false);
+            }
+        });
     }
 
     /// Show the seek banner immediately in "Finding…" state while the server
@@ -3291,21 +3387,22 @@ impl MessageView {
         let today = glib::DateTime::now_local().ok();
         let objs: Vec<MessageObject> = messages.iter().map(|m| Self::info_to_obj(m, today.as_ref())).collect();
 
-        // Populate the dedicated seek_store (never touches the live store).
+        // Populate the dedicated seek_store (never touches the live Timeline).
         let n_old = imp.seek_store.n_items();
         imp.seek_store.splice(0, n_old, &objs);
 
-        // Build seek event_index; save the live one for restore on cancel.
+        // Build the seek event_index — used by scroll_to_event / lookups while
+        // seek mode is active. The live Timeline's event_index is untouched;
+        // it comes back into use when cancel_seek fires.
         let mut seek_idx = std::collections::HashMap::new();
         for obj in &objs {
             let eid = obj.event_id();
             if !eid.is_empty() { seek_idx.insert(eid, obj.clone()); }
         }
-        let live_idx = imp.event_index.borrow().clone();
-        *imp.seek_saved_event_index.borrow_mut() = Some(live_idx);
-        *imp.event_index.borrow_mut() = seek_idx;
+        *imp.seek_event_index.borrow_mut() = seek_idx;
 
-        // Store seek state (don't overwrite prev_batch_token — live store's token untouched).
+        // Store seek state (don't overwrite the live Timeline's prev_batch_token —
+        // it stays untouched so cancel_seek returns to the same pagination state).
         *imp.seek_before_token.borrow_mut() = before_token;
         *imp.seek_target_event_id.borrow_mut() = Some(target_event_id.to_string());
 
@@ -3339,20 +3436,18 @@ impl MessageView {
     }
 
     /// Exit seek mode: swap the ListView model back to the live room store,
-    /// restore the event_index, and clear the seek store.
+    /// clear the seek event_index, and clear the seek store.
     pub fn cancel_seek(&self) {
         let imp = self.imp();
 
-        // Swap model back to the live room store.
+        // Swap model back to the live room store (owned by Timeline).
         let room_id = imp.current_room_id.borrow().clone();
         let live_store = imp.ensure_room_store(&room_id);
         let no_sel = gtk::NoSelection::new(Some(live_store));
         imp.list_view().set_model(Some(&no_sel));
 
-        // Restore the live event_index.
-        if let Some(saved) = imp.seek_saved_event_index.borrow_mut().take() {
-            *imp.event_index.borrow_mut() = saved;
-        }
+        // Clear the seek event_index — the live Timeline handles everything now.
+        imp.seek_event_index.borrow_mut().clear();
 
         // Clear the seek store so its memory is released.
         imp.seek_store.remove_all();
@@ -3409,22 +3504,6 @@ impl MessageView {
     }
 
     /// Walk a widget tree to find a MessageRow child.
-    /// Binary-search the list_store (sorted oldest→newest by timestamp) for the
-    /// first position whose item's timestamp is strictly greater than `ts`.
-    /// Inserting at this position keeps the list sorted.
-    /// Returns list_store.n_items() when `ts` is ≥ everything (append case).
-    fn sorted_insert_pos(list_store: &gio::ListStore, ts: u64) -> u32 {
-        use gio::prelude::ListModelExt;
-        let n = list_store.n_items();
-        if n == 0 { return 0; }
-        sorted_insert_pos_in(n, ts, |mid| {
-            list_store.item(mid)
-                .and_downcast::<crate::models::MessageObject>()
-                .map(|o| o.timestamp())
-                .unwrap_or(0)
-        })
-    }
-
     fn find_message_row(widget: &gtk::Widget) -> Option<crate::widgets::message_row::MessageRow> {
         use crate::widgets::message_row::MessageRow;
         if let Some(row) = widget.downcast_ref::<MessageRow>() {
@@ -3517,9 +3596,30 @@ impl MessageView {
         obj
     }
 
-    /// Get the current pagination token.
+    /// Get the current pagination token for the visible room. Returns None when
+    /// there is no current room or Timeline hasn't been given one yet.
     pub fn prev_batch_token(&self) -> Option<String> {
-        self.imp().prev_batch_token.borrow().clone()
+        let imp = self.imp();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return None; }
+        imp.timelines.borrow().get(&rid).and_then(|t| {
+            let tok = t.prev_batch_token();
+            if tok.is_empty() { None } else { Some(tok) }
+        })
+    }
+
+    /// Timestamp (seconds since epoch) of the oldest message currently shown,
+    /// or None if the list is empty. Used by FetchOlderMessages so the matrix
+    /// client can loop past chunks of duplicate events when the prev_batch
+    /// token points partway into our existing data.
+    ///
+    /// O(1) via Timeline's cached oldest_timestamp property.
+    pub fn oldest_message_timestamp(&self) -> Option<u64> {
+        let imp = self.imp();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return None; }
+        let ts = imp.timelines.borrow().get(&rid).map(|t| t.oldest_timestamp()).unwrap_or(0);
+        if ts == 0 { None } else { Some(ts) }
     }
 
     /// Prepare for a room switch to `room_id`.
@@ -3545,8 +3645,8 @@ impl MessageView {
             let frac = scroll_save_frac(adj.value(), adj.upper(), adj.page_size());
             imp.saved_scroll_frac.borrow_mut().insert(old_room_id.clone(), frac);
 
-            let idx = imp.event_index.borrow().clone();
-            imp.saved_event_indices.borrow_mut().insert(old_room_id.clone(), idx);
+            // event_index and prev_batch_token now live on the per-room Timeline,
+            // which is retained (unless evicted) — no explicit save needed.
             imp.saved_messages_loaded.borrow_mut()
                 .insert(old_room_id, imp.messages_loaded.get());
         }
@@ -3566,13 +3666,6 @@ impl MessageView {
         *imp.cur_list_store.borrow_mut() = list_store;
         *imp.current_room_id.borrow_mut() = room_id.to_string();
 
-        // Restore per-room state for return visits so set_messages can skip an
-        // unnecessary splice when the server returns the same data we already show.
-        if let Some(saved_idx) = imp.saved_event_indices.borrow_mut().remove(room_id) {
-            *imp.event_index.borrow_mut() = saved_idx;
-        } else {
-            imp.event_index.borrow_mut().clear();
-        }
         let was_loaded = imp.saved_messages_loaded.borrow_mut()
             .remove(room_id).unwrap_or(false);
         imp.messages_loaded.set(was_loaded);
@@ -3583,14 +3676,10 @@ impl MessageView {
         imp.pending_appends.borrow_mut().clear();
         imp.append_flush_pending.set(false);
         imp.tail_evicted.set(false);
-        imp.prev_batch_token.replace(None);
         imp.fetching_older.set(false);
         imp.room_unread_count.set(0);
         imp.fully_read_event_id.replace(None);
         imp.scroll_to_bottom_pending.set(false);
-        // pending_echo_count is a hint; reset on room switch so stale echoes
-        // in a swapped-away room don't keep the new room's counter elevated.
-        imp.pending_echo_count.set(0);
 
         // Clear info banners.
         imp.unread_banner.set_revealed(false);
@@ -3833,13 +3922,13 @@ impl MessageView {
         // clear is_first_unread on the tracked object — no list-store removal, O(1).
         if let Some(obj) = imp.divider_obj.borrow_mut().take() {
             obj.set_is_first_unread(false);
-            imp.event_index.borrow_mut().remove("__unread_divider__");
         } else {
             // Sentinel divider (insert_divider for live messages at end of list):
-            // must be removed from the list store.
-            if let Some(divider) = imp.event_index.borrow_mut().remove("__unread_divider__") {
-                if let Some(i) = imp.list_store().find(&divider) {
-                    imp.list_store().remove(i);
+            // must be removed from the Timeline.
+            let rid = imp.current_room_id.borrow().clone();
+            if !rid.is_empty() {
+                if let Some(tl) = imp.timelines.borrow().get(&rid) {
+                    tl.remove("__unread_divider__");
                 }
             }
         }
@@ -3913,8 +4002,7 @@ impl MessageView {
             .and_downcast::<MessageObject>()
         {
             first_obj.set_is_first_unread(true);
-            *imp.divider_obj.borrow_mut() = Some(first_obj.clone());
-            imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), first_obj);
+            *imp.divider_obj.borrow_mut() = Some(first_obj);
         }
         // Actual new count = messages from pos to end.
         let actual_new = n - pos;
@@ -3932,7 +4020,7 @@ impl MessageView {
     fn insert_divider_after_event(&self, event_id: &str) -> bool {
         let imp = self.imp();
         let my_id = imp.user_id.borrow().clone();
-        let Some(marker_obj) = imp.event_index.borrow().get(event_id).cloned() else {
+        let Some(marker_obj) = self.current_timeline_lookup(event_id) else {
             return false; // Event not in the current window (case C).
         };
         let Some(marker_pos) = imp.list_store().find(&marker_obj) else {
@@ -3974,8 +4062,7 @@ impl MessageView {
             .and_downcast::<MessageObject>()
         {
             first_obj.set_is_first_unread(true);
-            *imp.divider_obj.borrow_mut() = Some(first_obj.clone());
-            imp.event_index.borrow_mut().insert("__unread_divider__".to_string(), first_obj);
+            *imp.divider_obj.borrow_mut() = Some(first_obj);
         }
         let new_count = n - insert_pos;
         self.show_unread_banner(new_count);
@@ -3985,11 +4072,22 @@ impl MessageView {
     /// Insert a "New messages" divider line at the end of the timeline
     /// (used for live messages arriving while the room is unfocused).
     /// Removes any existing dividers first to avoid duplicates.
+    ///
+    /// The divider gets `newest_timestamp + 1` so Timeline's sort-by-timestamp
+    /// places it at the tail. Live messages arriving after have real timestamps
+    /// (≥ now), which is typically > newest_before + 1 — they sort AFTER the
+    /// divider, exactly matching the current "everything below is new"
+    /// semantics. Clock skew edge cases may sort a message before the divider;
+    /// tolerable since remove_dividers clears it on next room read.
     pub fn insert_divider(&self) {
         self.remove_dividers();
+        let imp = self.imp();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return; }
+        let tl = imp.ensure_timeline(&rid);
         let divider = Self::make_divider_obj();
-        self.imp().event_index.borrow_mut().insert("__unread_divider__".to_string(), divider.clone());
-        self.imp().list_store().append(&divider);
+        divider.set_timestamp(tl.newest_timestamp().saturating_add(1));
+        tl.insert(vec![divider]);
         // Count starts at 1; window.rs calls set_unseen_count() as more messages arrive.
         self.show_unread_banner(1);
         self.scroll_to_bottom();
@@ -4007,10 +4105,38 @@ impl MessageView {
     /// `mark_as_new` tints the row blue and adds it to `new_message_objs` so
     /// `remove_dividers` can clear the tint when the user reads the room.
     pub fn append_message(&self, msg: &crate::matrix::MessageInfo, mark_as_new: bool) {
-        // Dedup: if the event is already displayed (e.g. sync reconnect re-delivers it),
-        // skip silently rather than appending a duplicate row.
-        if !msg.event_id.is_empty() && self.imp().event_index.borrow().contains_key(&msg.event_id) {
+        let imp = self.imp();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return; }
+        let tl = imp.ensure_timeline(&rid);
+        // Dedup: if the event is already in Timeline (e.g. sync reconnect
+        // re-delivers it) or already sitting in pending_appends waiting for the
+        // flush idle, skip appending a duplicate row.
+        //
+        // BUT — still apply mark_as_new to the existing object. Without this,
+        // messages loaded via set_messages/bg_refresh (which populates Timeline
+        // before the live NewMessage sync fires) skip the tint entirely; the
+        // user reads a room fresh from cache and never sees the blue-highlight
+        // that identifies unread-while-unfocused messages. Look up the existing
+        // MessageObject (Timeline first, pending_appends fallback) and set the
+        // property + register it for remove_dividers cleanup.
+        if !msg.event_id.is_empty()
+            && (tl.has_event(&msg.event_id)
+                || imp.pending_appends.borrow().iter().any(|o| o.event_id() == msg.event_id))
+        {
             tracing::debug!("append_message: dedup skip event_id={} body={:?}", msg.event_id, body_preview(&msg.body));
+            if mark_as_new {
+                let existing = tl.get_event(&msg.event_id).or_else(|| {
+                    imp.pending_appends.borrow().iter()
+                        .find(|o| o.event_id() == msg.event_id).cloned()
+                });
+                if let Some(obj) = existing {
+                    if !obj.is_new_message() {
+                        obj.set_is_new_message(true);
+                        imp.new_message_objs.borrow_mut().push(obj);
+                    }
+                }
+            }
             return;
         }
         // Echo dedup: if there is an unpatched local echo with the same body, patch
@@ -4023,7 +4149,7 @@ impl MessageView {
         // always from ourselves, so scanning for other senders is pure wasted work.
         // Without this guard, every message arriving on focus-return (potentially
         // dozens) triggers an O(list_store) backwards scan on the GTK thread.
-        let my_id = self.imp().user_id.borrow().clone();
+        let my_id = imp.user_id.borrow().clone();
         if !msg.event_id.is_empty()
             && !my_id.is_empty()
             && msg.sender_id == my_id
@@ -4033,11 +4159,11 @@ impl MessageView {
             return;
         }
         // When the user is scrolled back reading history and the store is at cap,
-        // skip the append — no event_index insert either.  The message will appear
-        // on the next bg_refresh incremental pass; nothing is permanently lost.
+        // skip the append. The message will appear on the next bg_refresh
+        // incremental pass; nothing is permanently lost.
         const MAX_STORE_SIZE: u32 = 400;
         if !msg.event_id.is_empty()
-            && gio::prelude::ListModelExt::n_items(&self.imp().list_store()) >= MAX_STORE_SIZE
+            && tl.n_items() >= MAX_STORE_SIZE
             && !self.is_near_bottom()
         {
             tracing::debug!(
@@ -4048,26 +4174,14 @@ impl MessageView {
         }
         tracing::debug!("append_message: adding event_id={:?} sender={} body={:?}", msg.event_id, msg.sender_id, body_preview(&msg.body));
         let obj = Self::info_to_obj(msg, glib::DateTime::now_local().ok().as_ref());
-        let eid = obj.event_id();
-        if !eid.is_empty() {
-            // Pre-insert into event_index immediately so subsequent dedup checks
-            // within the same burst (before the flush idle fires) work correctly.
-            self.imp().event_index.borrow_mut().insert(eid, obj.clone());
-        } else {
-            // Local echo (empty event_id). Bump the echo counter so
-            // patch_echo_event_id's backwards scan is only taken when there
-            // is actually an unpatched echo to look for.
-            let imp = self.imp();
-            imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_add(1));
-        }
         if mark_as_new {
             obj.set_is_new_message(true);
-            self.imp().new_message_objs.borrow_mut().push(obj.clone());
+            imp.new_message_objs.borrow_mut().push(obj.clone());
         }
-        // Defer the list_store mutation to an idle so bursts of NewMessage events
+        // Defer the Timeline mutation to an idle so bursts of NewMessage events
         // (e.g. 8 messages after a sync reconnect) produce one items_changed signal
-        // instead of N separate ones.
-        let imp = self.imp();
+        // instead of N separate ones. Timeline.insert on flush handles dedup and
+        // sort itself — no need to pre-insert into any index here.
         imp.pending_appends.borrow_mut().push(obj);
         if !imp.append_flush_pending.get() {
             imp.append_flush_pending.set(true);
@@ -4080,57 +4194,7 @@ impl MessageView {
         }
     }
 
-    /// Defensive dedup: walk the current room's list_store and remove any
-    /// MessageObject whose event_id has already appeared earlier in the
-    /// same store. Logs an INFO entry with context (room, event_id,
-    /// duplicate count) so recurrences point at the insertion path.
-    ///
-    /// This is a safety net against stealth-duplication paths that haven't
-    /// been fully traced — the dedup checks in `append_message`,
-    /// `set_messages` incremental, and `prepend_messages` each guard their
-    /// own path, but duplicates keep cropping up in field reports where
-    /// the log shows a single clean send yet the UI renders twice. Until
-    /// the exact race is root-caused, auto-healing is better than
-    /// leaving the user with ghost rows.
-    ///
-    /// Echoes (empty event_id) are never deduped — two in-flight echoes
-    /// with the same body are legitimate user intent (tapping Send twice
-    /// is a valid way to repeat a message).
-    fn dedup_list_store(&self, context: &str) {
-        let imp = self.imp();
-        let store = imp.list_store();
-        let n = gio::prelude::ListModelExt::n_items(&store);
-        if n <= 1 { return; }
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(n as usize);
-        // Collect duplicate positions high-to-low so removals don't shift
-        // the indices of entries we haven't inspected yet.
-        let mut dupes_high_to_low: Vec<(u32, String)> = Vec::new();
-        for i in 0..n {
-            let Some(obj) = gio::prelude::ListModelExt::item(&store, i)
-                .and_downcast::<MessageObject>() else { continue };
-            let eid = obj.event_id();
-            if eid.is_empty() { continue; }
-            if !seen.insert(eid.clone()) {
-                dupes_high_to_low.push((i, eid));
-            }
-        }
-        if dupes_high_to_low.is_empty() { return; }
-        // Sort descending so later removals don't shift earlier positions.
-        dupes_high_to_low.sort_by(|a, b| b.0.cmp(&a.0));
-        let count = dupes_high_to_low.len();
-        let sample_eid = dupes_high_to_low.first().map(|(_, e)| e.clone()).unwrap_or_default();
-        tracing::info!(
-            "dedup_list_store: removing {} duplicate row(s) (context={context}, room={}, sample_eid={})",
-            count,
-            imp.current_room_id.borrow(),
-            sample_eid,
-        );
-        for (pos, _) in dupes_high_to_low {
-            store.splice(pos, 1, &[] as &[MessageObject]);
-        }
-    }
-
-    /// Flush all pending appends to the list_store in a single splice call.
+    /// Flush all pending appends to the Timeline in a single insert call.
     /// Called from the idle scheduled by append_message().
     fn flush_pending_appends(&self) {
         const MAX_STORE_SIZE: u32 = 400;
@@ -4140,14 +4204,19 @@ impl MessageView {
         if objs.is_empty() {
             return;
         }
-        let store = imp.list_store();
-        let n = store.n_items();
-        // Single splice appends all queued objects — one items_changed signal.
-        store.splice(n, 0, &objs);
-        // Evict oldest messages from the front to maintain the cap.
-        let new_n = store.n_items();
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return; }
+        let tl = imp.ensure_timeline(&rid);
+        // Timeline.insert handles sort + dedup; multiple queued objects go
+        // through in a batched splice (append_batch inside Timeline).
+        tl.insert(objs);
+        // Evict oldest messages from the front to maintain the cap. We must
+        // not evict an unconfirmed echo, so compute the count of leading
+        // rows with a non-empty event_id, capped at overflow.
+        let new_n = tl.n_items();
         if new_n > MAX_STORE_SIZE {
             let target = new_n - MAX_STORE_SIZE;
+            let store = tl.model();
             let mut evict: u32 = 0;
             for i in 0..target {
                 match store.item(i).and_downcast::<MessageObject>() {
@@ -4156,40 +4225,23 @@ impl MessageView {
                 }
             }
             if evict > 0 {
-                {
-                    let mut idx = imp.event_index.borrow_mut();
-                    for i in 0..evict {
-                        if let Some(o) = store.item(i).and_downcast::<MessageObject>() {
-                            idx.remove(&o.event_id());
-                        }
-                    }
-                }
-                store.splice(0, evict, &[] as &[MessageObject]);
-                tracing::debug!("flush_pending_appends: evicted {} from front, store={}", evict, new_n - evict);
+                let removed = tl.front_evict(evict);
+                tracing::debug!("flush_pending_appends: evicted {} from front, store={}", removed, tl.n_items());
             }
         }
-        self.dedup_list_store("flush_pending_appends");
         if self.is_near_bottom() {
             self.scroll_to_bottom();
         }
     }
 
     /// Patch the event_id on a local echo message once the server confirms it.
-    /// Searches backwards for a MessageObject with empty event_id and matching body.
-    /// Returns true if an echo was found and patched, false otherwise.
+    /// Delegates to `Timeline::patch_echo`, with a fallback that walks the
+    /// pending_appends queue for echoes still waiting for the flush idle.
     pub fn patch_echo_event_id(&self, echo_body: &str, event_id: &str) -> bool {
         let _g = crate::perf::scope_gt("patch_echo_event_id", 200);
         let imp = self.imp();
-        // Previously guarded with `imp.pending_echo_count.get() == 0 →
-        // return false` as a fast-path. The counter is approximate
-        // (it can drift between its expected value and reality when
-        // echoes are evicted by MAX_STORE_SIZE cap, when a message is
-        // patched via MessageSent and then NewMessage arrives with a
-        // different body variant, or when the user double-taps send)
-        // and the short-circuit caused visible duplicate own-messages.
-        // Correctness over speculative perf: always run the backwards
-        // scan here — in a typical session it exits at the first
-        // non-empty-event_id row near the tail (O(1) in practice).
+        let rid = imp.current_room_id.borrow().clone();
+        if rid.is_empty() { return false; }
         // Normalise the incoming body by stripping any Matrix reply fallback
         // ("> <@sender> quoted\n\nreal body"). The stored body on the local
         // echo MessageObject was stripped in info_to_obj; the server echo
@@ -4201,33 +4253,31 @@ impl MessageView {
         // "> ", so this is cheap for the common non-reply case.
         let normalized = crate::widgets::message_row::strip_reply_fallback(echo_body);
         let echo_body: &str = &normalized;
-        let n = gio::prelude::ListModelExt::n_items(&imp.list_store());
-        tracing::debug!("patch_echo_event_id: searching n={} for body={:?} event_id={}", n, body_preview(echo_body), event_id);
-        // Local echo search — echos have empty event_id and are near the end.
-        // This is a backwards scan over items to process (finding the echo),
-        // not a lookup of a known key — acceptable per the no-loops policy.
-        for i in (0..n).rev() {
-            let Some(obj) = gio::prelude::ListModelExt::item(&imp.list_store(), i) else { continue };
-            let Some(msg) = obj.downcast_ref::<MessageObject>() else { continue };
-            if msg.event_id().is_empty() && msg.body() == echo_body {
-                tracing::info!("patch_echo_event_id: patched echo at pos={} body={:?} → {}", i, body_preview(echo_body), event_id);
-                // set_event_id fires notify::event-id on the MessageObject;
-                // every MessageRow bound to this msg has an event_id_handler
-                // that refreshes its cached `imp.event_id`. The previous
-                // implementation walked the widget tree to find a row to
-                // rebind, but with off-screen recycled rows that walk
-                // routinely picked the wrong row, leaving the visible row's
-                // cache stale and breaking edit/delete/react clicks.
-                msg.set_event_id(event_id.to_string());
-                tracing::info!(
-                    "edit-diag: patch_echo set_event_id done; msg.event_id()={:?}",
-                    msg.event_id()
-                );
-                imp.pending_echo_count.set(imp.pending_echo_count.get().saturating_sub(1));
-                imp.event_index.borrow_mut().insert(event_id.to_string(), msg.clone());
-                return true;
-            } else if msg.event_id().is_empty() {
-                tracing::debug!("patch_echo_event_id: found echo at pos={} with DIFFERENT body={:?} (wanted {:?})", i, body_preview(&msg.body()), body_preview(echo_body));
+        let tl = imp.ensure_timeline(&rid);
+        if tl.patch_echo(echo_body, event_id) {
+            tracing::info!(
+                "patch_echo_event_id: patched echo via Timeline body={:?} → {}",
+                body_preview(echo_body), event_id
+            );
+            return true;
+        }
+        // Fall back to pending_appends — append_message defers the insert to
+        // idle, so for a fast homeserver round-trip (or sync delivering the
+        // self-echo before MessageSent fires) the local echo can still be in
+        // the queue when we get here. Without this scan we declare "NO echo
+        // found", and the NewMessage handler appends the server copy as a
+        // new row → the user sees their own message twice once the queue
+        // finally flushes. Patching the in-queue MessageObject is sufficient
+        // because flush_pending_appends inserts the same object into the
+        // Timeline; the patched event_id rides along.
+        {
+            let pending = imp.pending_appends.borrow();
+            for msg in pending.iter().rev() {
+                if msg.event_id().is_empty() && msg.body() == echo_body {
+                    tracing::info!("patch_echo_event_id: patched pending echo body={:?} → {}", body_preview(echo_body), event_id);
+                    msg.set_event_id(event_id.to_string());
+                    return true;
+                }
             }
         }
         tracing::warn!("patch_echo_event_id: NO echo found for body={:?} event_id={}", body_preview(echo_body), event_id);
@@ -4237,8 +4287,8 @@ impl MessageView {
     /// Check if a message with the given event_id already exists in the timeline.
     pub fn has_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() { return false; }
-        // O(1) lookup via event_index.
-        self.imp().event_index.borrow().contains_key(event_id)
+        // O(1) lookup via Timeline's event_index.
+        self.current_timeline_lookup(event_id).is_some()
     }
 
     /// True when the scroll position is within `threshold` pixels of the bottom.
