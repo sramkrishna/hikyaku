@@ -431,9 +431,15 @@ fn main() {
     // to 60Hz effective on a 120Hz display with occasional 125ms stalls.
     // Explicit vulkan removes the offscreen-fallback path and restores
     // smooth scroll. User override always wins (checked env first).
-    if std::env::var_os("GSK_RENDERER").is_none() {
+    let gsk_was_set = std::env::var_os("GSK_RENDERER").is_some();
+    if !gsk_was_set {
         std::env::set_var("GSK_RENDERER", "vulkan");
     }
+    let gsk_now = std::env::var("GSK_RENDERER").unwrap_or_default();
+    eprintln!(
+        "hikyaku: GSK_RENDERER={gsk_now} (pre_set_by_env={gsk_was_set}); \
+         look for `Using renderer '…'` from GSK_DEBUG=renderer to confirm GTK honored it"
+    );
 
     // Default RUST_BACKTRACE=1 on beta — flatpak crashes on user machines
     // give us no stderr by default, so a backtrace in the log is the

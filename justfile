@@ -102,6 +102,40 @@ debug-flatpak:
         --env=GSK_DEBUG=full-redraw \
         {{ app_id }}/x86_64/beta 2>&1 | tee /tmp/hikyaku.log
 
+# Use this when the jitter / bug is visible but a plain `cargo run` log
+# doesn't explain it.  Runs the LOCAL debug binary (not flatpak) so
+# `just profile` can attach via sysprof — flatpak's container hides the
+# process from the host's perf events.
+#
+# Env vars set:
+#   RUST_BACKTRACE=full            → Rust frames in any abort backtrace
+#   RUST_LOG=hikyaku=info          → tracing::info! incl. scroll-diag:
+#   G_DEBUG=fatal-criticals        → abort on first GLib/GTK CRITICAL,
+#                                    so we get a backtrace at the bad
+#                                    call site instead of just symptoms
+#   GSK_DEBUG=full-redraw,fallback → full-redraw flashes the window red
+#                                    on every full repaint (vs. damage
+#                                    repaint); fallback logs GPU→CPU
+#                                    fallbacks (driver / node-type bug)
+#   GDK_DEBUG=frames               → per-frame wall-clock from GDK,
+#                                    including compositor round-trip
+#                                    latency.  Use to spot missed
+#                                    frame deadlines (>16.6 ms at 60Hz)
+#
+# Pair with `just profile` in another terminal to also capture the CPU
+# call graph — they run against the same local binary so both attach.
+#
+# Run local debug binary with render-path diagnostics — for jitter / pagination.
+debug-render:
+    cargo build
+    RUST_BACKTRACE=full \
+    RUST_LOG=hikyaku=info \
+    G_DEBUG=fatal-criticals \
+    GSK_RENDERER=vulkan \
+    GSK_DEBUG=renderer,full-redraw \
+    GDK_DEBUG=frames \
+        ./target/debug/hikyaku 2>&1 | tee /tmp/hikyaku.log
+
 # Uninstall the user-installed flatpak
 flatpak-uninstall:
     flatpak uninstall --user {{ app_id }}
