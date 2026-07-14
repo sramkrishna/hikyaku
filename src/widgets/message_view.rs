@@ -3631,14 +3631,24 @@ impl MessageView {
             let escaped = gtk::glib::markup_escape_text(&body).to_string();
             obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
         } else {
-            // HTML-bodied msg: leave rendered_markup as plain-text fallback for
-            // now, and mark the msg as needing markup. The markup worker
-            // enqueue happens lazily at row-bind time — msgs that never enter
-            // the viewport (deep history the user paginates past) never pay
-            // for html_to_pango. Just-in-time work only.
+            // HTML-bodied msg: show a plain-text fallback immediately (so the
+            // row has content the moment it binds) and hand the HTML off to
+            // the background markup worker. The worker chews html_to_pango
+            // off the GTK thread and delivers via notify::rendered-markup;
+            // MessageView's central shepherd (see request_pending_markup_refresh)
+            // coordinates when to re-render the visible viewport so async
+            // deliveries don't fight the user's scroll.
+            //
+            // Eager enqueue at construction is intentional. An earlier
+            // just-in-time attempt (enqueue only at row-bind) meant the user
+            // hit worker latency AS they scrolled into new content — perceived
+            // as jitter. Warming the worker at load time (bg_refresh /
+            // prepend_messages) means rendered_markup is usually ready by the
+            // time the row is bound. Timeline caps its store at ~400 rows so
+            // this doesn't unbound-grow the worker queue.
             let escaped = gtk::glib::markup_escape_text(&body).to_string();
             obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
-            obj.set_needs_markup(true);
+            crate::markup_worker::try_enqueue(&obj, formatted_body.to_string());
         }
         obj.set_sender_markup(crate::widgets::message_row::prerender_sender_markup(&m.sender, &m.sender_id));
         obj.set_reactions_hash(fnv1a_str(&reactions_json));

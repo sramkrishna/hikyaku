@@ -1319,13 +1319,11 @@ impl MessageRow {
         let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
 
-        // Just-in-time HTML markup: enqueue the worker only when the row is
-        // actually being bound (i.e. GtkListView is about to display this
-        // msg). Msgs paginated deep into history that the user never scrolls
-        // to never pay for html_to_pango. The needs_markup flag is set true
-        // in info_to_obj for HTML-bearing msgs and cleared here on enqueue
-        // (defensive: also cleared in markup_worker::apply_result) so a
-        // rebind for the same msg doesn't re-queue.
+        // Defensive worker enqueue: if a msg somehow lands here with needs_markup
+        // still true (a code path that skipped info_to_obj's eager enqueue), get
+        // the worker started rather than showing plain-text fallback forever.
+        // Normal load paths clear this at construction; this branch effectively
+        // dead in a healthy tree, kept as a safety net.
         if msg.needs_markup() {
             let fb = msg.formatted_body();
             if !fb.is_empty() {
