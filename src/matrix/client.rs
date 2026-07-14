@@ -466,9 +466,17 @@ pub enum MatrixCommand {
     /// Request verification of our own device from another session.
     RequestSelfVerification,
     /// Fetch older messages for a room (pagination).
+    ///
+    /// `oldest_known_ts` is the timestamp (seconds since epoch) of the oldest
+    /// message currently in the UI's store. The matrix client loops
+    /// `room.messages()` from `from_token` until it gets a chunk whose oldest
+    /// event is older than this — short-circuiting the "token points partway
+    /// into our existing data" overlap that previously caused 45-of-48 dedups
+    /// per call. None means the UI has no messages yet (skip the loop).
     FetchOlderMessages {
         room_id: String,
         from_token: String,
+        oldest_known_ts: Option<u64>,
     },
     /// Import secrets using a recovery key or passphrase.
     RecoverKeys { recovery_key: String },
@@ -1281,8 +1289,8 @@ async fn matrix_task(
                             &client, &event_tx, &vs,
                         ).await;
                     }
-                    Ok(MatrixCommand::FetchOlderMessages { room_id, from_token }) => {
-                        handle_fetch_older(&client, &event_tx, &room_id, &from_token).await;
+                    Ok(MatrixCommand::FetchOlderMessages { room_id, from_token, oldest_known_ts }) => {
+                        handle_fetch_older(&client, &event_tx, &room_id, &from_token, oldest_known_ts).await;
                     }
                     Ok(MatrixCommand::RecoverKeys { recovery_key }) => {
                         super::encryption::handle_recover_keys(&client, &event_tx, &recovery_key, &timeline_cache).await;
@@ -4546,6 +4554,7 @@ async fn handle_fetch_older(
     event_tx: &Sender<MatrixEvent>,
     room_id: &str,
     from_token: &str,
+    oldest_known_ts: Option<u64>,
 ) {
     use matrix_sdk::ruma::UInt;
 
@@ -4557,41 +4566,117 @@ async fn handle_fetch_older(
     };
 
     use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
-    let mut msg_filter = RoomEventFilter::default();
-    // Reactions excluded for the same reason as the initial fetch: they count
-    // against the limit but produce no visible messages.
-    msg_filter.types = Some(vec![
-        "m.room.message".to_string(),
-        "m.room.encrypted".to_string(),
-    ]);
-    let mut options = matrix_sdk::room::MessagesOptions::backward();
-    options.limit = UInt::from(50u32);
-    options.from = Some(from_token.to_string());
-    options.filter = msg_filter;
-
-    let (messages, prev_batch_token) = match room.messages(options).await {
-        Ok(response) => {
-            let chunk_len = response.chunk.len();
-            let msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
-            let token = response.end.map(|t| t.to_string());
-            tracing::info!(
-                "scroll-diag: FetchOlder {room_id} chunk={chunk_len} extracted={} end_token={}",
-                msgs.len(),
-                if token.is_some() { "Some" } else { "None" }
-            );
-            (msgs, token)
-        }
-        Err(e) => {
-            tracing::error!("Failed to fetch older messages for {room_id}: {e}");
-            (Vec::new(), None)
-        }
+    let make_filter = || {
+        let mut f = RoomEventFilter::default();
+        // Reactions excluded for the same reason as the initial fetch: they
+        // count against the limit but produce no visible messages.
+        f.types = Some(vec![
+            "m.room.message".to_string(),
+            "m.room.encrypted".to_string(),
+        ]);
+        f
     };
+
+    // Loop the server-side pagination until we get genuinely older events.
+    //
+    // Why: the initial bg_refresh merges the server's fresh chunk (typically
+    // 100 events) with whatever the in-memory cache had — but the
+    // prev_batch_token is the SERVER's end token, which only accounts for the
+    // server's chunk. If the memory cache contains messages older than the
+    // server's chunk (common during a long-lived session), the token points
+    // partway into our existing data. The first pagination then returns
+    // mostly events we already have (logs showed 45-of-48 dedups per call).
+    //
+    // Loop drives `room.messages()` forward through history with the running
+    // end token until the chunk's OLDEST event is older than what the UI
+    // already has. Cap at MAX_ITER so a pathological room (sparse history,
+    // pure-overlap chunks) can't spin forever.
+    const MAX_ITER: u32 = 5;
+    const PER_CALL_LIMIT: u32 = 50;
+
+    let mut accumulated: Vec<crate::matrix::MessageInfo> = Vec::new();
+    let mut current_token = from_token.to_string();
+    let mut final_token: Option<String> = None;
+    let mut iter = 0u32;
+    let mut total_chunk_len = 0usize;
+    let mut last_token_was_none = false;
+
+    while iter < MAX_ITER {
+        iter += 1;
+        let mut options = matrix_sdk::room::MessagesOptions::backward();
+        options.limit = UInt::from(PER_CALL_LIMIT);
+        options.from = Some(current_token.clone());
+        options.filter = make_filter();
+
+        let response = match room.messages(options).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to fetch older messages for {room_id}: {e}");
+                break;
+            }
+        };
+        let chunk_len = response.chunk.len();
+        total_chunk_len += chunk_len;
+        let chunk_msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
+        let next_token = response.end.map(|t| t.to_string());
+
+        // Track the oldest timestamp we saw in this chunk to decide
+        // whether to loop again.
+        let chunk_oldest_ts = chunk_msgs.iter().map(|m| m.timestamp).min();
+        accumulated.extend(chunk_msgs);
+        final_token = next_token.clone();
+
+        let should_continue = match (oldest_known_ts, chunk_oldest_ts, &next_token) {
+            // No token to continue with → stop (history exhausted in this dir).
+            (_, _, None) => {
+                last_token_was_none = true;
+                false
+            }
+            // UI has no messages yet → one call is enough.
+            (None, _, _) => false,
+            // Chunk was empty → nothing useful; still try one more with the
+            // new token, the server occasionally returns empty chunks with a
+            // forward-progressing end token.
+            (Some(_), None, Some(_)) => true,
+            // Chunk's oldest is already older than what UI has → genuinely
+            // new territory, return.
+            (Some(known), Some(oldest), Some(_)) if oldest < known => false,
+            // Chunk is still inside the UI's range → loop with new token.
+            (Some(_), Some(_), Some(tok)) => {
+                current_token = tok.clone();
+                true
+            }
+        };
+
+        if !should_continue {
+            break;
+        }
+    }
+
+    // Log the oldest/newest timestamps in the accumulated batch so we can
+    // tell whether the server is genuinely walking backward in time or
+    // just re-returning the same window. If pagination is "stuck", these
+    // values would stay roughly constant across successive fetches even
+    // though end_token is Some — that points at a server-side gap, a
+    // tombstone, or a known matrix-rust-sdk limitation rather than our
+    // UI.
+    let (oldest_ts, newest_ts) = accumulated
+        .iter()
+        .fold((u64::MAX, 0u64), |(o, n), m| (o.min(m.timestamp), n.max(m.timestamp)));
+    tracing::info!(
+        "scroll-diag: FetchOlder {room_id} iters={iter} total_chunk={total_chunk_len} \
+         extracted={} end_token={} oldest_ts={} newest_ts={}",
+        accumulated.len(),
+        if last_token_was_none { "None" } else { "Some" },
+        if accumulated.is_empty() { 0 } else { oldest_ts },
+        newest_ts,
+    );
 
     let _ = event_tx
         .send(MatrixEvent::OlderMessages {
             room_id: room_id.to_string(),
-            messages,
-            prev_batch_token,
+            messages: accumulated,
+            prev_batch_token: final_token,
         })
         .await;
 }
