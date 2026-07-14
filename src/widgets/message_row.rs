@@ -184,6 +184,15 @@ mod imp {
         /// without this notify, the row keeps its stale empty cache and the
         /// edit/delete/react buttons fire with `event_id=""`.
         pub event_id_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
+        /// Handler for notify::reactions-json — rebuilds the reaction pills
+        /// whenever the bound MessageObject's reactions change. Without this,
+        /// live reactions arriving via sync (add_reaction, apply_reaction_in_room,
+        /// toggle_reaction) only render if update_message_in_place's walk finds
+        /// the visible row. Off-screen rows and rooms cached in the ListView
+        /// stack (where GtkListView doesn't refire bind on show) miss the update.
+        /// A reactive handler makes reactions render deterministically regardless
+        /// of scroll position or room switch.
+        pub reactions_handler: std::cell::RefCell<Option<(glib::Object, glib::SignalHandlerId)>>,
         /// Last two event_ids this row was bound to, oldest first. When the
         /// new bind matches `bind_history[0]` and the entries differ, GTK is
         /// recycling this widget between two adjacent items in a feedback
@@ -855,8 +864,13 @@ thread_local! {
         std::cell::Cell::new(false);
 }
 
-/// Queue an async-markup apply to run after a 500 ms scroll-quiet window.
-/// Multiple calls before the timer fires share the same drain pass.
+/// Queue an async-markup apply that will drain during a scroll-quiet window.
+/// The drain re-checks scroll activity when it fires; if the user is still
+/// scrolling, it defers itself another 300ms. This prevents the "little jumps"
+/// pattern where a periodic 500ms drain would keep firing mid-scroll and each
+/// batched set_markup would re-measure rows during kinetic decay. Only drains
+/// once scroll has been quiet for the full window — then all pending applies
+/// land in one layout pass instead of scattered ones.
 fn schedule_coalesced_markup_apply(row: &MessageRow, eid: String, markup: String) {
     PENDING_MARKUP_APPLIES.with(|p| {
         p.borrow_mut().push((row.downgrade(), eid, markup));
@@ -865,7 +879,31 @@ fn schedule_coalesced_markup_apply(row: &MessageRow, eid: String, markup: String
     if already {
         return;
     }
-    glib::timeout_add_local_once(std::time::Duration::from_millis(500), || {
+    schedule_markup_drain_attempt();
+}
+
+/// Try to drain pending markups. If scroll is active, reschedule another
+/// attempt. Called from schedule_coalesced_markup_apply and from itself
+/// (re-scheduling on scroll conflict). Keeps MARKUP_DRAIN_SCHEDULED true
+/// throughout the retry chain so parallel notify bursts don't spawn a second
+/// drain lane.
+fn schedule_markup_drain_attempt() {
+    glib::timeout_add_local_once(std::time::Duration::from_millis(300), || {
+        // Re-check scroll activity: if the user is still scrolling (input within
+        // the last 300ms), defer another 300ms. Applying markup mid-scroll shows
+        // up as row-height changes during kinetic decay → visible jumps.
+        let scroll_active = PENDING_MARKUP_APPLIES.with(|p| {
+            p.borrow().first().and_then(|(row_weak, _, _)| row_weak.upgrade())
+        }).and_then(|row| {
+            row.ancestor(crate::widgets::MessageView::static_type())
+                .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok())
+        }).and_then(|v| v.imp().last_user_scroll_at.get().map(|t| t.elapsed()))
+            .map(|d| d < std::time::Duration::from_millis(300))
+            .unwrap_or(false);
+        if scroll_active {
+            schedule_markup_drain_attempt();
+            return;
+        }
         MARKUP_DRAIN_SCHEDULED.with(|c| c.set(false));
         let pending: Vec<_> = PENDING_MARKUP_APPLIES.with(|p| {
             p.borrow_mut().drain(..).collect()
@@ -1427,7 +1465,12 @@ impl MessageRow {
             hist[0] = prev_last;
         }
         if oscillating {
-            tracing::info!(
+            // Demoted to debug: during a scroll storm this fires hundreds of
+            // times per second from the GTK thread, and the synchronous
+            // stderr writes were measurable as additional jitter (similar
+            // to the per-bind diag fix in 762238f). Re-enable with
+            // RUST_LOG=hikyaku=debug when investigating new osc paths.
+            tracing::debug!(
                 "scroll-diag: bind oscillation detected on row eid={new_eid:?}; \
                  skipping bind entirely to break height feedback loop"
             );
@@ -1464,6 +1507,35 @@ impl MessageRow {
         // info to keep the hot path quiet; re-enable with
         // RUST_LOG=hikyaku=debug when the diagnostic is needed.
         *imp.event_id_handler.borrow_mut() = Some((msg.clone().upcast(), eid_handler));
+
+        // Reactive reactions rendering — fires on every reactions_json mutation
+        // (add_reaction, apply_reaction_in_room, toggle_reaction). Without this,
+        // reactions only render when update_message_in_place's row walk finds
+        // the visible row. Off-screen rows and stack-cached rooms miss the
+        // update, so reactions appear stale until the next rebind. This handler
+        // makes the pill rebuild fire regardless of scroll position or room
+        // visibility.
+        if let Some((obj, id)) = imp.reactions_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        let rx_handler = msg.connect_notify_local(Some("reactions-json"), {
+            let row_weak = self.downgrade();
+            let bound_eid = msg.event_id();
+            move |obj, _| {
+                use crate::models::MessageObject;
+                let (Some(row), Some(msg)) = (row_weak.upgrade(), obj.downcast_ref::<MessageObject>())
+                    else { return; };
+                // Guard against stale handlers from an oscillating bind — the
+                // handler is disconnected on the NEXT non-oscillating bind, but
+                // if the row was recycled to a different item in between, the
+                // notify would render the old msg's reactions on the new row.
+                // Compare the row's currently-bound event_id against this
+                // handler's original binding.
+                if *row.imp().event_id.borrow() != bound_eid { return; }
+                row.rebuild_reactions_pills(msg);
+            }
+        });
+        *imp.reactions_handler.borrow_mut() = Some((msg.clone().upcast(), rx_handler));
 
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
         let reply_label = msg.reply_label();
@@ -1527,60 +1599,7 @@ impl MessageRow {
         }
 
         // Reactions — O(1) hash check, full rebuild only when reactions changed.
-        // Rebuild reuses pooled gtk::Label widgets in-place (see reaction_pills
-        // in imp) rather than constructing new ones; GTK widget allocation is
-        // the expensive path, so we grow the pool only when a row needs more
-        // pills than any previous bind demanded.
-        let reactions_hash = msg.reactions_hash();
-        let prev_hash = imp.last_reactions_hash.get();
-        if prev_hash != reactions_hash {
-            let _g = crate::perf::scope("bind::reactions_rebuild");
-            imp.last_reactions_hash.set(reactions_hash);
-            let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
-                &msg.reactions_json()
-            ).unwrap_or_default();
-
-            let mut pills = imp.reaction_pills.borrow_mut();
-            let need = reactions.len();
-            let pool_before = pills.len();
-            while pills.len() < need {
-                let pill = gtk::Label::builder()
-                    .css_classes(["reaction-pill"])
-                    .build();
-                imp.reactions_box.append(&pill);
-                pills.push(pill);
-            }
-
-            for (i, (emoji, count, names)) in reactions.iter().enumerate() {
-                let label = if *count > 1 {
-                    format!("{emoji} {count}")
-                } else {
-                    emoji.clone()
-                };
-                let tooltip = names.join(", ");
-                let a11y_label = if *count > 1 {
-                    format!("{count} reactions: {emoji}. From: {tooltip}")
-                } else {
-                    format!("Reaction: {emoji}. From: {tooltip}")
-                };
-                let pill = &pills[i];
-                pill.set_label(&label);
-                pill.set_tooltip_text(Some(&tooltip));
-                pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
-                pill.set_visible(true);
-            }
-            for pill in pills.iter().skip(need) {
-                pill.set_visible(false);
-            }
-            let box_visible = need > 0;
-            imp.reactions_box.set_visible(box_visible);
-            let eid_for_log = imp.event_id.borrow().clone();
-            let parent_visible = imp.reactions_box.parent().map(|p| p.is_visible()).unwrap_or(false);
-            let row_mapped = self.is_mapped();
-            tracing::info!(
-                "reactions-diag: rebuild eid={eid_for_log} prev_hash={prev_hash} new_hash={reactions_hash} need={need} pool_before={pool_before} box_visible={box_visible} parent_visible={parent_visible} row_mapped={row_mapped}"
-            );
-        }
+        self.rebuild_reactions_pills(msg);
         // The skip case (hash unchanged → no rebuild) used to log here at
         // info, but it fires on every bind in a scroll storm (200+/sec)
         // and the volume of stderr writes was itself contributing to
@@ -1845,14 +1864,30 @@ impl MessageRow {
             let markup = msg.rendered_markup();
             if markup.is_empty() { return; }
 
-            // If the user is actively scrolling, defer the apply.
-            // set_markup changes the label's measured text → row
-            // height re-measure → vadj jitter. We schedule the apply
-            // for 500 ms later and let the row's next bind (or this
-            // delayed call) refresh the label when the user pauses.
-            // Walk up the widget tree to find the MessageView so we
-            // can read its last_user_scroll_at.
             use gtk::prelude::*;
+
+            // Off-screen rows: don't apply now. The row is bound but
+            // not currently composited into the viewport (pool slot
+            // ahead/behind the visible window). Paying Pango layout
+            // for an invisible row still costs GTK-thread time and
+            // shows up in the next frame's layout pass — which lands
+            // exactly when the user is scrolling those rows into
+            // view. Bind reads rendered_markup directly when this
+            // row's slot is next recycled to display this message,
+            // so dropping the apply here is safe: the markup still
+            // ends up on the label, just at bind time when we
+            // already paid layout cost.
+            if !row.is_mapped() {
+                return;
+            }
+
+            // Visible row: if the user is actively scrolling, defer
+            // so set_markup doesn't trigger a row-height change mid-
+            // scroll. last_user_scroll_at is bumped on every wheel /
+            // touchpad event AND on every vadj-value change from
+            // kinetic decay (see MessageView wiring), so this gate
+            // stays held through the kinetic phase, not just the
+            // input phase.
             let view_anc = row.ancestor(crate::widgets::MessageView::static_type())
                 .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok());
             let scroll_active = view_anc.as_ref().and_then(|v| {
@@ -1860,22 +1895,84 @@ impl MessageRow {
             }).map(|d| d < std::time::Duration::from_millis(500))
                 .unwrap_or(false);
 
-            if scroll_active {
-                schedule_coalesced_markup_apply(&row, bound_eid.clone(), markup);
-                return;
-            }
-
-            tracing::info!(
-                "scroll-diag: async markup applied eid={} markup_len={}",
-                bound_eid, markup.len()
-            );
-            row.imp().body_label.set_markup(&markup);
-            row.imp().body_label.set_visible(true);
+            // Route ALL applies through the coalescing drain — even when the
+            // user isn't scrolling. The markup worker delivers messages in
+            // bursts (30+ formatted bodies over ~2s after set_messages loads
+            // a room), and applying each set_markup as it arrives forces one
+            // GTK layout pass per delivery — visible as small row-height jumps
+            // stacking up. The drain batches whatever landed in its window
+            // into one layout pass. When scroll IS active, the drain re-checks
+            // and defers until scroll settles, so applies never happen during
+            // kinetic decay. Cost: up to 300ms of plain-text fallback visible
+            // after msg first binds. Acceptable — the fallback is legible.
+            let _ = scroll_active; // no longer branches, but keep the diag intent
+            schedule_coalesced_markup_apply(&row, bound_eid.clone(), markup);
         });
         *self.imp().markup_handler.borrow_mut() = Some((msg.clone().upcast(), mu_id));
     }
 
     /// Disconnect and clear the `notify::is-flashing` handler from the bound MessageObject.
+    /// Reuse pooled reaction pill labels to render the current reactions_json.
+    /// Called from bind (initial render) and from the notify::reactions-json
+    /// handler (live updates arriving via sync or local echo). Skips work when
+    /// the reactions_hash matches the last-rendered hash — reactions rebuild
+    /// costs measurable time on a scroll storm and rebinding the same content
+    /// is a no-op.
+    fn rebuild_reactions_pills(&self, msg: &crate::models::MessageObject) {
+        let imp = self.imp();
+        let reactions_hash = msg.reactions_hash();
+        let prev_hash = imp.last_reactions_hash.get();
+        if prev_hash == reactions_hash { return; }
+        let _g = crate::perf::scope("bind::reactions_rebuild");
+        imp.last_reactions_hash.set(reactions_hash);
+        let reactions = serde_json::from_str::<Vec<(String, u64, Vec<String>)>>(
+            &msg.reactions_json()
+        ).unwrap_or_default();
+
+        let mut pills = imp.reaction_pills.borrow_mut();
+        let need = reactions.len();
+        let pool_before = pills.len();
+        while pills.len() < need {
+            let pill = gtk::Label::builder()
+                .css_classes(["reaction-pill"])
+                .build();
+            imp.reactions_box.append(&pill);
+            pills.push(pill);
+        }
+
+        for (i, (emoji, count, names)) in reactions.iter().enumerate() {
+            let label = if *count > 1 {
+                format!("{emoji} {count}")
+            } else {
+                emoji.clone()
+            };
+            let tooltip = names.join(", ");
+            let a11y_label = if *count > 1 {
+                format!("{count} reactions: {emoji}. From: {tooltip}")
+            } else {
+                format!("Reaction: {emoji}. From: {tooltip}")
+            };
+            let pill = &pills[i];
+            pill.set_label(&label);
+            pill.set_tooltip_text(Some(&tooltip));
+            pill.update_property(&[gtk::accessible::Property::Label(&a11y_label)]);
+            pill.set_visible(true);
+        }
+        for pill in pills.iter().skip(need) {
+            pill.set_visible(false);
+        }
+        let box_visible = need > 0;
+        imp.reactions_box.set_visible(box_visible);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let eid_for_log = imp.event_id.borrow().clone();
+            let parent_visible = imp.reactions_box.parent().map(|p| p.is_visible()).unwrap_or(false);
+            let row_mapped = self.is_mapped();
+            tracing::debug!(
+                "reactions-diag: rebuild eid={eid_for_log} prev_hash={prev_hash} new_hash={reactions_hash} need={need} pool_before={pool_before} box_visible={box_visible} parent_visible={parent_visible} row_mapped={row_mapped}"
+            );
+        }
+    }
+
     pub fn clear_flash_handler(&self) {
         if let Some((obj, id)) = self.imp().flash_handler.borrow_mut().take() {
             obj.disconnect(id);
@@ -1890,6 +1987,9 @@ impl MessageRow {
             obj.disconnect(id);
         }
         if let Some((obj, id)) = self.imp().event_id_handler.borrow_mut().take() {
+            obj.disconnect(id);
+        }
+        if let Some((obj, id)) = self.imp().reactions_handler.borrow_mut().take() {
             obj.disconnect(id);
         }
     }
