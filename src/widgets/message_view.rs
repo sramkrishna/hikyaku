@@ -3388,23 +3388,45 @@ impl MessageView {
         }
         tl.set_prev_batch_token(prev_batch);
 
-        // Anchor-based scroll restore. Before the splice the user was
-        // looking at the previously-topmost item (they had scrolled to the
-        // top to trigger pagination). That item is now at position
-        // n_prepended. Ask GtkListView to make it visible — it internally
-        // measures rows as needed and positions accurately, without the
-        // vadj-value heuristics that used to leave the user stranded at
-        // position 0 whenever GTK hadn't yet grown `upper` to account for
-        // the prepended content. Uses ScrollFlags::NONE (no select/focus),
-        // scroll_info=None (default alignment — minimal scroll to make
-        // visible; since the anchor is above the current viewport top, GTK
-        // pins it to the viewport top).
-        let _ = (old_upper, old_value); // heuristic locals no longer used
-        let lv = imp.list_view();
-        let anchor_pos = n_prepended as u32;
+        // Scroll restore — shift vadj.value by the estimated added-content
+        // height so the user's CURRENT visible content stays put.
+        //
+        // Previously we called list_view.scroll_to(n_prepended, NONE, None),
+        // which anchors to the item that was topmost at pagination-trigger
+        // time. Problem: the round-trip takes 1-2s, and the user typically
+        // scrolls further UP during that window. When the response lands
+        // and scroll_to fires, it SNAPS the user back to the trigger-time
+        // anchor — reported as "scroll goes forward 10-12 msgs, then
+        // resets back by 7-9". The reset delta = distance user scrolled
+        // during the round-trip.
+        //
+        // Fix: read vadj.value AT IDLE TIME (i.e., the user's current
+        // position, not the stale trigger-time snapshot). Shift by the
+        // estimated added height so visible content stays exactly where
+        // the user is looking, whether or not they scrolled during the
+        // round-trip. The estimate comes from the room's own per-row
+        // average of already-measured content (clamped 40–300px), so
+        // rooms with tall or short msgs both track correctly.
+        let pre_splice_n = if n_prepended > 0 {
+            tl.n_items() - n_prepended as u32
+        } else { 0 };
+        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
+            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
+        } else { 60.0 };
+        let sw = imp.scrolled_window().clone();
+        let expected_added = n_prepended as f64 * per_row_est;
         glib::idle_add_local_once(move || {
-            if anchor_pos > 0 {
-                lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
+            let vadj = sw.vadjustment();
+            // Live vadj.value — reflects any scrolling that happened
+            // during the pagination round-trip. Never snap back to the
+            // stale trigger-time value.
+            let cur_value = vadj.value();
+            // If GtkListView already auto-shifted vadj to keep visible
+            // content stable (delta >= half the expected added height),
+            // don't double-shift. Otherwise, add the estimate.
+            let observed_delta = cur_value - old_value;
+            if observed_delta < expected_added * 0.5 {
+                vadj.set_value(cur_value + expected_added);
             }
         });
 
