@@ -527,24 +527,22 @@ mod imp {
                     // a real cooldown expiry fires a fresh fetch.
                     if dy < 0.0 && *imp.current_room_id.borrow() == input_rid {
                         let vadj = imp.scrolled_window().vadjustment();
-                        // Prefetch on approach — trigger backpagination when
-                        // scrolled into the top viewport-height's worth of
-                        // content, not only at the exact top. By the time the
-                        // user actually reaches the top, the server round-trip
-                        // has usually completed and the messages splice in
-                        // without a visible stall. Falls back to a fixed
-                        // threshold when page_size is 0 (early startup).
-                        let page = vadj.page_size();
-                        let threshold = if page > 0.0 { page } else { 400.0 };
-                        let near_top = vadj.value() < threshold;
+                        // Small proximity buffer (200px ~ 3 rows) — fires just
+                        // before hitting the exact top so the server round-trip
+                        // begins slightly earlier, without triggering pagination
+                        // cascades on scroll approach. The previous full-
+                        // viewport threshold caused unusable scroll during
+                        // backlog reads because each pagination shifted content
+                        // while the user was still scrolling.
+                        let near_top = vadj.value() < 200.0;
                         let fetching = imp.fetching_older.get();
                         let has_token = imp.timelines.borrow().get(&input_rid)
                             .map(|t| t.has_prev_batch()).unwrap_or(false);
                         if near_top && !fetching && has_token {
                             tracing::info!(
                                 "scroll-diag: input-driven backpaginate room={input_rid} \
-                                 value={:.1} threshold={:.1} n_items={}",
-                                vadj.value(), threshold, imp.list_store().n_items()
+                                 value={:.1} n_items={}",
+                                vadj.value(), imp.list_store().n_items()
                             );
                             imp.fetching_older.set(true);
                             if let Some(ref cb) = *imp.on_scroll_top.borrow() {
@@ -3343,19 +3341,16 @@ impl MessageView {
             vadj.set_value(target);
         });
 
-        // Cooldown for cascade suppression. Originally 3000ms after a user
-        // capture showed pagination cascades exhausting GTK's height-estimator
-        // and triggering bind-oscillation storms in the pre-Timeline days. That
-        // storm class is gone now — Timeline's bulk splices (evict_range +
-        // single-pass replace_all) and invariant-preserving inserts eliminated
-        // the row measurement thrash that used to compound. 300ms is enough to
-        // debounce the post-splice vadj bounce (0→N→0 as GTK reconciles) and
-        // still feels snappy when the user scrolls up multiple pages in
-        // succession. Combined with the "prefetch on approach" scroll trigger,
-        // consecutive pagination should now be limited by server round-trip,
-        // not this latch.
+        // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
+        // user report that the shorter cooldown combined with an aggressive
+        // prefetch threshold made backlog reading unusable — pagination fired
+        // on every scroll tick and each splice+scroll_restore fought the
+        // user's scroll input. Half the old 3000ms because Timeline's bulk
+        // splices (evict_range / replace_all) no longer trigger the bind-
+        // oscillation cascade that motivated the original 3s, and 1.5s still
+        // lets the user reach further into history without long stalls.
         let view_weak = self.downgrade();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
             if let Some(view) = view_weak.upgrade() {
                 view.imp().fetching_older.set(false);
             }

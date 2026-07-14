@@ -232,14 +232,37 @@ impl Timeline {
                 n += append_batch.len() as u32;
             }
 
-            // Gap-fills: one splice each. Process high-to-low so earlier
-            // positions stay valid as later inserts shift items right.
+            // Gap-fills: one splice each. Order by (position DESC, timestamp DESC).
+            //
+            // Position DESC so earlier-position splices don't have their
+            // positions invalidated by later ones (splice at pos P shifts
+            // items pos>=P to pos+1).
+            //
+            // TIMESTAMP DESC WITHIN THE SAME POSITION is critical: multiple
+            // gap-fills can compute the same sorted_insert_pos (both want to
+            // slot into the same gap in the store). Processing lower-ts first
+            // would splice it at pos P; the higher-ts then splices at the
+            // same pos P and pushes the lower-ts to P+1 — swapping their
+            // order and violating the sort invariant.
+            //
+            // Repro that used to fail: insert [150, 175] into [100, 200,
+            // 300, 400]. Both compute pos=1. Old code processed 150 first
+            // (stable sort tie), giving [100, 175, 150, 200, 300, 400] —
+            // 175 before 150. Processing 175 first gives [100, 175, ...]
+            // then 150 splice at pos 1 gives [100, 150, 175, ...]. Sorted.
+            //
+            // This bug caused historical-timeline pagination to produce
+            // scrambled order (today, may 20, yesterday, may 24, ...) once
+            // multiple new msgs landed in the same gap.
             if !gap_fills.is_empty() {
                 let mut placements: Vec<(u32, MessageObject)> = gap_fills
                     .iter()
                     .map(|obj| (sorted_insert_pos(store, obj.timestamp()), obj.clone()))
                     .collect();
-                placements.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+                placements.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| b.1.timestamp().cmp(&a.1.timestamp()))
+                });
                 for (pos, obj) in placements {
                     let eid = obj.event_id();
                     if !eid.is_empty() {
@@ -683,6 +706,42 @@ mod tests {
         assert!(!t.has_event("$a"));
         assert!(t.has_event("$x"));
         assert_eq!(timestamps(&t), vec![500, 600]);
+    }
+
+    #[test]
+    fn gap_fills_at_same_position_preserve_sort() {
+        // Regression: two gap-fills whose sorted_insert_pos computed the
+        // same slot used to end up reversed because the second splice at
+        // the same pos would push the first one down. Repro'd as scrambled
+        // history ordering after backpagination.
+        init_gtk();
+        let t = Timeline::new("!room:test");
+        t.insert(vec![
+            msg("$a", "", 100),
+            msg("$b", "", 200),
+            msg("$c", "", 300),
+            msg("$d", "", 400),
+        ]);
+        // Both slot between 100 and 200 (pos=1 initially).
+        t.insert(vec![msg("$x", "", 150), msg("$y", "", 175)]);
+        assert_eq!(timestamps(&t), vec![100, 150, 175, 200, 300, 400]);
+    }
+
+    #[test]
+    fn many_gap_fills_at_same_position_preserve_sort() {
+        // Same shape at scale — a burst of pagination msgs all landing in
+        // the same slot.
+        init_gtk();
+        let t = Timeline::new("!room:test");
+        t.insert(vec![msg("$a", "", 100), msg("$b", "", 1000)]);
+        t.insert(vec![
+            msg("$1", "", 500),
+            msg("$2", "", 200),
+            msg("$3", "", 800),
+            msg("$4", "", 300),
+            msg("$5", "", 700),
+        ]);
+        assert_eq!(timestamps(&t), vec![100, 200, 300, 500, 700, 800, 1000]);
     }
 
     #[test]
