@@ -833,7 +833,45 @@ mod imp {
             });
         }
     }
-    impl WidgetImpl for MessageRow {}
+    impl WidgetImpl for MessageRow {
+        /// Quantize the row's reported height to a multiple of ROW_HEIGHT_UNIT.
+        ///
+        /// GtkListView's height virtualizer keeps a running average of measured
+        /// row heights and uses it to estimate positions for unmeasured rows.
+        /// With unrestricted dynamic heights, every set_markup on a visible
+        /// row (async markup delivery, edit, reaction change) reports a
+        /// slightly different natural height — GTK re-measures, vadj.upper
+        /// shifts by a few pixels, and the user perceives it as jitter,
+        /// especially during backpagination scroll where many rows land at
+        /// once.
+        ///
+        /// Snapping natural height to the next multiple of a fixed unit
+        /// eliminates SMALL height variations entirely: a msg going from
+        /// 32px plain-text to 41px rendered-HTML both round up to 48px in a
+        /// 24-unit scheme, so the row height doesn't change and GTK doesn't
+        /// re-measure. Only variations that cross a bucket boundary produce
+        /// a shift, and even then the shift is a predictable quantum rather
+        /// than a fractional-pixel drift.
+        ///
+        /// The trade-off is up to (ROW_HEIGHT_UNIT - 1) px of padding below
+        /// short content. 24px is enough to absorb most single-line
+        /// plain-text/HTML variance while being small enough to keep the
+        /// list visually dense.
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            const ROW_HEIGHT_UNIT: i32 = 24;
+            let (min, nat, min_bl, nat_bl) = self.parent_measure(orientation, for_size);
+            if orientation == gtk::Orientation::Vertical {
+                // Round each up to the next unit. `.max(0)` guards against
+                // GTK passing -1 as an unset baseline; that stays -1.
+                let quantize = |v: i32| -> i32 {
+                    if v <= 0 { v } else { (v + ROW_HEIGHT_UNIT - 1) / ROW_HEIGHT_UNIT * ROW_HEIGHT_UNIT }
+                };
+                (quantize(min), quantize(nat), min_bl, nat_bl)
+            } else {
+                (min, nat, min_bl, nat_bl)
+            }
+        }
+    }
 
     impl BoxImpl for MessageRow {}
 }
