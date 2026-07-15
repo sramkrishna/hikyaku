@@ -3363,13 +3363,19 @@ impl MessageView {
             let lv = imp.list_view();
             let vp_top = vadj_before.value();
             let mut found: Option<String> = None;
+            let mut rows_walked = 0u32;
             let mut child = lv.first_child();
             while let Some(ref widget) = child {
                 if let Some(row) = Self::find_message_row(widget) {
+                    rows_walked += 1;
                     if let Some(bounds) = row.compute_bounds(&lv) {
                         let row_bottom_in_lv = (bounds.y() + bounds.height()) as f64;
                         if row_bottom_in_lv > vp_top {
                             let eid = row.imp().event_id.borrow().clone();
+                            tracing::info!(
+                                "scroll-diag: anchor captured eid={} bounds.y={:.1} h={:.1} vp_top={:.1} rows_walked={}",
+                                eid, bounds.y(), bounds.height(), vp_top, rows_walked
+                            );
                             if !eid.is_empty() {
                                 found = Some(eid);
                             }
@@ -3378,6 +3384,12 @@ impl MessageView {
                     }
                 }
                 child = widget.next_sibling();
+            }
+            if found.is_none() {
+                tracing::warn!(
+                    "scroll-diag: anchor capture found NO eid; vp_top={:.1} rows_walked={}",
+                    vp_top, rows_walked
+                );
             }
             found
         };
@@ -3438,17 +3450,33 @@ impl MessageView {
         // no overshooting to the bottom of the chat.
         if let Some(anchor_eid) = pre_splice_top_eid {
             let _g = crate::perf::scope_gt("prepend::scroll_to_anchor", 500);
-            if let Some(anchor_msg) = tl.get_event(&anchor_eid) {
-                let store = tl.model();
-                if let Some(anchor_pos) = store.find(&anchor_msg) {
-                    let lv = imp.list_view();
-                    lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
-                    tracing::debug!(
-                        "scroll-restore anchor: eid={} → pos={}",
-                        anchor_eid, anchor_pos
-                    );
+            match tl.get_event(&anchor_eid) {
+                Some(anchor_msg) => {
+                    let store = tl.model();
+                    match store.find(&anchor_msg) {
+                        Some(anchor_pos) => {
+                            let lv = imp.list_view();
+                            let vadj_pre = imp.scrolled_window().vadjustment().value();
+                            lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
+                            let vadj_post = imp.scrolled_window().vadjustment().value();
+                            tracing::info!(
+                                "scroll-restore anchor: eid={} → pos={} vadj {:.1} → {:.1}",
+                                anchor_eid, anchor_pos, vadj_pre, vadj_post
+                            );
+                        }
+                        None => tracing::warn!(
+                            "scroll-restore: anchor eid={} found in Timeline but NOT in store.find()",
+                            anchor_eid
+                        ),
+                    }
                 }
+                None => tracing::warn!(
+                    "scroll-restore: anchor eid={} NOT in Timeline after insert (lost during splice?)",
+                    anchor_eid
+                ),
             }
+        } else {
+            tracing::warn!("scroll-restore: no anchor captured, GTK's default post-splice behavior will run unchecked");
         }
         let _ = old_value; // no longer used
         let _ = n_prepended; // no longer used for scroll math
