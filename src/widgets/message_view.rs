@@ -2878,11 +2878,18 @@ impl MessageView {
         let (markup, hash) = prerender_body(&new_body, &new_formatted);
         let image_url = crate::widgets::message_row::extract_image_url(&new_body).unwrap_or_default();
         self.update_message_in_place(event_id, |msg| {
+            // Order matters: non-notifying Cell/RefCell fields (body_hash,
+            // image_url) go BEFORE the notify-firing property setters. Any
+            // handler that fires synchronously off notify::body /
+            // notify::rendered-markup and reads body_hash must see the NEW
+            // hash — same class of ordering bug as update_reactions_json.
+            // Latent today (no such handler currently exists) but fixed
+            // preemptively for consistency.
+            msg.set_body_hash(hash);
+            msg.set_image_url(image_url.clone());
             msg.set_body(new_body.clone());
             msg.set_formatted_body(new_formatted.clone());
             msg.set_rendered_markup(markup.clone());
-            msg.set_body_hash(hash);
-            msg.set_image_url(image_url.clone());
         });
     }
 
