@@ -577,6 +577,34 @@ impl Timeline {
         if prev_newest != new_newest {
             self.notify_newest_timestamp();
         }
+
+        // Invariant check: walk the store and error-log any place where
+        // ts decreases (sort violation). This is O(n) per mutation but
+        // only runs when RUST_LOG=hikyaku=debug or higher. Non-debug
+        // builds skip via tracing::enabled!.
+        if tracing::enabled!(tracing::Level::DEBUG) && new_n > 1 {
+            let mut prev_ts: u64 = 0;
+            let mut violations: u32 = 0;
+            let mut first_violation_pos: Option<u32> = None;
+            for i in 0..new_n {
+                if let Some(msg) = store.item(i).and_downcast::<MessageObject>() {
+                    let ts = msg.timestamp();
+                    if i > 0 && ts < prev_ts {
+                        violations += 1;
+                        if first_violation_pos.is_none() {
+                            first_violation_pos = Some(i);
+                        }
+                    }
+                    prev_ts = ts;
+                }
+            }
+            if violations > 0 {
+                tracing::error!(
+                    "timeline-invariant: {} sort violations in store (n={}), first at pos={:?}",
+                    violations, new_n, first_violation_pos
+                );
+            }
+        }
     }
 }
 
