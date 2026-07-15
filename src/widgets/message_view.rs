@@ -3485,71 +3485,33 @@ impl MessageView {
             );
         }
 
-        // Scroll restore: preserve visible-content-stability semantics.
-        // User's rule: state of scroll should be untouched, data structure
-        // should just have more in the buffer. Adding N items above the
-        // viewport should shift vadj.value by N*avg_row_height so the same
-        // content stays under the user's eyes.
+        // Scroll restore — restored from the working version at ccf6eec.
+        // Simpler than my recent iterations: schedule an idle after GTK's
+        // post-splice work, check if upper actually grew (measurement
+        // caught up), use the exact delta if so, else fall back to
+        // per_row_est.
         //
-        // GTK doesn't do this by default — items_changed(0, 0, N) leaves
-        // vadj.value where it was, so the viewport (which is now looking
-        // at pixel offset old_value from the top) shows the newly-added
-        // top msgs instead of what the user was reading.
-        //
-        // Fix: SYNCHRONOUSLY, immediately after tl.insert:
-        //   1. Force vadj.upper to grow by expected_added, so set_value
-        //      doesn't clamp when upper hasn't been re-measured yet.
-        //   2. Set vadj.value = old_value + expected_added.
-        //   3. Schedule ONE idle retry to catch GTK's post-splice
-        //      reconciliation resetting us.
-        //
-        // If our per_row_est is slightly off, the user's visible content
-        // is off by a few pixels — acceptable, still stable feel. If
-        // wildly off (never should be with the 40-300 clamp), user sees
-        // slight jump. The old scroll_to(anchor_pos, NONE, None) approach
-        // silently no-op'd in many cases (log confirmed) — this approach
-        // never no-ops.
+        // Do NOT call vadj.set_upper() — GTK owns upper and re-computes it
+        // from measurements; overriding causes other paths to misbehave.
+        // Do NOT call list_view.scroll_to() — proven silently no-op in
+        // many cases (vadj 0.0 → 0.0 in log). Just set_value(target).
+        let sw = imp.scrolled_window().clone();
         let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
         let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
             (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
         } else { 60.0 };
-        let expected_added = (n_prepended as f64) * per_row_est;
-        if n_prepended > 0 && expected_added > 0.0 {
-            let vadj = imp.scrolled_window().vadjustment();
-            let sw = imp.scrolled_window().clone();
-            let target = old_value + expected_added;
-            // Force upper to accommodate the new value (so set_value doesn't
-            // clamp), then set value. GTK may re-compute upper later from
-            // actual row heights; our target is close enough that it stays
-            // within the new upper.
-            let new_upper_est = old_upper + expected_added;
-            if vadj.upper() < new_upper_est {
-                vadj.set_upper(new_upper_est);
-            }
+        glib::idle_add_local_once(move || {
+            let vadj = sw.vadjustment();
+            let delta = vadj.upper() - old_upper;
+            let target = if delta > 50.0 {
+                // Measurement caught up — shift by exact delta.
+                old_value + delta
+            } else {
+                // Fallback: estimate from per-row average.
+                old_value + (n_prepended as f64) * per_row_est
+            };
             vadj.set_value(target);
-            let after_sync = vadj.value();
-            tracing::info!(
-                "scroll-restore sync: n_prepended={} per_row_est={:.1} old_value={:.1} target={:.1} vadj_after_sync={:.1}",
-                n_prepended, per_row_est, old_value, target, after_sync
-            );
-            // Idle retry — GTK's items_changed reconciliation runs later
-            // on the same main-loop turn and may reset vadj. Re-assert.
-            let target_captured = target;
-            glib::idle_add_local_once(move || {
-                let vadj = sw.vadjustment();
-                let cur = vadj.value();
-                // Only restore if vadj drifted meaningfully away from target
-                // AND the user hasn't scrolled themselves. If cur is close
-                // to target (within 1 row worth), leave alone.
-                if (cur - target_captured).abs() > 50.0 && cur < target_captured * 0.5 {
-                    vadj.set_value(target_captured);
-                    tracing::info!(
-                        "scroll-restore idle-retry: cur={:.1} target={:.1} restored",
-                        cur, target_captured
-                    );
-                }
-            });
-        }
+        });
         let _ = pre_splice_top_eid; // captured for logging; not used for scroll math anymore
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
