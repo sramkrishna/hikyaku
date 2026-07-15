@@ -892,6 +892,36 @@ thread_local! {
     /// scroll, so if this rate is thousands/sec on a plain scroll it's
     /// a smoking gun for the micro-stutter.
     pub(crate) static MEASURE_CALLS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+
+    /// Decoded avatar textures: user_id → GdkTexture. Thread-local (GTK
+    /// is single-threaded), so no locking. Populated on first bind that
+    /// touches a given user_id. Bind reads via a plain map lookup — no
+    /// Application/downcast chain, no borrow of an MxWindow imp field.
+    ///
+    /// This was 100µs/bind (measured 438 hits during a session) even
+    /// AFTER caching decoded textures — the cost was the traversal to
+    /// reach the RefCell on MxWindow. Thread-local reduces the bind
+    /// cost of the avatar block to a single HashMap::get.
+    static AVATAR_TEXTURES: std::cell::RefCell<std::collections::HashMap<String, gtk::gdk::Texture>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Look up the cached decoded avatar texture for a user_id. Returns None
+/// on cache miss; the caller falls back to loading from disk.
+pub(crate) fn cached_avatar_texture(user_id: &str) -> Option<gtk::gdk::Texture> {
+    AVATAR_TEXTURES.with(|c| c.borrow().get(user_id).cloned())
+}
+
+/// Insert a decoded texture into the cache. Called by MessageRow bind
+/// after the first-time load from disk.
+pub(crate) fn set_cached_avatar_texture(user_id: &str, tex: gtk::gdk::Texture) {
+    AVATAR_TEXTURES.with(|c| { c.borrow_mut().insert(user_id.to_string(), tex); });
+}
+
+/// Drop the cached texture for a user_id (e.g. when their avatar changes).
+/// Next bind decodes and re-caches from the fresh path.
+pub fn invalidate_avatar_texture(user_id: &str) {
+    AVATAR_TEXTURES.with(|c| { c.borrow_mut().remove(user_id); });
 }
 
 /// Install a periodic reporter for MEASURE_CALLS. Called once from the
@@ -1619,48 +1649,36 @@ impl MessageRow {
             }
         }
 
-        // Sender avatar — 32px next to the sender name. Reads decoded
-        // texture from the window's avatar_texture_cache; on cache miss,
-        // decodes from disk (Texture::from_filename) ONCE per session per
-        // sender and caches the result.
-        //
-        // The previous code called Texture::from_filename on EVERY bind,
-        // which is synchronous file I/O + image decode on the GTK thread —
-        // measured at 500-1000µs per bind, blowing the frame budget when
-        // scroll bursts landed 30 binds in ~50ms. This was the dominant
-        // cost after the notify-handler consolidation.
+        // Sender avatar. Reads decoded texture from a thread_local cache
+        // (populated on first bind per sender per session). Cache miss →
+        // walk to MxWindow for the path and decode ONCE, then insert the
+        // decoded texture into the cache. Bind cost on cache hit is a
+        // single HashMap::get + set_custom_image call — no Application
+        // downcast chain (which was 100µs/bind, measured 438 times per
+        // scroll session as the last remaining bind hotspot).
         {
             let _g_av = crate::perf::scope_gt("bind::avatar", 100);
             imp.sender_avatar.set_text(Some(sender.as_str()));
             imp.sender_avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
             if !sender_id.is_empty() {
-                use gtk::prelude::*;
-                if let Some(app) = gtk::gio::Application::default() {
-                    if let Some(gtk_app) = app.downcast_ref::<gtk::Application>() {
-                        if let Some(window) = gtk_app.active_window() {
-                            if let Some(win) = window
-                                .downcast_ref::<crate::widgets::MxWindow>()
-                            {
-                                // Fast path: cached decoded texture.
-                                let cached_tex = win.imp().avatar_texture_cache
-                                    .borrow().get(&sender_id).cloned();
-                                if let Some(tex) = cached_tex {
-                                    imp.sender_avatar.set_custom_image(Some(&tex));
-                                } else {
-                                    // Slow path: decode from disk once, cache result.
-                                    let path = win.imp().avatar_cache
-                                        .borrow().get(&sender_id).cloned();
-                                    if let Some(path) = path {
-                                        if !path.is_empty() {
-                                            if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
-                                                imp.sender_avatar.set_custom_image(Some(&tex));
-                                                win.imp().avatar_texture_cache
-                                                    .borrow_mut()
-                                                    .insert(sender_id.clone(), tex);
-                                            }
-                                        }
-                                    }
-                                }
+                if let Some(tex) = cached_avatar_texture(&sender_id) {
+                    imp.sender_avatar.set_custom_image(Some(&tex));
+                } else {
+                    // Cache miss — reach into MxWindow to get the path,
+                    // decode once, cache. This chain runs ONCE per sender
+                    // per session; steady-state binds all hit the fast
+                    // path above.
+                    use gtk::prelude::*;
+                    let path: Option<String> = gtk::gio::Application::default()
+                        .and_then(|a| a.downcast::<gtk::Application>().ok())
+                        .and_then(|a| a.active_window())
+                        .and_then(|w| w.downcast::<crate::widgets::MxWindow>().ok())
+                        .and_then(|w| w.imp().avatar_cache.borrow().get(&sender_id).cloned());
+                    if let Some(path) = path {
+                        if !path.is_empty() {
+                            if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
+                                imp.sender_avatar.set_custom_image(Some(&tex));
+                                set_cached_avatar_texture(&sender_id, tex);
                             }
                         }
                     }
