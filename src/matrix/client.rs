@@ -326,8 +326,16 @@ pub enum MatrixEvent {
     MessageSent { room_id: String, echo_body: String, event_id: String },
     /// Reactions on a message were updated.
     ReactionUpdate { room_id: String, event_id: String, reactions: Vec<(String, u64, Vec<String>)> },
-    /// Someone reacted to one of our messages — fire a toast / desktop notif.
-    ReactionNotification { room_id: String, room_name: String, reactor: String, emoji: String },
+    /// Someone reacted to one of our messages — fire a toast / desktop notif
+    /// AND log to the in-session notification pane. `target_event_id` is the
+    /// event that was reacted TO (so clicking the pane entry can jump to it).
+    ReactionNotification {
+        room_id: String,
+        room_name: String,
+        reactor: String,
+        emoji: String,
+        target_event_id: String,
+    },
     /// A message was edited.
     MessageEdited { room_id: String, event_id: String, new_body: String, formatted_body: Option<String> },
     /// A message was redacted (deleted).
@@ -3204,6 +3212,7 @@ async fn start_sync(
                                             room_name,
                                             reactor: sender_name,
                                             emoji,
+                                            target_event_id: target_event_id.clone(),
                                         }).await;
                                     }
                                 }

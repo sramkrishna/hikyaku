@@ -2426,13 +2426,30 @@ impl MxWindow {
                             }
                         }
                     }
-                    MatrixEvent::ReactionNotification { room_id, room_name, reactor, emoji } => {
+                    MatrixEvent::ReactionNotification { room_id, room_name, reactor, emoji, target_event_id } => {
                         toast_or_notify(
                             &window,
                             &toast_overlay,
                             &format!("reaction-{room_id}"),
                             "New reaction",
                             &format!("{reactor} reacted {emoji} to your message in {room_name}"),
+                        );
+                        // Log to the in-session notification pane (bell icon).
+                        // event_id is the msg that was reacted TO, so clicking
+                        // the pane entry can jump to that msg. Body encodes
+                        // the reactor + emoji so the pane row reads
+                        // "Alice: reacted 👍" — consistent with the existing
+                        // "sender: body" convention for regular msg notifs.
+                        // Timestamp is 0 (we don't have the reaction event's
+                        // ts here without an extra fetch); the pane sorts by
+                        // insertion order, so unknown-ts is acceptable.
+                        window.push_notification(
+                            &room_id,
+                            &target_event_id,
+                            &reactor,
+                            &room_name,
+                            &format!("reacted {emoji}"),
+                            0,
                         );
                     }
                     MatrixEvent::MessageEdited { room_id, event_id, new_body, formatted_body } => {
