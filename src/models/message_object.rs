@@ -213,10 +213,18 @@ impl MessageObject {
 
     /// Update reactions_json and its hash together.  Always use this instead of
     /// set_reactions_json() so the hash stays in sync.
+    ///
+    /// CRITICAL: update the hash BEFORE setting the json property. set_reactions_json
+    /// fires notify::reactions-json SYNCHRONOUSLY, and any handler that reads
+    /// reactions_hash to compare against a cached value (like MessageRow's
+    /// rebuild_reactions_pills) must see the NEW hash — otherwise the handler
+    /// sees stale hash-equal-to-cache and skips the pill rebuild, and the
+    /// user's reaction never renders live (only appears after app restart when
+    /// disk cache reloads).
     pub fn update_reactions_json(&self, json: String) {
         let h = fnv1a_str(&json);
-        self.set_reactions_json(json);
         self.imp().reactions_hash.set(h);
+        self.set_reactions_json(json);
     }
 
     pub fn image_url(&self) -> String {
