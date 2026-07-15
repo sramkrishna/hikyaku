@@ -3392,21 +3392,19 @@ impl MessageView {
         // height so the user's CURRENT visible content stays put.
         //
         // Previously we called list_view.scroll_to(n_prepended, NONE, None),
-        // which anchors to the item that was topmost at pagination-trigger
-        // time. Problem: the round-trip takes 1-2s, and the user typically
-        // scrolls further UP during that window. When the response lands
-        // and scroll_to fires, it SNAPS the user back to the trigger-time
-        // anchor — reported as "scroll goes forward 10-12 msgs, then
-        // resets back by 7-9". The reset delta = distance user scrolled
-        // during the round-trip.
+        // which anchored to the item topmost at pagination-trigger time —
+        // and snapped the user backward if they'd scrolled during the
+        // round-trip. Fixed by shifting the LIVE vadj.value instead.
         //
-        // Fix: read vadj.value AT IDLE TIME (i.e., the user's current
-        // position, not the stale trigger-time snapshot). Shift by the
-        // estimated added height so visible content stays exactly where
-        // the user is looking, whether or not they scrolled during the
-        // round-trip. The estimate comes from the room's own per-row
-        // average of already-measured content (clamped 40–300px), so
-        // rooms with tall or short msgs both track correctly.
+        // Two-shot shift: fire once on next idle (before GTK's items_changed
+        // reconciliation might revert us), then again after 80ms (once
+        // reconciliation has settled). The 80ms retry catches the case where
+        // GtkListView's own vadj bookkeeping resets value to keep the
+        // scrollbar thumb at the same relative position — which for a user
+        // sitting at the top means value = 0, leaving them looking at the
+        // oldest msg in the just-loaded batch instead of the youngest.
+        // Explicitly re-setting after settlement guarantees the user's
+        // reading position sticks.
         let pre_splice_n = if n_prepended > 0 {
             tl.n_items() - n_prepended as u32
         } else { 0 };
@@ -3415,18 +3413,33 @@ impl MessageView {
         } else { 60.0 };
         let sw = imp.scrolled_window().clone();
         let expected_added = n_prepended as f64 * per_row_est;
+        let _ = old_value; // no longer needed — we shift by current, always
+        let sw2 = sw.clone();
         glib::idle_add_local_once(move || {
             let vadj = sw.vadjustment();
-            // Live vadj.value — reflects any scrolling that happened
-            // during the pagination round-trip. Never snap back to the
-            // stale trigger-time value.
             let cur_value = vadj.value();
-            // If GtkListView already auto-shifted vadj to keep visible
-            // content stable (delta >= half the expected added height),
-            // don't double-shift. Otherwise, add the estimate.
-            let observed_delta = cur_value - old_value;
-            if observed_delta < expected_added * 0.5 {
+            vadj.set_value(cur_value + expected_added);
+            tracing::debug!(
+                "scroll-restore idle1: cur={:.1} shift={:.1} → set {:.1}",
+                cur_value, expected_added, cur_value + expected_added
+            );
+        });
+        glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+            let vadj = sw2.vadjustment();
+            let cur_value = vadj.value();
+            // If GTK's reconciliation reset us below the shift we asked for,
+            // re-apply. Detect by checking whether cur_value is at least the
+            // expected added height (which is where the first idle should
+            // have left us at minimum). Guard against re-shifting if the
+            // user has since scrolled further up (in which case cur_value
+            // is intentionally lower).
+            if cur_value < expected_added * 0.5 {
                 vadj.set_value(cur_value + expected_added);
+                tracing::debug!(
+                    "scroll-restore idle2: reconciliation reset us, \
+                     re-shifting from {:.1} by {:.1}",
+                    cur_value, expected_added
+                );
             }
         });
 
