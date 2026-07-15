@@ -1649,13 +1649,8 @@ impl MessageRow {
             }
         }
 
-        // Sender avatar. Reads decoded texture from a thread_local cache
-        // (populated on first bind per sender per session). Cache miss →
-        // walk to MxWindow for the path and decode ONCE, then insert the
-        // decoded texture into the cache. Bind cost on cache hit is a
-        // single HashMap::get + set_custom_image call — no Application
-        // downcast chain (which was 100µs/bind, measured 438 times per
-        // scroll session as the last remaining bind hotspot).
+        // Sender avatar — re-enabled after diagnostic (disabling avatars
+        // did NOT reduce jitter, so they're not the cause).
         {
             let _g_av = crate::perf::scope_gt("bind::avatar", 100);
             imp.sender_avatar.set_text(Some(sender.as_str()));
@@ -1664,10 +1659,6 @@ impl MessageRow {
                 if let Some(tex) = cached_avatar_texture(&sender_id) {
                     imp.sender_avatar.set_custom_image(Some(&tex));
                 } else {
-                    // Cache miss — reach into MxWindow to get the path,
-                    // decode once, cache. This chain runs ONCE per sender
-                    // per session; steady-state binds all hit the fast
-                    // path above.
                     use gtk::prelude::*;
                     let path: Option<String> = gtk::gio::Application::default()
                         .and_then(|a| a.downcast::<gtk::Application>().ok())

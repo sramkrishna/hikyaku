@@ -141,6 +141,7 @@ impl Timeline {
         if objs.is_empty() {
             return;
         }
+        let _g = crate::perf::scope_gt("Timeline::insert", 500);
         let imp = self.imp();
         let store = &imp.list_store;
 

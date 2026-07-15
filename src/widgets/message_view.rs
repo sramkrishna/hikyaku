@@ -3309,6 +3309,7 @@ impl MessageView {
 
     /// Prepend older messages at the top (pagination).
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
+        let _g = crate::perf::scope_gt("prepend_messages", 1000);
         let imp = self.imp();
         let today = glib::DateTime::now_local().ok();
         let rid = imp.current_room_id.borrow().clone();
@@ -3358,6 +3359,7 @@ impl MessageView {
         // below the viewport top — that's the topmost user-visible msg
         // and the anchor we want to keep in view after prepend.
         let pre_splice_top_eid: Option<String> = {
+            let _g = crate::perf::scope_gt("prepend::capture_anchor", 500);
             let lv = imp.list_view();
             let vp_top = vadj_before.value();
             let mut found: Option<String> = None;
@@ -3435,6 +3437,7 @@ impl MessageView {
         // as needed to position accurately — no estimation, no heuristic,
         // no overshooting to the bottom of the chat.
         if let Some(anchor_eid) = pre_splice_top_eid {
+            let _g = crate::perf::scope_gt("prepend::scroll_to_anchor", 500);
             if let Some(anchor_msg) = tl.get_event(&anchor_eid) {
                 let store = tl.model();
                 if let Some(anchor_pos) = store.find(&anchor_msg) {
