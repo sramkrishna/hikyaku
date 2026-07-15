@@ -133,7 +133,7 @@ pub fn apply_result(id: u64, markup: String) {
             obj.set_needs_markup(false); // don't retry pathological HTML
             return;
         }
-        obj.set_rendered_markup(markup);
         obj.set_needs_markup(false);
+        obj.update_rendered_markup(markup);
     }
 }

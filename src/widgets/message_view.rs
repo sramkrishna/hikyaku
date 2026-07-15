@@ -2390,7 +2390,7 @@ impl MessageView {
                     let escaped = gtk::glib::markup_escape_text(&body).to_string();
                     let new_markup = crate::markdown::linkify_urls(&escaped);
                     if new_markup != obj.rendered_markup() {
-                        obj.set_rendered_markup(new_markup);
+                        obj.update_rendered_markup(new_markup);
                     }
                 } else {
                     // Re-enqueue: markup_worker is a single bounded queue
@@ -2878,18 +2878,16 @@ impl MessageView {
         let (markup, hash) = prerender_body(&new_body, &new_formatted);
         let image_url = crate::widgets::message_row::extract_image_url(&new_body).unwrap_or_default();
         self.update_message_in_place(event_id, |msg| {
-            // Order matters: non-notifying Cell/RefCell fields (body_hash,
-            // image_url) go BEFORE the notify-firing property setters. Any
-            // handler that fires synchronously off notify::body /
-            // notify::rendered-markup and reads body_hash must see the NEW
-            // hash — same class of ordering bug as update_reactions_json.
-            // Latent today (no such handler currently exists) but fixed
-            // preemptively for consistency.
-            msg.set_body_hash(hash);
-            msg.set_image_url(image_url.clone());
-            msg.set_body(new_body.clone());
-            msg.set_formatted_body(new_formatted.clone());
-            msg.set_rendered_markup(markup.clone());
+            // Route through the single-shot atomic updater on MessageObject:
+            // non-notifying cells set first, property notifies batched via
+            // freeze_notify, all handlers observe fully-consistent state.
+            msg.update_body_and_markup(
+                new_body.clone(),
+                new_formatted.clone(),
+                markup.clone(),
+                hash,
+                image_url.clone(),
+            );
         });
     }
 

@@ -214,17 +214,66 @@ impl MessageObject {
     /// Update reactions_json and its hash together.  Always use this instead of
     /// set_reactions_json() so the hash stays in sync.
     ///
-    /// CRITICAL: update the hash BEFORE setting the json property. set_reactions_json
-    /// fires notify::reactions-json SYNCHRONOUSLY, and any handler that reads
-    /// reactions_hash to compare against a cached value (like MessageRow's
-    /// rebuild_reactions_pills) must see the NEW hash — otherwise the handler
-    /// sees stale hash-equal-to-cache and skips the pill rebuild, and the
-    /// user's reaction never renders live (only appears after app restart when
-    /// disk cache reloads).
+    /// Discipline: non-notifying fields (Cell/RefCell) set BEFORE any notify-
+    /// firing property setter. GObject property notifications fire
+    /// synchronously off the setter, so any handler that reads related state
+    /// off the notify callback must see the updated cells — otherwise the
+    /// handler sees stale cache-equal-to-hash and skips work. Same rule
+    /// applies to every multi-field update on MessageObject; see
+    /// `update_body_and_markup` for the equivalent pattern.
+    ///
+    /// A `freeze_notify` guard defers any additional notifies in this
+    /// method until the guard drops, so if in future we add more property
+    /// setters here they'll fire in a single batch and handlers observe a
+    /// single fully-consistent state transition.
     pub fn update_reactions_json(&self, json: String) {
+        use gtk::prelude::ObjectExt;
+        let _guard = self.freeze_notify();
         let h = fnv1a_str(&json);
         self.imp().reactions_hash.set(h);
         self.set_reactions_json(json);
+    }
+
+    /// Update body, formatted_body, rendered_markup, body_hash, and image_url
+    /// atomically. All non-notifying Cell/RefCell fields set first; then a
+    /// freeze_notify guard defers property notifies until every setter has
+    /// run, so handlers listening on any of these properties fire once and
+    /// observe fully-consistent state (body_hash matches body, image_url
+    /// matches the new body, etc.).
+    ///
+    /// Any code that previously called msg.set_body / set_formatted_body /
+    /// set_rendered_markup individually for a live edit should route through
+    /// this method instead. Construction paths (info_to_obj, make_divider_obj)
+    /// remain OK to set fields directly since no handlers are attached yet.
+    pub fn update_body_and_markup(
+        &self,
+        body: String,
+        formatted_body: String,
+        rendered_markup: String,
+        body_hash: u64,
+        image_url: String,
+    ) {
+        use gtk::prelude::ObjectExt;
+        let _guard = self.freeze_notify();
+        // Non-notifying fields first.
+        self.imp().body_hash.set(body_hash);
+        self.imp().image_url.replace(image_url);
+        // Property setters — notifies deferred until _guard drops.
+        self.set_body(body);
+        self.set_formatted_body(formatted_body);
+        self.set_rendered_markup(rendered_markup);
+    }
+
+    /// Live-update rendered_markup only. Used by the markup worker's
+    /// apply_result and by refresh_alias_references. Wrapped in freeze_notify
+    /// for consistency with the other update helpers — currently it only
+    /// touches one property but the guard reserves room for future related
+    /// state (a rendered_markup_hash cache, etc.) without callers needing
+    /// to re-audit ordering.
+    pub fn update_rendered_markup(&self, markup: String) {
+        use gtk::prelude::ObjectExt;
+        let _guard = self.freeze_notify();
+        self.set_rendered_markup(markup);
     }
 
     pub fn image_url(&self) -> String {
