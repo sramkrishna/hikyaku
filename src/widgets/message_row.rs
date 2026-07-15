@@ -1562,7 +1562,10 @@ impl MessageRow {
         // Delegate to text rendering with highlights.
         // Reply fallback is already stripped at the GObject level (info_to_obj).
         let force_highlight = msg.is_highlight();
-        self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+        {
+            let _g = crate::perf::scope_gt("bind::render_body", 100);
+            self.render_body(msg, &sender, &sender_id, &body, &formatted_body, &formatted_ts, highlight_names, force_highlight, &ctx.rolodex_ids);
+        }
 
         // Link preview card: if the body cites a matrix.to event link
         // and the linked event is in our local cache, render a small
@@ -1570,6 +1573,7 @@ impl MessageRow {
         // pill in the body still does its thing — this is additive.
         // No server fetch; out-of-cache events leave the card hidden.
         {
+            let _g = crate::perf::scope_gt("bind::link_preview", 100);
             let link = crate::markdown::extract_first_matrix_to_event_link(&body)
                 .or_else(|| {
                     if formatted_body.is_empty() {
@@ -1626,6 +1630,7 @@ impl MessageRow {
         // scroll bursts landed 30 binds in ~50ms. This was the dominant
         // cost after the notify-handler consolidation.
         {
+            let _g_av = crate::perf::scope_gt("bind::avatar", 100);
             imp.sender_avatar.set_text(Some(sender.as_str()));
             imp.sender_avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
             if !sender_id.is_empty() {
