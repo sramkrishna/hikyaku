@@ -3318,20 +3318,37 @@ impl MessageView {
         }
         let tl = imp.ensure_timeline(&rid);
 
-        // Pre-filter: drop events already in the Timeline OR in pending_appends
-        // (Timeline.insert dedups against its own event_index but not against
-        // the pending queue; without this filter, a slow flush could re-add a
-        // recently-appended message via the pagination path).
+        // Pre-filter, two rules:
+        //
+        // 1. Drop events already in Timeline OR pending_appends. Timeline.insert
+        //    dedups against its own event_index but not against the pending
+        //    queue; without this filter, a slow flush could re-add a recently-
+        //    appended message via the pagination path.
+        //
+        // 2. Strict pagination — drop events with ts >= cur_oldest. Backpagination
+        //    is only supposed to bring OLDER msgs; anything the server happens
+        //    to return that falls inside our current loaded range would land as
+        //    a Timeline gap-fill (inserted in the middle of the visible
+        //    viewport). Reported by user as "grabbing the backlog blends it
+        //    with the current timeline" jitter. If matrix upstream ever changes
+        //    such that backward pagination legitimately returns non-strictly-
+        //    older msgs, this filter would silently drop them and we'd want to
+        //    revisit — for now trusting upstream is the right default.
+        //
+        //    Skipped when cur_oldest == 0 (Timeline is empty), so the very
+        //    first pagination on an empty room isn't a no-op.
+        let cur_oldest = tl.oldest_timestamp();
         let pending_eids: std::collections::HashSet<String> = imp.pending_appends
             .borrow()
             .iter()
             .map(|o| o.event_id())
             .filter(|e| !e.is_empty())
             .collect();
-        let mut filtered: Vec<&crate::matrix::MessageInfo> = messages
+        let filtered: Vec<&crate::matrix::MessageInfo> = messages
             .iter()
             .filter(|m| m.event_id.is_empty()
                 || (!tl.has_event(&m.event_id) && !pending_eids.contains(&m.event_id)))
+            .filter(|m| cur_oldest == 0 || m.timestamp < cur_oldest)
             .collect();
         // No sort here — Timeline::insert sorts internally as its invariant
         // guarantee. Input from handle_fetch_older's chunk accumulation is
