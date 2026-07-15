@@ -3485,68 +3485,72 @@ impl MessageView {
             );
         }
 
-        if let Some(anchor_eid) = pre_splice_top_eid {
-            let _g = crate::perf::scope_gt("prepend::scroll_to_anchor", 500);
-            match tl.get_event(&anchor_eid) {
-                Some(anchor_msg) => {
-                    let store = tl.model();
-                    match store.find(&anchor_msg) {
-                        Some(anchor_pos) => {
-                            // Two-pronged approach: schedule scroll_to for the
-                            // next idle (after items_changed reconciliation)
-                            // AND compute an explicit vadj offset as fallback.
-                            // GtkListView's scroll_to sometimes silently
-                            // no-ops even from an idle (proven by log showing
-                            // "vadj 0.0 → 0.0" on later paginations); the
-                            // explicit set_value guarantees SOMETHING moves
-                            // so the user isn't stuck at vp_top=0 triggering
-                            // another pagination immediately.
-                            let lv = imp.list_view();
-                            let sw = imp.scrolled_window().clone();
-                            let anchor_eid_clone = anchor_eid.clone();
-                            // Rough estimate of anchor's pixel position from
-                            // its ordinal position and the room's per-row avg.
-                            let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
-                            let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
-                                (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
-                            } else { 60.0 };
-                            let estimated_target = (anchor_pos as f64) * per_row_est;
-                            glib::idle_add_local_once(move || {
-                                let vadj = sw.vadjustment();
-                                let vadj_pre = vadj.value();
-                                lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
-                                let after_scroll_to = vadj.value();
-                                // If scroll_to didn't move vadj (or moved to
-                                // something implausibly close to 0), fall back
-                                // to an explicit set_value. Clamped to
-                                // [0, upper-page_size] by GTK.
-                                if after_scroll_to < estimated_target * 0.5 {
-                                    vadj.set_value(estimated_target);
-                                }
-                                let final_vadj = vadj.value();
-                                tracing::info!(
-                                    "scroll-restore idle: eid={} → pos={} est_target={:.1} vadj pre={:.1} after_scroll_to={:.1} final={:.1}",
-                                    anchor_eid_clone, anchor_pos, estimated_target,
-                                    vadj_pre, after_scroll_to, final_vadj
-                                );
-                            });
-                        }
-                        None => tracing::warn!(
-                            "scroll-restore: anchor eid={} found in Timeline but NOT in store.find()",
-                            anchor_eid
-                        ),
-                    }
-                }
-                None => tracing::warn!(
-                    "scroll-restore: anchor eid={} NOT in Timeline after insert (lost during splice?)",
-                    anchor_eid
-                ),
+        // Scroll restore: preserve visible-content-stability semantics.
+        // User's rule: state of scroll should be untouched, data structure
+        // should just have more in the buffer. Adding N items above the
+        // viewport should shift vadj.value by N*avg_row_height so the same
+        // content stays under the user's eyes.
+        //
+        // GTK doesn't do this by default — items_changed(0, 0, N) leaves
+        // vadj.value where it was, so the viewport (which is now looking
+        // at pixel offset old_value from the top) shows the newly-added
+        // top msgs instead of what the user was reading.
+        //
+        // Fix: SYNCHRONOUSLY, immediately after tl.insert:
+        //   1. Force vadj.upper to grow by expected_added, so set_value
+        //      doesn't clamp when upper hasn't been re-measured yet.
+        //   2. Set vadj.value = old_value + expected_added.
+        //   3. Schedule ONE idle retry to catch GTK's post-splice
+        //      reconciliation resetting us.
+        //
+        // If our per_row_est is slightly off, the user's visible content
+        // is off by a few pixels — acceptable, still stable feel. If
+        // wildly off (never should be with the 40-300 clamp), user sees
+        // slight jump. The old scroll_to(anchor_pos, NONE, None) approach
+        // silently no-op'd in many cases (log confirmed) — this approach
+        // never no-ops.
+        let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
+        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
+            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
+        } else { 60.0 };
+        let expected_added = (n_prepended as f64) * per_row_est;
+        if n_prepended > 0 && expected_added > 0.0 {
+            let vadj = imp.scrolled_window().vadjustment();
+            let sw = imp.scrolled_window().clone();
+            let target = old_value + expected_added;
+            // Force upper to accommodate the new value (so set_value doesn't
+            // clamp), then set value. GTK may re-compute upper later from
+            // actual row heights; our target is close enough that it stays
+            // within the new upper.
+            let new_upper_est = old_upper + expected_added;
+            if vadj.upper() < new_upper_est {
+                vadj.set_upper(new_upper_est);
             }
-        } else {
-            tracing::warn!("scroll-restore: no anchor captured, GTK's default post-splice behavior will run unchecked");
+            vadj.set_value(target);
+            let after_sync = vadj.value();
+            tracing::info!(
+                "scroll-restore sync: n_prepended={} per_row_est={:.1} old_value={:.1} target={:.1} vadj_after_sync={:.1}",
+                n_prepended, per_row_est, old_value, target, after_sync
+            );
+            // Idle retry — GTK's items_changed reconciliation runs later
+            // on the same main-loop turn and may reset vadj. Re-assert.
+            let target_captured = target;
+            glib::idle_add_local_once(move || {
+                let vadj = sw.vadjustment();
+                let cur = vadj.value();
+                // Only restore if vadj drifted meaningfully away from target
+                // AND the user hasn't scrolled themselves. If cur is close
+                // to target (within 1 row worth), leave alone.
+                if (cur - target_captured).abs() > 50.0 && cur < target_captured * 0.5 {
+                    vadj.set_value(target_captured);
+                    tracing::info!(
+                        "scroll-restore idle-retry: cur={:.1} target={:.1} restored",
+                        cur, target_captured
+                    );
+                }
+            });
         }
-        let _ = old_value; // no longer used
-        let _ = n_prepended; // no longer used for scroll math
+        let _ = pre_splice_top_eid; // captured for logging; not used for scroll math anymore
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
         // user report that the shorter cooldown combined with an aggressive
