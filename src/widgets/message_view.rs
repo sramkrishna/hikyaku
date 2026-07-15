@@ -3333,7 +3333,10 @@ impl MessageView {
             .filter(|m| m.event_id.is_empty()
                 || (!tl.has_event(&m.event_id) && !pending_eids.contains(&m.event_id)))
             .collect();
-        filtered.sort_by_key(|m| m.timestamp);
+        // No sort here — Timeline::insert sorts internally as its invariant
+        // guarantee. Input from handle_fetch_older's chunk accumulation is
+        // partially unsorted at chunk boundaries; Timeline's single sort
+        // fixes that.
 
         // Build MessageObjects for the Timeline. Timeline handles the placement
         // decision (prepend / append / gap-fill) internally based on timestamp.
@@ -3448,6 +3451,23 @@ impl MessageView {
         // number of prepended items) and scroll_to it. GTK measures rows
         // as needed to position accurately — no estimation, no heuristic,
         // no overshooting to the bottom of the chat.
+        // Log Timeline state so we can catch sort violations and missing msgs.
+        // User reports "got July 8th at end of timeline instead of July 15th"
+        // which points to either sort broken or newest msgs dropped.
+        {
+            let store = tl.model();
+            let n = store.n_items();
+            let oldest_ts = tl.oldest_timestamp();
+            let newest_ts = tl.newest_timestamp();
+            let mid_ts = if n > 0 {
+                store.item(n / 2).and_downcast::<MessageObject>().map(|o| o.timestamp()).unwrap_or(0)
+            } else { 0 };
+            tracing::info!(
+                "timeline-state: n={} oldest_ts={} mid_ts={} newest_ts={}",
+                n, oldest_ts, mid_ts, newest_ts
+            );
+        }
+
         if let Some(anchor_eid) = pre_splice_top_eid {
             let _g = crate::perf::scope_gt("prepend::scroll_to_anchor", 500);
             match tl.get_event(&anchor_eid) {
@@ -3455,25 +3475,42 @@ impl MessageView {
                     let store = tl.model();
                     match store.find(&anchor_msg) {
                         Some(anchor_pos) => {
-                            // scroll_to called synchronously here is a no-op because
-                            // GTK's items_changed reconciliation runs on the same
-                            // stack and clobbers vadj back to 0. Defer to an idle
-                            // so reconciliation finishes first. Also set vadj.value
-                            // directly as belt-and-suspenders: some GtkListView
-                            // versions queue scroll_to for their next measure pass
-                            // rather than immediately updating vadj, so a naive
-                            // scroll_to with default alignment can silently do
-                            // nothing when the anchor is far off-screen.
+                            // Two-pronged approach: schedule scroll_to for the
+                            // next idle (after items_changed reconciliation)
+                            // AND compute an explicit vadj offset as fallback.
+                            // GtkListView's scroll_to sometimes silently
+                            // no-ops even from an idle (proven by log showing
+                            // "vadj 0.0 → 0.0" on later paginations); the
+                            // explicit set_value guarantees SOMETHING moves
+                            // so the user isn't stuck at vp_top=0 triggering
+                            // another pagination immediately.
                             let lv = imp.list_view();
                             let sw = imp.scrolled_window().clone();
                             let anchor_eid_clone = anchor_eid.clone();
+                            // Rough estimate of anchor's pixel position from
+                            // its ordinal position and the room's per-row avg.
+                            let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
+                            let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
+                                (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
+                            } else { 60.0 };
+                            let estimated_target = (anchor_pos as f64) * per_row_est;
                             glib::idle_add_local_once(move || {
-                                let vadj_pre = sw.vadjustment().value();
+                                let vadj = sw.vadjustment();
+                                let vadj_pre = vadj.value();
                                 lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
-                                let vadj_post = sw.vadjustment().value();
+                                let after_scroll_to = vadj.value();
+                                // If scroll_to didn't move vadj (or moved to
+                                // something implausibly close to 0), fall back
+                                // to an explicit set_value. Clamped to
+                                // [0, upper-page_size] by GTK.
+                                if after_scroll_to < estimated_target * 0.5 {
+                                    vadj.set_value(estimated_target);
+                                }
+                                let final_vadj = vadj.value();
                                 tracing::info!(
-                                    "scroll-restore idle: eid={} → pos={} vadj {:.1} → {:.1}",
-                                    anchor_eid_clone, anchor_pos, vadj_pre, vadj_post
+                                    "scroll-restore idle: eid={} → pos={} est_target={:.1} vadj pre={:.1} after_scroll_to={:.1} final={:.1}",
+                                    anchor_eid_clone, anchor_pos, estimated_target,
+                                    vadj_pre, after_scroll_to, final_vadj
                                 );
                             });
                         }
