@@ -3347,6 +3347,33 @@ impl MessageView {
             old_value, old_upper, model_oldest_ts_before
         );
 
+        // CAPTURE ANCHOR BEFORE SPLICE. Walk visible ListView children
+        // NOW (pre-splice) to find the first row whose bottom edge is
+        // below the viewport top — that's the topmost user-visible msg
+        // and the anchor we want to keep in view after prepend.
+        let pre_splice_top_eid: Option<String> = {
+            let lv = imp.list_view();
+            let vp_top = vadj_before.value();
+            let mut found: Option<String> = None;
+            let mut child = lv.first_child();
+            while let Some(ref widget) = child {
+                if let Some(row) = Self::find_message_row(widget) {
+                    if let Some(bounds) = row.compute_bounds(&lv) {
+                        let row_bottom_in_lv = (bounds.y() + bounds.height()) as f64;
+                        if row_bottom_in_lv > vp_top {
+                            let eid = row.imp().event_id.borrow().clone();
+                            if !eid.is_empty() {
+                                found = Some(eid);
+                            }
+                            break;
+                        }
+                    }
+                }
+                child = widget.next_sibling();
+            }
+            found
+        };
+
         let n_prepended = objs.len();
         if !objs.is_empty() {
             tl.insert(objs);
@@ -3396,36 +3423,26 @@ impl MessageView {
         // oldest msg in the just-loaded batch instead of the youngest.
         // Explicitly re-setting after settlement guarantees the user's
         // reading position sticks.
-        let pre_splice_n = if n_prepended > 0 {
-            tl.n_items() - n_prepended as u32
-        } else { 0 };
-        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
-            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
-        } else { 60.0 };
-        let expected_added = n_prepended as f64 * per_row_est;
-        // Single synchronous shift — no idle_add, no delayed retry. The
-        // previous two-shot approach caused a visible bounce: first shot
-        // set vadj on next idle, GTK's items_changed reconciliation then
-        // ran and could reset vadj back to keep the scrollbar thumb
-        // position, second shot at 80ms detected this and re-shifted. The
-        // user saw the value bounce (~80ms of "wrong" position) as
-        // "content moves up to align itself" jitter.
-        //
-        // Apply the shift IMMEDIATELY, synchronously, right after
-        // tl.insert. This should hopefully happen before GTK's items_changed
-        // reconciliation sees the "wrong" vadj value, so reconciliation
-        // preserves our shift instead of clobbering it. If reconciliation
-        // still clobbers, we'll need a different mechanism than a delayed
-        // retry (e.g., connect to items_changed and re-set inside the
-        // signal handler).
-        let _ = old_value; // no longer needed — we shift by current, always
-        let vadj = imp.scrolled_window().vadjustment();
-        let cur_value = vadj.value();
-        vadj.set_value(cur_value + expected_added);
-        tracing::debug!(
-            "scroll-restore sync: cur={:.1} shift={:.1} → set {:.1}",
-            cur_value, expected_added, cur_value + expected_added
-        );
+        // Scroll restore using the pre-splice anchor we captured above.
+        // Find the anchor msg's NEW position in the store (shifted by the
+        // number of prepended items) and scroll_to it. GTK measures rows
+        // as needed to position accurately — no estimation, no heuristic,
+        // no overshooting to the bottom of the chat.
+        if let Some(anchor_eid) = pre_splice_top_eid {
+            if let Some(anchor_msg) = tl.get_event(&anchor_eid) {
+                let store = tl.model();
+                if let Some(anchor_pos) = store.find(&anchor_msg) {
+                    let lv = imp.list_view();
+                    lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
+                    tracing::debug!(
+                        "scroll-restore anchor: eid={} → pos={}",
+                        anchor_eid, anchor_pos
+                    );
+                }
+            }
+        }
+        let _ = old_value; // no longer used
+        let _ = n_prepended; // no longer used for scroll math
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
         // user report that the shorter cooldown combined with an aggressive
