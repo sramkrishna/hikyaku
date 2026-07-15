@@ -3455,14 +3455,27 @@ impl MessageView {
                     let store = tl.model();
                     match store.find(&anchor_msg) {
                         Some(anchor_pos) => {
+                            // scroll_to called synchronously here is a no-op because
+                            // GTK's items_changed reconciliation runs on the same
+                            // stack and clobbers vadj back to 0. Defer to an idle
+                            // so reconciliation finishes first. Also set vadj.value
+                            // directly as belt-and-suspenders: some GtkListView
+                            // versions queue scroll_to for their next measure pass
+                            // rather than immediately updating vadj, so a naive
+                            // scroll_to with default alignment can silently do
+                            // nothing when the anchor is far off-screen.
                             let lv = imp.list_view();
-                            let vadj_pre = imp.scrolled_window().vadjustment().value();
-                            lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
-                            let vadj_post = imp.scrolled_window().vadjustment().value();
-                            tracing::info!(
-                                "scroll-restore anchor: eid={} → pos={} vadj {:.1} → {:.1}",
-                                anchor_eid, anchor_pos, vadj_pre, vadj_post
-                            );
+                            let sw = imp.scrolled_window().clone();
+                            let anchor_eid_clone = anchor_eid.clone();
+                            glib::idle_add_local_once(move || {
+                                let vadj_pre = sw.vadjustment().value();
+                                lv.scroll_to(anchor_pos, gtk::ListScrollFlags::NONE, None);
+                                let vadj_post = sw.vadjustment().value();
+                                tracing::info!(
+                                    "scroll-restore idle: eid={} → pos={} vadj {:.1} → {:.1}",
+                                    anchor_eid_clone, anchor_pos, vadj_pre, vadj_post
+                                );
+                            });
                         }
                         None => tracing::warn!(
                             "scroll-restore: anchor eid={} found in Timeline but NOT in store.find()",
