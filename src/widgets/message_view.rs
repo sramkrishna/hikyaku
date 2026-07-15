@@ -3358,39 +3358,27 @@ impl MessageView {
             vadj_before.value(), vadj_before.upper(), tl.n_items()
         );
 
-        // Cap the store at MAX_STORE_SIZE to keep GTK height-tracking bounded.
-        // Items at the tail (high indices = newest messages) are evicted first
-        // when the user loads deep history via prepend.
-        // IMPORTANT: never evict unconfirmed echoes (empty event_id).
-        let store = tl.model().clone();
-        let n = store.n_items();
-        if n > MAX_STORE_SIZE {
-            // Scan forward from MAX_STORE_SIZE; stop before the first echo.
-            let mut evict_end = MAX_STORE_SIZE;
-            while evict_end < n {
-                let is_echo = store.item(evict_end)
-                    .and_downcast::<MessageObject>()
-                    .map(|o| o.event_id().is_empty())
-                    .unwrap_or(false);
-                if is_echo { break; }
-                evict_end += 1;
-            }
-            let remove_count = evict_end - MAX_STORE_SIZE;
-            if remove_count > 0 {
-                // Bulk tail eviction — one splice, one items_changed signal.
-                // Per-eid tl.remove() would fire N items_changed events which
-                // GtkListView processes on the frame boundary and shows as
-                // scroll jitter (measurable regression from Phase 2 migration).
-                let removed = tl.evict_range(MAX_STORE_SIZE, remove_count);
-                tracing::debug!(
-                    "prepend_messages: evicted {} newest via evict_range({}, {})",
-                    removed, MAX_STORE_SIZE, remove_count
-                );
-                // Signal that newest messages were evicted; the scroll handler
-                // will trigger a bg_refresh when the user returns to the bottom.
-                imp.tail_evicted.set(true);
-            }
-        }
+        // DISABLED: tail eviction during prepend created visible gaps.
+        //
+        // Previously, when Timeline exceeded MAX_STORE_SIZE after prepend, we
+        // evicted the NEWEST msgs from the tail (marking tail_evicted so a
+        // future scroll-to-bottom would trigger bg_refresh to reload them).
+        // Symptom: user scrolls to load history, prepend evicts recent msgs,
+        // then a live msg arrives and gets appended at the new tail — leaving
+        // a visible timeline gap between the newly-appended live msg and the
+        // remaining loaded content. Reported as "message at 19:50, next one
+        // above is Jun 17 08:46" with a huge time gap between.
+        //
+        // The cap existed to bound GTK height-tracking cost, but Timeline's
+        // quantized measure + the existing MAX_STORE_SIZE=400 limit on the
+        // active window make ~thousand-msg Timelines cheap enough. Growing
+        // beyond 400 on active pagination is preferable to losing recent
+        // msgs from view.
+        //
+        // A separate mechanism should cap TOTAL Timeline size over the room's
+        // lifetime — but that eviction should target the OLDEST msgs (which
+        // the user has scrolled past), not the newest. Deferred for later.
+        let _ = MAX_STORE_SIZE; // suppress unused warning; kept for the front-evict path in flush_pending_appends
         tl.set_prev_batch_token(prev_batch);
 
         // Scroll restore — shift vadj.value by the estimated added-content
