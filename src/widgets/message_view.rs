@@ -3420,6 +3420,7 @@ impl MessageView {
         let expected_added = n_prepended as f64 * per_row_est;
         let _ = old_value; // no longer needed — we shift by current, always
         let sw2 = sw.clone();
+        let view_weak2 = self.downgrade();
         glib::idle_add_local_once(move || {
             let vadj = sw.vadjustment();
             let cur_value = vadj.value();
@@ -3432,12 +3433,28 @@ impl MessageView {
         glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
             let vadj = sw2.vadjustment();
             let cur_value = vadj.value();
-            // If GTK's reconciliation reset us below the shift we asked for,
-            // re-apply. Detect by checking whether cur_value is at least the
-            // expected added height (which is where the first idle should
-            // have left us at minimum). Guard against re-shifting if the
-            // user has since scrolled further up (in which case cur_value
-            // is intentionally lower).
+            // Skip the second shot if the user has ACTIVELY SCROLLED within
+            // the last 100ms — otherwise our re-shift fights their scroll
+            // input. Symptom that motivated this guard: a small two-finger
+            // upward scroll after backpagination would land in the 80ms
+            // window; the second-shot's "cur_value < expected * 0.5" check
+            // then fired because the user had scrolled up (lowering
+            // cur_value), and we'd shift them DOWN by expected_added,
+            // undoing their scroll and looking like content "moves up to
+            // align itself."
+            let user_scrolling = view_weak2.upgrade()
+                .and_then(|v| v.imp().last_user_scroll_at.get())
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
+                .unwrap_or(false);
+            if user_scrolling {
+                tracing::debug!(
+                    "scroll-restore idle2: user actively scrolling, skipping re-shift"
+                );
+                return;
+            }
+            // Only re-apply if GTK's reconciliation actually reset us below
+            // where the first shot left us. Guard against re-shifting when
+            // cur_value is legitimately low from earlier scroll-past-trigger.
             if cur_value < expected_added * 0.5 {
                 vadj.set_value(cur_value + expected_added);
                 tracing::debug!(
