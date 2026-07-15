@@ -3303,7 +3303,6 @@ impl MessageView {
 
     /// Prepend older messages at the top (pagination).
     pub fn prepend_messages(&self, messages: &[crate::matrix::MessageInfo], prev_batch: Option<String>) {
-        const MAX_STORE_SIZE: u32 = 400;
         let imp = self.imp();
         let today = glib::DateTime::now_local().ok();
         let rid = imp.current_room_id.borrow().clone();
@@ -3358,27 +3357,26 @@ impl MessageView {
             vadj_before.value(), vadj_before.upper(), tl.n_items()
         );
 
-        // DISABLED: tail eviction during prepend created visible gaps.
+        // DISABLED: no in-session eviction of Timeline msgs at all.
         //
-        // Previously, when Timeline exceeded MAX_STORE_SIZE after prepend, we
-        // evicted the NEWEST msgs from the tail (marking tail_evicted so a
-        // future scroll-to-bottom would trigger bg_refresh to reload them).
-        // Symptom: user scrolls to load history, prepend evicts recent msgs,
-        // then a live msg arrives and gets appended at the new tail — leaving
-        // a visible timeline gap between the newly-appended live msg and the
-        // remaining loaded content. Reported as "message at 19:50, next one
-        // above is Jun 17 08:46" with a huge time gap between.
+        // Prepend used to tail-evict (drop NEWEST), flush_pending_appends used
+        // to front-evict (drop OLDEST). Both had the same shape of bug:
+        // remove content the user has explicitly loaded/paginated to during
+        // their active session, creating visible timeline gaps.
         //
-        // The cap existed to bound GTK height-tracking cost, but Timeline's
-        // quantized measure + the existing MAX_STORE_SIZE=400 limit on the
-        // active window make ~thousand-msg Timelines cheap enough. Growing
-        // beyond 400 on active pagination is preferable to losing recent
-        // msgs from view.
+        // Prepend + tail-evict: reported as "msg at 19:50, next one above is
+        // Jun 17" — eviction removed everything between the loaded history
+        // end and today's freshly-appended live msg.
         //
-        // A separate mechanism should cap TOTAL Timeline size over the room's
-        // lifetime — but that eviction should target the OLDEST msgs (which
-        // the user has scrolled past), not the newest. Deferred for later.
-        let _ = MAX_STORE_SIZE; // suppress unused warning; kept for the front-evict path in flush_pending_appends
+        // Flush + front-evict: if user is scrolled up reading history and
+        // live msgs arrive at the tail, front-eviction would drop what
+        // they're looking at.
+        //
+        // Timeline grows unbounded within a session. Memory reclaimed on
+        // room-switch away via evict_room_widgets (drops the whole Timeline
+        // when the room is evicted from the MAX_CACHED_ROOMS LRU). A proper
+        // lifetime-total cap that considers viewport distance can be added
+        // later if memory becomes a real concern.
         tl.set_prev_batch_token(prev_batch);
 
         // Scroll restore — shift vadj.value by the estimated added-content
@@ -4293,7 +4291,6 @@ impl MessageView {
     /// Flush all pending appends to the Timeline in a single insert call.
     /// Called from the idle scheduled by append_message().
     fn flush_pending_appends(&self) {
-        const MAX_STORE_SIZE: u32 = 400;
         let imp = self.imp();
         imp.append_flush_pending.set(false);
         let objs: Vec<MessageObject> = imp.pending_appends.borrow_mut().drain(..).collect();
@@ -4306,25 +4303,16 @@ impl MessageView {
         // Timeline.insert handles sort + dedup; multiple queued objects go
         // through in a batched splice (append_batch inside Timeline).
         tl.insert(objs);
-        // Evict oldest messages from the front to maintain the cap. We must
-        // not evict an unconfirmed echo, so compute the count of leading
-        // rows with a non-empty event_id, capped at overflow.
-        let new_n = tl.n_items();
-        if new_n > MAX_STORE_SIZE {
-            let target = new_n - MAX_STORE_SIZE;
-            let store = tl.model();
-            let mut evict: u32 = 0;
-            for i in 0..target {
-                match store.item(i).and_downcast::<MessageObject>() {
-                    Some(o) if !o.event_id().is_empty() => evict += 1,
-                    _ => break,
-                }
-            }
-            if evict > 0 {
-                let removed = tl.front_evict(evict);
-                tracing::debug!("flush_pending_appends: evicted {} from front, store={}", removed, tl.n_items());
-            }
-        }
+        // DISABLED: front eviction on live-msg append had the same shape of
+        // bug as the prepend tail-eviction — removed the OLDEST loaded msgs
+        // when new live msgs pushed the tail over the cap. If the user was
+        // scrolled up reading history, eviction would drop what they were
+        // looking at (they scroll further, hit missing msgs). Same
+        // reasoning as the prepend fix: never evict content the user has
+        // explicitly loaded during their session. Timeline grows within a
+        // room; memory reclaimed on room-switch via evict_room_widgets. A
+        // proper lifetime cap that considers viewport distance can be
+        // added later if memory becomes a real concern.
         if self.is_near_bottom() {
             self.scroll_to_bottom();
         }
