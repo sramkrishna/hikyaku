@@ -859,10 +859,14 @@ mod imp {
         /// list visually dense.
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             const ROW_HEIGHT_UNIT: i32 = 24;
+            // Count and log rate — GTK can call measure() multiple times per
+            // row per frame, and if this adds up to thousands per second
+            // during scroll it will show as micro-stuttering. Rate logged
+            // via a thread_local counter that reports every second.
+            super::MEASURE_CALLS.with(|c| c.set(c.get() + 1));
+            let _g = crate::perf::scope_gt("row_measure", 200);
             let (min, nat, min_bl, nat_bl) = self.parent_measure(orientation, for_size);
             if orientation == gtk::Orientation::Vertical {
-                // Round each up to the next unit. `.max(0)` guards against
-                // GTK passing -1 as an unset baseline; that stays -1.
                 let quantize = |v: i32| -> i32 {
                     if v <= 0 { v } else { (v + ROW_HEIGHT_UNIT - 1) / ROW_HEIGHT_UNIT * ROW_HEIGHT_UNIT }
                 };
@@ -880,6 +884,31 @@ use adw::prelude::*;
 use gtk::gio;
 use gtk::glib;
 use gtk::subclass::prelude::*;
+
+thread_local! {
+    /// Counter for MessageRow::measure() calls. Incremented on every
+    /// invocation; a 1-second timer reports the rate and resets.
+    /// GtkListView can call measure many times per row per frame during
+    /// scroll, so if this rate is thousands/sec on a plain scroll it's
+    /// a smoking gun for the micro-stutter.
+    pub(crate) static MEASURE_CALLS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+/// Install a periodic reporter for MEASURE_CALLS. Called once from the
+/// MessageView setup to start the timer.
+pub(crate) fn install_measure_rate_reporter() {
+    glib::timeout_add_local(std::time::Duration::from_secs(1), || {
+        let count = MEASURE_CALLS.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v
+        });
+        if count > 100 {
+            tracing::info!("measure-rate: {} MessageRow::measure() calls in last 1s", count);
+        }
+        glib::ControlFlow::Continue
+    });
+}
 
 /// Pre-render the sender label markup string for use in MessageObject.
 /// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load

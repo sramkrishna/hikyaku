@@ -656,6 +656,12 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            // Start the measure-rate reporter for this session. Reports the
+            // MessageRow::measure() call count every 1s if > 100/sec, to
+            // help catch cases where GtkListView is thrashing measure()
+            // during scroll and causing micro-stutter.
+            crate::widgets::message_row::install_measure_rate_reporter();
+
             // Tombstone banner link — click the replacement-room anchor to
             // route through the window's matrix-link handler (same path
             // used by message body links, so join / navigate state is
