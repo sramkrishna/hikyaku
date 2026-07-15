@@ -84,6 +84,14 @@ mod imp {
         pub media_cache: RefCell<std::collections::HashMap<String, String>>,
         /// Avatar cache: user_id → local file path of the downloaded thumbnail.
         pub avatar_cache: RefCell<std::collections::HashMap<String, String>>,
+        /// Decoded avatar textures: user_id → GdkTexture. Populated on first
+        /// use per session; MessageRow::bind reads from here instead of
+        /// calling Texture::from_filename per bind (which is synchronous
+        /// file I/O + image decode on the GTK thread — measured at
+        /// 500-1000µs per bind and directly caused scroll-through-backlog
+        /// micro-stutter). Insertion sites keep the path cache updated too
+        /// so paths remain queryable.
+        pub avatar_texture_cache: RefCell<std::collections::HashMap<String, gtk::gdk::Texture>>,
         /// Widget to anchor the next media preview popover to.
         pub media_preview_anchor: RefCell<Option<gtk::Widget>>,
         /// Shared media preview popover — reused across hovers.
@@ -236,6 +244,7 @@ mod imp {
                 user_id: RefCell::new(String::new()),
                 media_cache: RefCell::new(std::collections::HashMap::new()),
                 avatar_cache: RefCell::new(std::collections::HashMap::new()),
+                avatar_texture_cache: RefCell::new(std::collections::HashMap::new()),
                 media_preview_anchor: RefCell::new(None),
                 media_popover: {
                     let p = gtk::Popover::new();
@@ -2202,6 +2211,11 @@ impl MxWindow {
                     }
                     MatrixEvent::AvatarReady { user_id, path } => {
                         window.imp().avatar_cache.borrow_mut().insert(user_id.clone(), path.clone());
+                        // Invalidate the decoded-texture cache so the fresh
+                        // avatar gets decoded on next bind. Without this the
+                        // MessageRow bind fast-path would keep serving the
+                        // old texture forever after avatar changes.
+                        window.imp().avatar_texture_cache.borrow_mut().remove(&user_id);
                         // Update the visible nick-picker popover in place so
                         // the avatar appears without requiring the user to
                         // close and reopen the picker.

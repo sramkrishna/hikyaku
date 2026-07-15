@@ -1615,10 +1615,16 @@ impl MessageRow {
             }
         }
 
-        // Sender avatar — 32px next to the sender name. Image from the
-        // window's avatar_cache if we've downloaded it; initials-on-
-        // colour fallback otherwise. Walking to MxWindow is O(1) and the
-        // cache read is a HashMap get.
+        // Sender avatar — 32px next to the sender name. Reads decoded
+        // texture from the window's avatar_texture_cache; on cache miss,
+        // decodes from disk (Texture::from_filename) ONCE per session per
+        // sender and caches the result.
+        //
+        // The previous code called Texture::from_filename on EVERY bind,
+        // which is synchronous file I/O + image decode on the GTK thread —
+        // measured at 500-1000µs per bind, blowing the frame budget when
+        // scroll bursts landed 30 binds in ~50ms. This was the dominant
+        // cost after the notify-handler consolidation.
         {
             imp.sender_avatar.set_text(Some(sender.as_str()));
             imp.sender_avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
@@ -1630,11 +1636,23 @@ impl MessageRow {
                             if let Some(win) = window
                                 .downcast_ref::<crate::widgets::MxWindow>()
                             {
-                                let cache = win.imp().avatar_cache.borrow();
-                                if let Some(path) = cache.get(&sender_id) {
-                                    if !path.is_empty() {
-                                        if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
-                                            imp.sender_avatar.set_custom_image(Some(&tex));
+                                // Fast path: cached decoded texture.
+                                let cached_tex = win.imp().avatar_texture_cache
+                                    .borrow().get(&sender_id).cloned();
+                                if let Some(tex) = cached_tex {
+                                    imp.sender_avatar.set_custom_image(Some(&tex));
+                                } else {
+                                    // Slow path: decode from disk once, cache result.
+                                    let path = win.imp().avatar_cache
+                                        .borrow().get(&sender_id).cloned();
+                                    if let Some(path) = path {
+                                        if !path.is_empty() {
+                                            if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
+                                                imp.sender_avatar.set_custom_image(Some(&tex));
+                                                win.imp().avatar_texture_cache
+                                                    .borrow_mut()
+                                                    .insert(sender_id.clone(), tex);
+                                            }
                                         }
                                     }
                                 }
