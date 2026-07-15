@@ -580,12 +580,14 @@ impl Timeline {
 
         // Invariant check: walk the store and error-log any place where
         // ts decreases (sort violation). This is O(n) per mutation but
-        // only runs when RUST_LOG=hikyaku=debug or higher. Non-debug
-        // builds skip via tracing::enabled!.
-        if tracing::enabled!(tracing::Level::DEBUG) && new_n > 1 {
+        // Sort invariant check — WARN level so it fires with RUST_LOG=info
+        // (which is what `just debug-render` uses). O(n) per mutation but
+        // only VIOLATIONS log; the walk itself is silent on healthy stores.
+        if new_n > 1 {
             let mut prev_ts: u64 = 0;
             let mut violations: u32 = 0;
             let mut first_violation_pos: Option<u32> = None;
+            let mut first_violation_ts: (u64, u64) = (0, 0);
             for i in 0..new_n {
                 if let Some(msg) = store.item(i).and_downcast::<MessageObject>() {
                     let ts = msg.timestamp();
@@ -593,15 +595,17 @@ impl Timeline {
                         violations += 1;
                         if first_violation_pos.is_none() {
                             first_violation_pos = Some(i);
+                            first_violation_ts = (prev_ts, ts);
                         }
                     }
                     prev_ts = ts;
                 }
             }
             if violations > 0 {
-                tracing::error!(
-                    "timeline-invariant: {} sort violations in store (n={}), first at pos={:?}",
-                    violations, new_n, first_violation_pos
+                tracing::warn!(
+                    "timeline-invariant: {} sort violations in store (n={}), first at pos={:?} prev_ts={} < this_ts={} broken",
+                    violations, new_n, first_violation_pos,
+                    first_violation_ts.0, first_violation_ts.1
                 );
             }
         }
