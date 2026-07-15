@@ -3416,54 +3416,30 @@ impl MessageView {
         let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
             (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
         } else { 60.0 };
-        let sw = imp.scrolled_window().clone();
         let expected_added = n_prepended as f64 * per_row_est;
+        // Single synchronous shift — no idle_add, no delayed retry. The
+        // previous two-shot approach caused a visible bounce: first shot
+        // set vadj on next idle, GTK's items_changed reconciliation then
+        // ran and could reset vadj back to keep the scrollbar thumb
+        // position, second shot at 80ms detected this and re-shifted. The
+        // user saw the value bounce (~80ms of "wrong" position) as
+        // "content moves up to align itself" jitter.
+        //
+        // Apply the shift IMMEDIATELY, synchronously, right after
+        // tl.insert. This should hopefully happen before GTK's items_changed
+        // reconciliation sees the "wrong" vadj value, so reconciliation
+        // preserves our shift instead of clobbering it. If reconciliation
+        // still clobbers, we'll need a different mechanism than a delayed
+        // retry (e.g., connect to items_changed and re-set inside the
+        // signal handler).
         let _ = old_value; // no longer needed — we shift by current, always
-        let sw2 = sw.clone();
-        let view_weak2 = self.downgrade();
-        glib::idle_add_local_once(move || {
-            let vadj = sw.vadjustment();
-            let cur_value = vadj.value();
-            vadj.set_value(cur_value + expected_added);
-            tracing::debug!(
-                "scroll-restore idle1: cur={:.1} shift={:.1} → set {:.1}",
-                cur_value, expected_added, cur_value + expected_added
-            );
-        });
-        glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
-            let vadj = sw2.vadjustment();
-            let cur_value = vadj.value();
-            // Skip the second shot if the user has ACTIVELY SCROLLED within
-            // the last 100ms — otherwise our re-shift fights their scroll
-            // input. Symptom that motivated this guard: a small two-finger
-            // upward scroll after backpagination would land in the 80ms
-            // window; the second-shot's "cur_value < expected * 0.5" check
-            // then fired because the user had scrolled up (lowering
-            // cur_value), and we'd shift them DOWN by expected_added,
-            // undoing their scroll and looking like content "moves up to
-            // align itself."
-            let user_scrolling = view_weak2.upgrade()
-                .and_then(|v| v.imp().last_user_scroll_at.get())
-                .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
-                .unwrap_or(false);
-            if user_scrolling {
-                tracing::debug!(
-                    "scroll-restore idle2: user actively scrolling, skipping re-shift"
-                );
-                return;
-            }
-            // Only re-apply if GTK's reconciliation actually reset us below
-            // where the first shot left us. Guard against re-shifting when
-            // cur_value is legitimately low from earlier scroll-past-trigger.
-            if cur_value < expected_added * 0.5 {
-                vadj.set_value(cur_value + expected_added);
-                tracing::debug!(
-                    "scroll-restore idle2: reconciliation reset us, \
-                     re-shifting from {:.1} by {:.1}",
-                    cur_value, expected_added
-                );
-            }
-        });
+        let vadj = imp.scrolled_window().vadjustment();
+        let cur_value = vadj.value();
+        vadj.set_value(cur_value + expected_added);
+        tracing::debug!(
+            "scroll-restore sync: cur={:.1} shift={:.1} → set {:.1}",
+            cur_value, expected_added, cur_value + expected_added
+        );
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
         // user report that the shorter cooldown combined with an aggressive
