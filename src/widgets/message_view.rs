@@ -575,6 +575,8 @@ mod imp {
             // strand the user at value=0 with any latch-based trigger).
             let view_weak = self.obj().downgrade();
             let guard_rid = room_id.to_string();
+            let last_viewport_log_ts: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> =
+                std::rc::Rc::new(std::cell::Cell::new(None));
             sw.vadjustment().connect_value_notify(move |adj| {
                 let Some(view) = view_weak.upgrade() else { return };
                 let imp = view.imp();
@@ -585,6 +587,43 @@ mod imp {
                     imp.tail_evicted.set(false);
                     if let Some(ref cb) = *imp.on_scroll_bottom.borrow() {
                         cb();
+                    }
+                }
+                // Diagnostic: log the visible bottom row when we're at/near
+                // vadj.upper. Throttled to once per second so it doesn't spam
+                // during kinetic scroll. Shows msg position + timestamp of
+                // the last visible row so we can correlate with user's
+                // "Jul 8 at end" report.
+                if near_bottom {
+                    let now = std::time::Instant::now();
+                    let should_log = last_viewport_log_ts.get()
+                        .map(|t| now.duration_since(t).as_millis() > 1000)
+                        .unwrap_or(true);
+                    if should_log {
+                        last_viewport_log_ts.set(Some(now));
+                        let lv = imp.list_view();
+                        let mut last_visible_child = lv.first_child();
+                        let mut last_bound_eid = String::new();
+                        let mut last_bound_ts: u64 = 0;
+                        let mut rows_seen = 0u32;
+                        while let Some(ref widget) = last_visible_child {
+                            if let Some(row) = crate::widgets::MessageView::find_message_row(widget) {
+                                let eid = row.imp().event_id.borrow().clone();
+                                if !eid.is_empty() {
+                                    last_bound_eid = eid;
+                                    last_bound_ts = *row.imp().timestamp_val.borrow();
+                                    rows_seen += 1;
+                                }
+                            }
+                            last_visible_child = widget.next_sibling();
+                        }
+                        let rid = imp.current_room_id.borrow().clone();
+                        let n = imp.timelines.borrow().get(&rid).map(|t| t.n_items()).unwrap_or(0);
+                        tracing::info!(
+                            "viewport-at-bottom: n_items={} rows_rendered={} last_visible_eid={} last_visible_ts={} vadj value={:.1} upper={:.1} page_size={:.1}",
+                            n, rows_seen, last_bound_eid, last_bound_ts,
+                            adj.value(), adj.upper(), adj.page_size()
+                        );
                     }
                 }
             });
