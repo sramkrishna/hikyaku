@@ -3468,20 +3468,30 @@ impl MessageView {
         // number of prepended items) and scroll_to it. GTK measures rows
         // as needed to position accurately — no estimation, no heuristic,
         // no overshooting to the bottom of the chat.
-        // Log Timeline state so we can catch sort violations and missing msgs.
-        // User reports "got July 8th at end of timeline instead of July 15th"
-        // which points to either sort broken or newest msgs dropped.
+        // Log Timeline state + actual timestamps at the last 3 positions.
+        // User reports "Jul 8 at end, Jul 15 above" — need to see whether
+        // the store's actual item(n-1) matches the cached newest_ts. If
+        // they diverge, some code path is calling refresh_derived_state
+        // out of order with a store mutation.
         {
             let store = tl.model();
             let n = store.n_items();
             let oldest_ts = tl.oldest_timestamp();
             let newest_ts = tl.newest_timestamp();
-            let mid_ts = if n > 0 {
-                store.item(n / 2).and_downcast::<MessageObject>().map(|o| o.timestamp()).unwrap_or(0)
-            } else { 0 };
+            let read_ts = |i: u32| -> u64 {
+                if i < n {
+                    store.item(i).and_downcast::<MessageObject>().map(|o| o.timestamp()).unwrap_or(0)
+                } else { 0 }
+            };
+            let ts_end = if n > 0 { read_ts(n - 1) } else { 0 };
+            let ts_end_1 = if n > 1 { read_ts(n - 2) } else { 0 };
+            let ts_end_2 = if n > 2 { read_ts(n - 3) } else { 0 };
+            let mid_ts = if n > 0 { read_ts(n / 2) } else { 0 };
             tracing::info!(
-                "timeline-state: n={} oldest_ts={} mid_ts={} newest_ts={}",
-                n, oldest_ts, mid_ts, newest_ts
+                "timeline-state: n={} oldest={} mid={} newest_cached={} \
+                 actual[n-3]={} actual[n-2]={} actual[n-1]={}",
+                n, oldest_ts, mid_ts, newest_ts,
+                ts_end_2, ts_end_1, ts_end
             );
         }
 
