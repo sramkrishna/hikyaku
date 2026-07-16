@@ -929,6 +929,35 @@ pub fn invalidate_avatar_texture(user_id: &str) {
     AVATAR_TEXTURES.with(|c| { c.borrow_mut().remove(user_id); });
 }
 
+thread_local! {
+    /// event_id → (count, last-log-count) — tracks how many times each
+    /// specific msg has been bound to a MessageRow this session. A
+    /// runaway count for a single eid signals a recycle-oscillation
+    /// loop where GtkListView is repeatedly rebinding the same msg
+    /// (usually due to a height feedback loop). Rate-limited log so
+    /// long-lived scroll of unique msgs doesn't spam.
+    static BIND_COUNT_PER_MSG: std::cell::RefCell<std::collections::HashMap<String, (u32, u32)>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn bind_rate_track(eid: &str) {
+    BIND_COUNT_PER_MSG.with(|m| {
+        let mut m = m.borrow_mut();
+        let entry = m.entry(eid.to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        // Log at 10, 50, 100, 500 to catch escalating recycle loops.
+        let should_log = matches!(entry.0, 10 | 50 | 100 | 500)
+            || (entry.0 >= 1000 && entry.0 % 500 == 0);
+        if should_log && entry.0 > entry.1 {
+            entry.1 = entry.0;
+            tracing::warn!(
+                "bind-oscillation: msg eid={} bound {} times this session — recycle loop suspected",
+                eid, entry.0
+            );
+        }
+    });
+}
+
 /// Install a periodic reporter for MEASURE_CALLS. Called once from the
 /// MessageView setup to start the timer.
 pub(crate) fn install_measure_rate_reporter() {
@@ -1382,6 +1411,19 @@ impl MessageRow {
     ) {
         let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
+
+        // Diagnostic: count bind calls per-msg. If a specific msg is being
+        // bound many times in a short window, that's a recycle loop
+        // signature — GtkListView is toggling this row between two items
+        // repeatedly because of a height-measurement feedback loop. Log
+        // the eid on the 10th and 50th bind (rate-limited so a genuine
+        // long-lived row bound once doesn't spam).
+        {
+            let new_eid = msg.event_id();
+            if !new_eid.is_empty() {
+                bind_rate_track(&new_eid);
+            }
+        }
 
         // Defensive worker enqueue: if a msg somehow lands here with needs_markup
         // still true (a code path that skipped info_to_obj's eager enqueue), get
