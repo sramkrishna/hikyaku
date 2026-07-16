@@ -161,6 +161,15 @@ mod imp {
         /// FNV-1a hash of the last rendered reactions JSON.
         /// Compared against MessageObject::reactions_hash() — O(1) with no allocation.
         pub last_reactions_hash: std::cell::Cell<u64>,
+        /// Cached measured height for the currently-bound msg + for_size.
+        /// Returned unchanged on repeat measure() calls with the same
+        /// for_size — otherwise parent_measure can return slightly-varying
+        /// heights (async markup delivery, GTK's internal remeasure passes)
+        /// and each variation drives GtkListView to re-layout, causing
+        /// visible row oscillation / jitter. Invalidated on bind (see
+        /// bind_message_object) so a genuine content change re-measures.
+        /// Tuple is (for_size, min, nat). for_size == -1 means unset.
+        pub cached_measure_v: std::cell::Cell<(i32, i32, i32)>,
         /// Pool of reaction pill labels reused across rebinds. Hide unused ones
         /// instead of removing + recreating them. Widget construction is the
         /// costly path per CLAUDE.md §3, so we pay the allocation once.
@@ -859,18 +868,31 @@ mod imp {
         /// list visually dense.
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             const ROW_HEIGHT_UNIT: i32 = 24;
-            // Count and log rate — GTK can call measure() multiple times per
-            // row per frame, and if this adds up to thousands per second
-            // during scroll it will show as micro-stuttering. Rate logged
-            // via a thread_local counter that reports every second.
             super::MEASURE_CALLS.with(|c| c.set(c.get() + 1));
             let _g = crate::perf::scope_gt("row_measure", 200);
+
+            // For vertical measurement, return a cached height if we've
+            // measured this row at the same for_size since the last bind.
+            // Prevents the "slightly-varying heights on repeated measure"
+            // that drives GtkListView layout thrash / row oscillation.
+            // Cache is invalidated at bind_message_object start.
+            if orientation == gtk::Orientation::Vertical {
+                let (cached_for_size, cached_min, cached_nat) = self.cached_measure_v.get();
+                if cached_for_size == for_size && cached_min > 0 && cached_nat > 0 {
+                    // Reuse cached — return the same values GTK saw last time.
+                    return (cached_min, cached_nat, -1, -1);
+                }
+            }
+
             let (min, nat, min_bl, nat_bl) = self.parent_measure(orientation, for_size);
             if orientation == gtk::Orientation::Vertical {
                 let quantize = |v: i32| -> i32 {
                     if v <= 0 { v } else { (v + ROW_HEIGHT_UNIT - 1) / ROW_HEIGHT_UNIT * ROW_HEIGHT_UNIT }
                 };
-                (quantize(min), quantize(nat), min_bl, nat_bl)
+                let q_min = quantize(min);
+                let q_nat = quantize(nat);
+                self.cached_measure_v.set((for_size, q_min, q_nat));
+                (q_min, q_nat, min_bl, nat_bl)
             } else {
                 (min, nat, min_bl, nat_bl)
             }
@@ -1377,6 +1399,11 @@ impl MessageRow {
     ) {
         let _g = crate::perf::scope("bind_message_object");
         let imp = self.imp();
+        // Invalidate the cached measure — this row is being rebound to
+        // (possibly) different content, so any cached height from the
+        // previous msg is stale. Next measure() call will recompute and
+        // re-cache.
+        imp.cached_measure_v.set((-1, 0, 0));
 
         // Defensive worker enqueue: if a msg somehow lands here with needs_markup
         // still true (a code path that skipped info_to_obj's eager enqueue), get
