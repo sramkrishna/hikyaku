@@ -1487,27 +1487,28 @@ impl MessageRow {
         // represents the new item, but with no height delta GTK's
         // measurement converges immediately. The next non-oscillating
         // bind (after the loop dies) syncs all content correctly.
+        // Track bind history for diagnostic purposes only. The previous
+        // "return early on A→B→A oscillation" gate was removed because it
+        // left the row widget displaying the PREVIOUS msg's content while
+        // the model said it represents the new item. When oscillation
+        // persisted (which it does under some pagination conditions), the
+        // row stayed stuck showing wrong content — user reported "Jul 8
+        // at end of timeline" when store data clearly had Jul 15 there.
+        //
+        // The gate assumed "next non-oscillating bind syncs all content
+        // correctly" — but if GtkListView doesn't rebind (nothing has
+        // changed from its perspective), the row is permanently wrong.
+        //
+        // Rendering correctly on every bind is more important than
+        // avoiding height oscillation. If oscillation returns as a
+        // measurable jitter cause, address it by stabilizing the height
+        // source (usually inconsistent measure() results), not by
+        // skipping widget updates.
         let new_eid = msg.event_id();
-        let oscillating = {
-            let hist = imp.bind_history.borrow();
-            is_recycle_oscillation(&hist[0], &hist[1], &new_eid)
-        };
         {
             let mut hist = imp.bind_history.borrow_mut();
             let prev_last = std::mem::replace(&mut hist[1], new_eid.clone());
             hist[0] = prev_last;
-        }
-        if oscillating {
-            // Demoted to debug: during a scroll storm this fires hundreds of
-            // times per second from the GTK thread, and the synchronous
-            // stderr writes were measurable as additional jitter (similar
-            // to the per-bind diag fix in 762238f). Re-enable with
-            // RUST_LOG=hikyaku=debug when investigating new osc paths.
-            tracing::debug!(
-                "scroll-diag: bind oscillation detected on row eid={new_eid:?}; \
-                 skipping bind entirely to break height feedback loop"
-            );
-            return;
         }
 
         // The event_id + reactions handlers are now merged into a single
