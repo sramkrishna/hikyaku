@@ -3392,24 +3392,28 @@ impl MessageView {
             .map(|o| o.event_id())
             .filter(|e| !e.is_empty())
             .collect();
-        let after_dedup: Vec<&crate::matrix::MessageInfo> = messages
+        // Filter: drop msgs already in Timeline (or pending_appends). Timeline's
+        // event_index catches exact-duplicate re-deliveries.
+        //
+        // The strict-prepend filter (drop ts >= cur_oldest) that used to be
+        // here has been removed — diagnostic confirmed it dropped 100% of
+        // legitimate new msgs when the server returns fill-a-gap results
+        // rather than extend-oldest-back results. Matrix servers routinely
+        // return msgs to fill sync gaps rather than pure "even older than
+        // Timeline's oldest" msgs, and blocking those makes pagination
+        // completely useless (log showed 200+ new msgs delivered, 0 accepted,
+        // Timeline oldest never advancing).
+        //
+        // Timeline.insert handles gap-fills correctly via chronological
+        // sort placement. The original "blending" concern about gap-fills
+        // was really about SORT VIOLATIONS and evicted msgs — both
+        // separately fixed.
+        let filtered: Vec<&crate::matrix::MessageInfo> = messages
             .iter()
             .filter(|m| m.event_id.is_empty()
                 || (!tl.has_event(&m.event_id) && !pending_eids.contains(&m.event_id)))
             .collect();
-        let filtered: Vec<&crate::matrix::MessageInfo> = after_dedup
-            .iter()
-            .copied()
-            .filter(|m| cur_oldest == 0 || m.timestamp < cur_oldest)
-            .collect();
-        tracing::info!(
-            "prepend-filter: input={} after_dedup={} after_strict_prepend={} (dropped_by_dedup={} dropped_by_strict={})",
-            messages.len(),
-            after_dedup.len(),
-            filtered.len(),
-            messages.len() - after_dedup.len(),
-            after_dedup.len() - filtered.len()
-        );
+        let _ = cur_oldest; // no longer used for filtering
         // No sort here — Timeline::insert sorts internally as its invariant
         // guarantee. Input from handle_fetch_older's chunk accumulation is
         // partially unsorted at chunk boundaries; Timeline's single sort
