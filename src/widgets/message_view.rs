@@ -2703,20 +2703,42 @@ impl MessageView {
                 return;
             }
             imp.pending_markup_refresh.set(false);
-            // DIAGNOSTIC: drain rebind is suppressed. Prior confirmed that
-            // this rebind loop drives the row-oscillation. Keep the flag
-            // machinery running (above) so anything that depends on the
-            // shepherd being callable behaves normally; just don't
-            // actually rebind visible rows here.
+            // Drain: apply pending markup updates DIRECTLY to visible row
+            // labels. No full bind — that's what drove the rebind loop.
+            // For each visible row whose body_hash cache is invalidated
+            // (== 0, set by the notify::rendered-markup handler when it
+            // deferred due to scroll), look up the msg and set_markup on
+            // the label. Update the cache so future binds skip the render.
             //
-            // Row-widget-side effect while this is disabled: rows that
-            // receive markup while currently visible show fallback until
-            // the ListView recycles them (scroll them out then back in).
-            // Info_to_obj eager-enqueues the worker at msg construction,
-            // so for msgs entering view after the initial load the
-            // markup is usually already delivered by the time bind reads it.
-            let _ = view.row_context(); // keep the type-check bindings alive
-            let _ = imp.list_view();
+            // Height may change from set_markup; GTK reports the new
+            // measure on next layout pass. 48px quantization absorbs
+            // same-bucket variance; only bucket-crossing changes shift
+            // vadj — one-time per row, not a loop, because set_markup on
+            // a label doesn't fire MessageObject notifies.
+            let list_view = imp.list_view();
+            let mut child = list_view.first_child();
+            let mut applied = 0u32;
+            while let Some(ref widget) = child {
+                if let Some(row) = Self::find_message_row(widget) {
+                    if row.imp().last_body_hash.get() == 0 {
+                        let eid = row.imp().event_id.borrow().clone();
+                        if !eid.is_empty() {
+                            if let Some(msg) = view.current_timeline_lookup(&eid) {
+                                let markup = msg.rendered_markup();
+                                if !markup.is_empty() {
+                                    row.imp().body_label.set_markup(&markup);
+                                    row.imp().last_body_hash.set(msg.body_hash());
+                                    applied += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                child = widget.next_sibling();
+            }
+            if applied > 0 {
+                tracing::debug!("markup-drain: applied set_markup to {} visible rows", applied);
+            }
         });
     }
 

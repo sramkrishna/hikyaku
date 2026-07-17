@@ -1870,15 +1870,48 @@ impl MessageRow {
                 }
                 "rendered-markup" => {
                     if *row.imp().event_id.borrow() != bound_eid { return; }
-                    if msg.rendered_markup().is_empty() { return; }
-                    // Invalidate cache; let the central shepherd rebuild
-                    // during a scroll-quiet window.
-                    row.imp().last_body_hash.set(0);
-                    if let Some(view) = row.ancestor(crate::widgets::MessageView::static_type())
+                    let markup = msg.rendered_markup();
+                    if markup.is_empty() { return; }
+                    // Direct label update — NO full bind. Previous shepherd
+                    // called bind_message_object which drove a rebind-loop
+                    // during backpagination markup delivery (100+ binds per
+                    // msg observed). Applying set_markup directly to the
+                    // label is a single GTK property change that doesn't
+                    // fire any MessageObject notifies, so it can't cascade.
+                    //
+                    // Height may change from the set_markup — GTK's row
+                    // measure will report the new value on next layout
+                    // pass. The 48px quantization absorbs same-bucket
+                    // variance; only genuine bucket-crossing changes
+                    // (fallback → multi-line HTML) produce a shift, and
+                    // those are exactly the updates the user wants to
+                    // see land.
+                    //
+                    // Defer if scroll is active — apply during kinetic
+                    // decay would jitter. Queue in a thread_local
+                    // per-view drain (see MessageView infrastructure).
+                    let scroll_active = row.ancestor(crate::widgets::MessageView::static_type())
                         .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok())
-                    {
-                        view.request_pending_markup_refresh();
+                        .and_then(|v| v.imp().last_user_scroll_at.get())
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+                        .unwrap_or(false);
+                    if scroll_active {
+                        // Queue for scroll-quiet drain. Keep the cache
+                        // invalidation so bind knows to re-render if
+                        // the row is recycled later.
+                        row.imp().last_body_hash.set(0);
+                        if let Some(view) = row.ancestor(crate::widgets::MessageView::static_type())
+                            .and_then(|w| w.downcast::<crate::widgets::MessageView>().ok())
+                        {
+                            view.request_pending_markup_refresh();
+                        }
+                        return;
                     }
+                    // Not scrolling — apply immediately. Update body_hash
+                    // cache so future binds skip re-render (label is already
+                    // showing correct content).
+                    row.imp().body_label.set_markup(&markup);
+                    row.imp().last_body_hash.set(msg.body_hash());
                 }
                 _ => {} // Other property changes are not reactive.
             }
