@@ -2659,23 +2659,15 @@ impl MessageView {
     /// during that window, the timer stays armed; the flag prevents parallel
     /// timers from stacking up.
     pub fn request_pending_markup_refresh(&self) {
-        // DIAGNOSTIC: shepherd is disabled. Suspected as the cause of the
-        // rebind-oscillation loop during backpagination scroll — every
-        // notify::rendered-markup fired by the worker delivering markup for
-        // just-loaded msgs invalidated a row's body-hash cache and triggered
-        // the shepherd to rebind visible rows. Rebind changed heights, GTK
-        // re-laid out, more notifies fired, loop.
-        //
-        // With the shepherd disabled: rows that receive fresh markup while
-        // bound will show the plain-text fallback until they're recycled
-        // (scrolled out then back into view). Info_to_obj eagerly enqueues
-        // the worker at msg construction, so for msgs viewed via later
-        // scroll the markup is usually ready when bind reads it.
-        //
-        // If oscillation stops with this off, the shepherd needs a
-        // fundamentally different design (batch-once-per-load, or apply
-        // markup directly without rebind).
-        let _ = self.imp().pending_markup_refresh.get();
+        // Flag/timer machinery restored — only the drain's rebind is
+        // suppressed (see schedule_markup_refresh_attempt). This isolates
+        // the shepherd's rebind loop as the suspect without touching the
+        // rest of the scroll/pagination infrastructure that may depend
+        // on this method being called normally.
+        let imp = self.imp();
+        if imp.pending_markup_refresh.get() { return; }
+        imp.pending_markup_refresh.set(true);
+        self.schedule_markup_refresh_attempt();
     }
 
     fn schedule_markup_refresh_attempt(&self) {
@@ -2693,34 +2685,20 @@ impl MessageView {
                 return;
             }
             imp.pending_markup_refresh.set(false);
-            // Walk visible rows and rebind any whose body-hash cache was
-            // invalidated (set to 0 by notify::rendered-markup handler).
-            // The rebind picks up the fresh rendered_markup. One pass →
-            // one GTK layout pass over the viewport, applied in a single
-            // frame budget instead of scattered.
-            let ctx = view.row_context();
-            let list_view = imp.list_view();
-            let mut child = list_view.first_child();
-            let mut refreshed = 0u32;
-            while let Some(ref widget) = child {
-                if let Some(row) = Self::find_message_row(widget) {
-                    if row.imp().last_body_hash.get() == 0 {
-                        // Find the msg this row is bound to. Look up via
-                        // Timeline using the row's cached event_id.
-                        let eid = row.imp().event_id.borrow().clone();
-                        if !eid.is_empty() {
-                            if let Some(msg) = view.current_timeline_lookup(&eid) {
-                                row.bind_message_object(&msg, &ctx);
-                                refreshed += 1;
-                            }
-                        }
-                    }
-                }
-                child = widget.next_sibling();
-            }
-            if refreshed > 0 {
-                tracing::debug!("markup-refresh: rebound {} visible rows", refreshed);
-            }
+            // DIAGNOSTIC: drain rebind is suppressed. Prior confirmed that
+            // this rebind loop drives the row-oscillation. Keep the flag
+            // machinery running (above) so anything that depends on the
+            // shepherd being callable behaves normally; just don't
+            // actually rebind visible rows here.
+            //
+            // Row-widget-side effect while this is disabled: rows that
+            // receive markup while currently visible show fallback until
+            // the ListView recycles them (scroll them out then back in).
+            // Info_to_obj eager-enqueues the worker at msg construction,
+            // so for msgs entering view after the initial load the
+            // markup is usually already delivered by the time bind reads it.
+            let _ = view.row_context(); // keep the type-check bindings alive
+            let _ = imp.list_view();
         });
     }
 
