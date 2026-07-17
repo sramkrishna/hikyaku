@@ -3392,12 +3392,24 @@ impl MessageView {
             .map(|o| o.event_id())
             .filter(|e| !e.is_empty())
             .collect();
-        let filtered: Vec<&crate::matrix::MessageInfo> = messages
+        let after_dedup: Vec<&crate::matrix::MessageInfo> = messages
             .iter()
             .filter(|m| m.event_id.is_empty()
                 || (!tl.has_event(&m.event_id) && !pending_eids.contains(&m.event_id)))
+            .collect();
+        let filtered: Vec<&crate::matrix::MessageInfo> = after_dedup
+            .iter()
+            .copied()
             .filter(|m| cur_oldest == 0 || m.timestamp < cur_oldest)
             .collect();
+        tracing::info!(
+            "prepend-filter: input={} after_dedup={} after_strict_prepend={} (dropped_by_dedup={} dropped_by_strict={})",
+            messages.len(),
+            after_dedup.len(),
+            filtered.len(),
+            messages.len() - after_dedup.len(),
+            after_dedup.len() - filtered.len()
+        );
         // No sort here — Timeline::insert sorts internally as its invariant
         // guarantee. Input from handle_fetch_older's chunk accumulation is
         // partially unsorted at chunk boundaries; Timeline's single sort
