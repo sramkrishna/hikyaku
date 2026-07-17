@@ -549,6 +549,24 @@ mod imp {
                         let fetching = imp.fetching_older.get();
                         let has_token = imp.timelines.borrow().get(&input_rid)
                             .map(|t| t.has_prev_batch()).unwrap_or(false);
+                        // Diagnostic: log every scroll-up input at trigger site so
+                        // we can see WHICH condition is blocking pagination when
+                        // user reports "backscroll doesn't work." Throttled to
+                        // once per second by comparing against a stashed instant.
+                        {
+                            static LAST_LOG: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+                                std::sync::OnceLock::new();
+                            let mtx = LAST_LOG.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+                            let mut last = mtx.lock().unwrap();
+                            if last.elapsed() > std::time::Duration::from_millis(1000) {
+                                *last = std::time::Instant::now();
+                                tracing::info!(
+                                    "scroll-up-trigger: vadj={:.1} near_top={} fetching={} has_token={} would_fire={}",
+                                    vadj.value(), near_top, fetching, has_token,
+                                    near_top && !fetching && has_token
+                                );
+                            }
+                        }
                         if near_top && !fetching && has_token {
                             tracing::info!(
                                 "scroll-diag: input-driven backpaginate room={input_rid} \
