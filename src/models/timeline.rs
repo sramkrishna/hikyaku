@@ -256,21 +256,44 @@ impl Timeline {
             // scrambled order (today, may 20, yesterday, may 24, ...) once
             // multiple new msgs landed in the same gap.
             if !gap_fills.is_empty() {
-                let mut placements: Vec<(u32, MessageObject)> = gap_fills
-                    .iter()
-                    .map(|obj| (sorted_insert_pos(store, obj.timestamp()), obj.clone()))
-                    .collect();
-                placements.sort_by(|a, b| {
-                    b.0.cmp(&a.0)
-                        .then_with(|| b.1.timestamp().cmp(&a.1.timestamp()))
-                });
-                for (pos, obj) in placements {
-                    let eid = obj.event_id();
-                    if !eid.is_empty() {
-                        idx_updates.push((eid, obj.clone()));
+                // Compute each gap-fill's insert position against the ORIGINAL
+                // store (pre-splice). Group by position — items that all want
+                // to slot into the same gap share a splice.
+                //
+                // Why this matters: one splice per gap-fill fires one
+                // items_changed. During pagination that delivers 200
+                // interior msgs, 200 individual splices drive GtkListView
+                // to recycle/remeasure every visible row 200 times — the
+                // row-oscillation loop observed as bind counts of 50+ per
+                // msg. Batching same-position gap-fills into a single splice
+                // collapses that to one items_changed per unique position.
+                //
+                // Ordering:
+                //   - Process position groups from HIGHEST to LOWEST so
+                //     earlier splices don't shift later positions.
+                //   - Within a group, sort ASC by timestamp so the batch is
+                //     already chronologically ordered when spliced in place
+                //     (splice inserts the slice contiguously; ASC sort within
+                //     the batch preserves the Timeline's overall ASC-by-ts
+                //     invariant).
+                let mut by_pos: std::collections::BTreeMap<u32, Vec<MessageObject>> =
+                    std::collections::BTreeMap::new();
+                for obj in gap_fills.into_iter() {
+                    let pos = sorted_insert_pos(store, obj.timestamp());
+                    by_pos.entry(pos).or_default().push(obj);
+                }
+                // BTreeMap iterates ASC; iterate reverse to get DESC.
+                for (pos, mut group) in by_pos.into_iter().rev() {
+                    group.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+                    for obj in &group {
+                        let eid = obj.event_id();
+                        if !eid.is_empty() {
+                            idx_updates.push((eid, obj.clone()));
+                        }
                     }
-                    store.splice(pos, 0, &[obj]);
-                    n += 1;
+                    let added = group.len() as u32;
+                    store.splice(pos, 0, &group);
+                    n += added;
                 }
             }
         }
