@@ -2659,10 +2659,23 @@ impl MessageView {
     /// during that window, the timer stays armed; the flag prevents parallel
     /// timers from stacking up.
     pub fn request_pending_markup_refresh(&self) {
-        let imp = self.imp();
-        if imp.pending_markup_refresh.get() { return; }
-        imp.pending_markup_refresh.set(true);
-        self.schedule_markup_refresh_attempt();
+        // DIAGNOSTIC: shepherd is disabled. Suspected as the cause of the
+        // rebind-oscillation loop during backpagination scroll — every
+        // notify::rendered-markup fired by the worker delivering markup for
+        // just-loaded msgs invalidated a row's body-hash cache and triggered
+        // the shepherd to rebind visible rows. Rebind changed heights, GTK
+        // re-laid out, more notifies fired, loop.
+        //
+        // With the shepherd disabled: rows that receive fresh markup while
+        // bound will show the plain-text fallback until they're recycled
+        // (scrolled out then back into view). Info_to_obj eagerly enqueues
+        // the worker at msg construction, so for msgs viewed via later
+        // scroll the markup is usually ready when bind reads it.
+        //
+        // If oscillation stops with this off, the shepherd needs a
+        // fundamentally different design (batch-once-per-load, or apply
+        // markup directly without rebind).
+        let _ = self.imp().pending_markup_refresh.get();
     }
 
     fn schedule_markup_refresh_attempt(&self) {
