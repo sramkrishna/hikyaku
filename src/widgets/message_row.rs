@@ -169,6 +169,14 @@ mod imp {
         /// consecutive msgs from the same person; caching skips ~30-50% of
         /// avatar work at zero correctness cost.
         pub last_sender_id: std::cell::RefCell<String>,
+        /// Last formatted_ts written to timestamp_label. Skip set_label
+        /// on rebind when unchanged — GtkLabel doesn't dedupe internally
+        /// and every set_label triggers a Pango relayout invalidation.
+        /// Chat msgs from the same minute share this string.
+        pub last_formatted_ts: std::cell::RefCell<String>,
+        /// True when body_label.set_selectable was set to true by a click.
+        /// Tracked so bind's reset-to-false is a no-op when already false.
+        pub selectable_state: std::cell::Cell<bool>,
         /// Pool of reaction pill labels reused across rebinds. Hide unused ones
         /// instead of removing + recreating them. Widget construction is the
         /// costly path per CLAUDE.md §3, so we pay the allocation once.
@@ -693,8 +701,10 @@ mod imp {
             // Select-text button — flip body_label selectable on demand,
             // grab focus so drag-selection starts immediately.
             let body_label = self.body_label.clone();
+            let sel_state_on = self.selectable_state.clone();
             select_button.connect_clicked(move |_| {
                 body_label.set_selectable(true);
+                sel_state_on.set(true);
                 body_label.grab_focus();
             });
 
@@ -749,8 +759,10 @@ mod imp {
             // every row except the one the user is actively selecting in.
             let focus_ctrl = gtk::EventControllerFocus::new();
             let body_label_leave = self.body_label.clone();
+            let sel_state_off = self.selectable_state.clone();
             focus_ctrl.connect_leave(move |_| {
                 body_label_leave.set_selectable(false);
+                sel_state_off.set(false);
             });
             self.body_label.add_controller(focus_ctrl);
 
@@ -1490,8 +1502,13 @@ impl MessageRow {
         // a prior bind (focus-leave on body_label normally handles this,
         // but a new message arriving into the same row while the label
         // still has focus would otherwise keep the GtkTextView backing
-        // store alive on every recycled row).
-        imp.body_label.set_selectable(false);
+        // store alive on every recycled row). Cached: set_selectable(false)
+        // when already false still hits GtkLabel internals; skip when we
+        // know the label isn't currently selectable.
+        if imp.selectable_state.get() {
+            imp.body_label.set_selectable(false);
+            imp.selectable_state.set(false);
+        }
         let highlight_names = &ctx.highlight_names;
         let my_user_id = ctx.my_user_id.as_str();
         let is_dm_room = ctx.is_dm;
@@ -2200,7 +2217,14 @@ impl MessageRow {
         }
 
         if !formatted_ts.is_empty() {
-            imp.timestamp_label.set_label(formatted_ts);
+            // Skip set_label when unchanged. Chat msgs from the same minute
+            // share the formatted timestamp string; without this cache
+            // each rebind fires a Pango relayout even though the visible
+            // text doesn't change.
+            if imp.last_formatted_ts.borrow().as_str() != formatted_ts {
+                imp.timestamp_label.set_label(formatted_ts);
+                imp.last_formatted_ts.replace(formatted_ts.to_string());
+            }
             imp.timestamp_label.set_visible(true);
         } else {
             imp.timestamp_label.set_visible(false);
