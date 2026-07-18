@@ -961,6 +961,16 @@ pub(crate) fn bind_rate_track(eid: &str) {
 thread_local! {
     /// Per-second bind_message_object call count.
     pub(crate) static BIND_CALLS_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-second count of binds where this SAME row widget was already
+    /// bound to this SAME event_id — a "spurious rebind" that indicates
+    /// GTK is re-firing bind on an item the row already displays. Almost
+    /// always a measure-feedback signature: GTK re-measures, the estimator
+    /// invalidates, the visible range recomputes, and rows get rebound to
+    /// the same items they already have. If BIND_CALLS_1S ≈ SPURIOUS_1S,
+    /// nearly every bind is measure-driven noise and the fix belongs in
+    /// the measure impl. If SPURIOUS_1S ≪ BIND_CALLS_1S, most binds are
+    /// legitimate recycle from actual scrolling.
+    pub(crate) static SPURIOUS_REBIND_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Per-second shepherd-drain call count (each drain applies set_markup
     /// on 0-or-more visible rows; count = # of drain firings, not rows).
     pub(crate) static SHEPHERD_DRAIN_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -980,6 +990,7 @@ pub(crate) fn install_measure_rate_reporter() {
             v
         });
         let binds = BIND_CALLS_1S.with(|c| { let v = c.get(); c.set(0); v });
+        let spurious = SPURIOUS_REBIND_1S.with(|c| { let v = c.get(); c.set(0); v });
         let drains = SHEPHERD_DRAIN_1S.with(|c| { let v = c.get(); c.set(0); v });
         let splices = TIMELINE_SPLICE_1S.with(|c| { let v = c.get(); c.set(0); v });
         if count > 100 {
@@ -988,11 +999,12 @@ pub(crate) fn install_measure_rate_reporter() {
         // Report the aggregate any time bind rate is above idle. 22 visible
         // rows at ~3Hz is 66/s — well above the "user scrolling normally"
         // baseline of a few per second. Correlating this with drains and
-        // splices tells us the trigger.
+        // splices tells us the trigger. spurious = binds where the row was
+        // already bound to this same event_id (measure-feedback signature).
         if binds > 30 {
             tracing::warn!(
-                "rate-1s: binds={} drains={} timeline_splices={}",
-                binds, drains, splices
+                "rate-1s: binds={} spurious={} drains={} timeline_splices={} measures={}",
+                binds, spurious, drains, splices, count
             );
         }
         glib::ControlFlow::Continue
@@ -1581,6 +1593,14 @@ impl MessageRow {
         {
             let mut hist = imp.bind_history.borrow_mut();
             let prev_last = std::mem::replace(&mut hist[1], new_eid.clone());
+            // Spurious rebind: this row was already showing this same
+            // event_id and GTK is asking us to bind it again. Not an
+            // items_changed-driven recycle (that would put a different
+            // eid on the row). Not a first bind (prev_last would be "").
+            // Almost certainly a measure-feedback loop.
+            if !prev_last.is_empty() && !new_eid.is_empty() && prev_last == new_eid {
+                SPURIOUS_REBIND_1S.with(|c| c.set(c.get().saturating_add(1)));
+            }
             hist[0] = prev_last;
         }
 
