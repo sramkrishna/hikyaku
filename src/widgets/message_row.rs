@@ -1615,6 +1615,7 @@ impl MessageRow {
         }
 
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
+        let _g_visibility = crate::perf::scope_gt("bind::visibility", 50);
         let reply_label = msg.reply_label();
         if !reply_to.is_empty() {
             imp.reply_label.set_label(&reply_label);
@@ -1638,8 +1639,10 @@ impl MessageRow {
         if let Some(ref btn) = *imp.dm_button.borrow() {
             btn.set_visible(!is_own && !is_dm_room);
         }
+        drop(_g_visibility);
 
         // Media attachment — all display strings pre-computed in info_to_obj.
+        let _g_media = crate::perf::scope_gt("bind::media", 50);
         if !show_media {
             imp.media_button.set_visible(false);
         } else {
@@ -1674,6 +1677,8 @@ impl MessageRow {
                 }
             }
         }
+
+        drop(_g_media);
 
         // Reactions — O(1) hash check, full rebuild only when reactions changed.
         self.rebuild_reactions_pills(msg);
@@ -1863,13 +1868,16 @@ impl MessageRow {
         }
 
         // Apply initial state for all reactive properties.
+        let _g_css = crate::perf::scope_gt("bind::css_reactive", 50);
         if msg.is_flashing() { self.add_css_class("message-flash"); }
         else { self.remove_css_class("message-flash"); }
         if msg.is_new_message() { self.add_css_class("new-message"); }
         else { self.remove_css_class("new-message"); }
         self.imp().unread_divider_box.set_visible(msg.is_first_unread());
+        drop(_g_css);
 
         // Consolidated notify handler — one connect + one disconnect per bind
+        let _g_notify = crate::perf::scope_gt("bind::notify_setup", 50);
         // instead of six. GLib signal registration overhead was measured at
         // ~600µs of the ~700µs total bind time; consolidating gets bind
         // down under 200µs on the common path.
@@ -1965,6 +1973,7 @@ impl MessageRow {
         // Store the combined handler in flash_handler's slot; clear_flash_handler
         // disconnects it. The other slots stay None (harmless — take() no-ops).
         *self.imp().flash_handler.borrow_mut() = Some((msg.clone().upcast(), combined_id));
+        drop(_g_notify);
     }
 
     /// Disconnect and clear the `notify::is-flashing` handler from the bound MessageObject.
