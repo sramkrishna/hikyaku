@@ -2487,6 +2487,9 @@ impl MessageView {
                 let eid = row.imp().event_id.borrow().clone();
                 if !eid.is_empty() {
                     if let Some(msg) = self.current_timeline_lookup(&eid) {
+                        // Invalidate sender cache so bind re-runs the
+                        // flair block for every row (global flair change).
+                        row.imp().last_sender_id.replace(String::new());
                         row.bind_message_object(&msg, &self.row_context());
                     }
                 }
@@ -2524,6 +2527,11 @@ impl MessageView {
                         // keep the work proportional to matching rows
                         // rather than the full viewport.
                         if msg.sender_id() == user_id {
+                            // Invalidate sender cache so bind re-runs the
+                            // flair block — the sender_changed gate would
+                            // otherwise skip it since the same sender is
+                            // being re-bound onto the same row.
+                            row.imp().last_sender_id.replace(String::new());
                             row.bind_message_object(&msg, &self.row_context());
                         }
                     }
