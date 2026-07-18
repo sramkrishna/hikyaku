@@ -958,6 +958,18 @@ pub(crate) fn bind_rate_track(eid: &str) {
     });
 }
 
+thread_local! {
+    /// Per-second bind_message_object call count.
+    pub(crate) static BIND_CALLS_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-second shepherd-drain call count (each drain applies set_markup
+    /// on 0-or-more visible rows; count = # of drain firings, not rows).
+    pub(crate) static SHEPHERD_DRAIN_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-second store.splice call count from Timeline. Split so we can
+    /// tell whether pagination is spiking or if something else is calling
+    /// mutation paths at rest.
+    pub(crate) static TIMELINE_SPLICE_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Install a periodic reporter for MEASURE_CALLS. Called once from the
 /// MessageView setup to start the timer.
 pub(crate) fn install_measure_rate_reporter() {
@@ -967,8 +979,21 @@ pub(crate) fn install_measure_rate_reporter() {
             c.set(0);
             v
         });
+        let binds = BIND_CALLS_1S.with(|c| { let v = c.get(); c.set(0); v });
+        let drains = SHEPHERD_DRAIN_1S.with(|c| { let v = c.get(); c.set(0); v });
+        let splices = TIMELINE_SPLICE_1S.with(|c| { let v = c.get(); c.set(0); v });
         if count > 100 {
             tracing::info!("measure-rate: {} MessageRow::measure() calls in last 1s", count);
+        }
+        // Report the aggregate any time bind rate is above idle. 22 visible
+        // rows at ~3Hz is 66/s — well above the "user scrolling normally"
+        // baseline of a few per second. Correlating this with drains and
+        // splices tells us the trigger.
+        if binds > 30 {
+            tracing::warn!(
+                "rate-1s: binds={} drains={} timeline_splices={}",
+                binds, drains, splices
+            );
         }
         glib::ControlFlow::Continue
     });
@@ -1423,6 +1448,7 @@ impl MessageRow {
             if !new_eid.is_empty() {
                 bind_rate_track(&new_eid);
             }
+            BIND_CALLS_1S.with(|c| c.set(c.get().saturating_add(1)));
         }
 
         // Defensive worker enqueue: if a msg somehow lands here with needs_markup

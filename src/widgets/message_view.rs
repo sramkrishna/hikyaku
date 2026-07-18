@@ -2703,6 +2703,7 @@ impl MessageView {
                 return;
             }
             imp.pending_markup_refresh.set(false);
+            crate::widgets::message_row::SHEPHERD_DRAIN_1S.with(|c| c.set(c.get().saturating_add(1)));
             // Drain: apply pending markup updates DIRECTLY to visible row
             // labels. No full bind — that's what drove the rebind loop.
             // For each visible row whose body_hash cache is invalidated

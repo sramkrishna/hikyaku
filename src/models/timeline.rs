@@ -24,6 +24,21 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
+/// Wrapper around `store.splice()` that increments a per-second counter.
+/// Diagnostic aid for the row-oscillation investigation — lets us see
+/// how many items_changed signals fire per second correlated with bind
+/// rate and shepherd drain rate.
+#[inline]
+fn splice_tracked(
+    store: &gio::ListStore,
+    pos: u32,
+    remove: u32,
+    additions: &[MessageObject],
+) {
+    crate::widgets::message_row::TIMELINE_SPLICE_1S.with(|c| c.set(c.get().saturating_add(1)));
+    store.splice(pos, remove, additions);
+}
+
 mod imp {
     use super::*;
     use glib::Properties;
@@ -182,7 +197,7 @@ impl Timeline {
                     idx_updates.push((eid, obj.clone()));
                 }
             }
-            store.splice(0, 0, &filtered);
+            splice_tracked(store, 0, 0, &filtered);
             n = filtered.len() as u32;
         } else {
             // Three buckets, processed in order so position bookkeeping
@@ -217,7 +232,7 @@ impl Timeline {
                         idx_updates.push((eid, obj.clone()));
                     }
                 }
-                store.splice(0, 0, &prepend_batch);
+                splice_tracked(store, 0, 0, &prepend_batch);
                 n += prepend_batch.len() as u32;
             }
 
@@ -229,7 +244,7 @@ impl Timeline {
                         idx_updates.push((eid, obj.clone()));
                     }
                 }
-                store.splice(n, 0, &append_batch);
+                splice_tracked(store, n, 0, &append_batch);
                 n += append_batch.len() as u32;
             }
 
@@ -292,7 +307,7 @@ impl Timeline {
                         }
                     }
                     let added = group.len() as u32;
-                    store.splice(pos, 0, &group);
+                    splice_tracked(store, pos, 0, &group);
                     n += added;
                 }
             }
@@ -344,7 +359,7 @@ impl Timeline {
         }
 
         // Single splice: remove all old, insert all new. One items_changed.
-        store.splice(0, n_old, &filtered);
+        splice_tracked(store, 0, n_old, &filtered);
         *imp.event_index.borrow_mut() = new_idx;
         imp.pending_echo_count.set(echo_count);
         let new_n = filtered.len() as u32;
@@ -433,7 +448,7 @@ impl Timeline {
                 continue;
             };
             if o.event_id() == event_id {
-                store.splice(i, 1, &[] as &[MessageObject]);
+                splice_tracked(store, i, 1, &[] as &[MessageObject]);
                 self.refresh_derived_state(n - 1);
                 return true;
             }
@@ -468,7 +483,7 @@ impl Timeline {
                 }
             }
         }
-        store.splice(0, actual, &[] as &[MessageObject]);
+        splice_tracked(store, 0, actual, &[] as &[MessageObject]);
         {
             let mut idx = imp.event_index.borrow_mut();
             for eid in drop_eids {
@@ -508,7 +523,7 @@ impl Timeline {
                 }
             }
         }
-        store.splice(start, actual, &[] as &[MessageObject]);
+        splice_tracked(store, start, actual, &[] as &[MessageObject]);
         {
             let mut idx = imp.event_index.borrow_mut();
             for eid in drop_eids {
@@ -523,7 +538,7 @@ impl Timeline {
     pub fn clear(&self) {
         let imp = self.imp();
         let n = gio::prelude::ListModelExt::n_items(&imp.list_store);
-        imp.list_store.splice(0, n, &[] as &[MessageObject]);
+        splice_tracked(&imp.list_store, 0, n, &[] as &[MessageObject]);
         imp.event_index.borrow_mut().clear();
         imp.pending_echo_count.set(0);
         self.refresh_derived_state(0);
