@@ -185,18 +185,30 @@ impl Timeline {
         let cur_newest = imp.newest_timestamp.get();
 
         let mut added_echoes: u32 = 0;
-        let mut idx_updates: Vec<(String, MessageObject)> = Vec::new();
 
-        if n == 0 {
-            // Empty store: one bulk splice is correct.
-            for obj in &filtered {
+        // Per-batch helper: apply all non-empty event_ids to event_index
+        // BEFORE the splice fires items-changed. Non-notifying cell first
+        // (issue #3) — any observer of items-changed that queries
+        // has_event / get_event sees the fresh index instead of stale
+        // state. One borrow_mut per batch keeps contention minimal.
+        let apply_index = |batch: &[MessageObject]| {
+            let mut idx = imp.event_index.borrow_mut();
+            for obj in batch {
                 let eid = obj.event_id();
-                if eid.is_empty() {
-                    added_echoes += 1;
-                } else {
-                    idx_updates.push((eid, obj.clone()));
+                if !eid.is_empty() {
+                    idx.insert(eid, obj.clone());
                 }
             }
+        };
+
+        if n == 0 {
+            // Empty store: one bulk splice.
+            for obj in &filtered {
+                if obj.event_id().is_empty() {
+                    added_echoes += 1;
+                }
+            }
+            apply_index(&filtered);
             splice_tracked(store, 0, 0, &filtered);
             n = filtered.len() as u32;
         } else {
@@ -226,24 +238,14 @@ impl Timeline {
 
             // Head: bulk splice, single items_changed.
             if !prepend_batch.is_empty() {
-                for obj in &prepend_batch {
-                    let eid = obj.event_id();
-                    if !eid.is_empty() {
-                        idx_updates.push((eid, obj.clone()));
-                    }
-                }
+                apply_index(&prepend_batch);
                 splice_tracked(store, 0, 0, &prepend_batch);
                 n += prepend_batch.len() as u32;
             }
 
             // Tail: bulk splice at end.
             if !append_batch.is_empty() {
-                for obj in &append_batch {
-                    let eid = obj.event_id();
-                    if !eid.is_empty() {
-                        idx_updates.push((eid, obj.clone()));
-                    }
-                }
+                apply_index(&append_batch);
                 splice_tracked(store, n, 0, &append_batch);
                 n += append_batch.len() as u32;
             }
@@ -300,25 +302,14 @@ impl Timeline {
                 // BTreeMap iterates ASC; iterate reverse to get DESC.
                 for (pos, mut group) in by_pos.into_iter().rev() {
                     group.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
-                    for obj in &group {
-                        let eid = obj.event_id();
-                        if !eid.is_empty() {
-                            idx_updates.push((eid, obj.clone()));
-                        }
-                    }
                     let added = group.len() as u32;
+                    apply_index(&group);
                     splice_tracked(store, pos, 0, &group);
                     n += added;
                 }
             }
         }
 
-        {
-            let mut idx = imp.event_index.borrow_mut();
-            for (eid, obj) in idx_updates {
-                idx.insert(eid, obj);
-            }
-        }
         imp.pending_echo_count
             .set(imp.pending_echo_count.get().saturating_add(added_echoes));
 
@@ -368,21 +359,6 @@ impl Timeline {
 
     /// Update the body (and optional formatted body) of an existing message
     /// in place. Returns true if the event was found.
-    pub fn update_body(&self, event_id: &str, body: &str, formatted: Option<&str>) -> bool {
-        if event_id.is_empty() {
-            return false;
-        }
-        let imp = self.imp();
-        let Some(msg) = imp.event_index.borrow().get(event_id).cloned() else {
-            return false;
-        };
-        msg.set_body(body.to_string());
-        if let Some(f) = formatted {
-            msg.set_formatted_body(f.to_string());
-        }
-        true
-    }
-
     /// Overwrite the reactions JSON for an existing message. Returns true
     /// if the event was found.
     pub fn update_reactions(&self, event_id: &str, reactions_json: &str) -> bool {
@@ -420,10 +396,14 @@ impl Timeline {
                 continue;
             }
             if msg.body() == echo_body {
-                msg.set_event_id(real_event_id.to_string());
+                // Non-notifying cell (event_index) written BEFORE the
+                // notifying setter (set_event_id) — so any observer of
+                // notify::event-id that queries the index sees the fresh
+                // mapping instead of stale state. See issue #3.
                 imp.event_index
                     .borrow_mut()
-                    .insert(real_event_id.to_string(), msg);
+                    .insert(real_event_id.to_string(), msg.clone());
+                msg.set_event_id(real_event_id.to_string());
                 imp.pending_echo_count
                     .set(imp.pending_echo_count.get().saturating_sub(1));
                 return true;
