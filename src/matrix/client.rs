@@ -4565,6 +4565,20 @@ async fn handle_select_room_bg(
 }
 
 /// Fetch older messages for a room (pagination).
+/// Read process RSS (resident set size) in kB from /proc/self/status.
+/// Returns None on non-Linux or read failure. Used only for diagnostic
+/// logs; not on any hot path.
+fn read_rss_kb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let n: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(n);
+        }
+    }
+    None
+}
+
 async fn handle_fetch_older(
     client: &Client,
     event_tx: &EventSender,
@@ -4573,6 +4587,9 @@ async fn handle_fetch_older(
     oldest_known_ts: Option<u64>,
 ) {
     use matrix_sdk::ruma::UInt;
+
+    let fetch_start = std::time::Instant::now();
+    let rss_before = read_rss_kb();
 
     let Ok(room_id) = RoomId::parse(room_id) else {
         return;
@@ -4607,20 +4624,15 @@ async fn handle_fetch_older(
     // end token until the chunk's OLDEST event is older than what the UI
     // already has. Cap at MAX_ITER so a pathological room (sparse history,
     // pure-overlap chunks) can't spin forever.
-    // Server-side pagination cap. Kept small on purpose: each returned
-    // batch becomes a single Timeline::insert → one items_changed emission,
-    // which GtkListView reconciles in a single frame. At the previous 5×50
-    // cap (up to 250 msgs per user-triggered pagination), that reconcile
-    // stalled the frame long enough to be visible as frame stutter — the
-    // "oscillation when inserting messages" the user pinned. Smaller cap
-    // = smaller per-frame layout burst; more round-trips for the same
-    // scroll distance, but each round-trip is finish-in-one-frame.
-    //
-    // If this proves too aggressive (user has to keep re-triggering
-    // pagination), the next lever is chunking the accumulated batch on
-    // the GTK side across idle callbacks instead of pulling less.
-    const MAX_ITER: u32 = 3;
-    const PER_CALL_LIMIT: u32 = 15;
+    // Pagination cap. Isolation test (2026-07-21) with PER_CALL_LIMIT=1
+    // MAX_ITER=1 proved batch size is NOT the primary jitter driver —
+    // user reported degradation escalates from scrolling alone, even
+    // when a pagination attempt returned zero new msgs. So splice cost
+    // matters at high batch sizes but the accumulation happens somewhere
+    // else. Keeping the cap modest (2×10 = up to 20 msgs) so the
+    // per-splice cost stays low, but stop chasing this as the fix.
+    const MAX_ITER: u32 = 2;
+    const PER_CALL_LIMIT: u32 = 10;
 
     let mut accumulated: Vec<crate::matrix::MessageInfo> = Vec::new();
     let mut current_token = from_token.to_string();
@@ -4628,6 +4640,9 @@ async fn handle_fetch_older(
     let mut iter = 0u32;
     let mut total_chunk_len = 0usize;
     let mut last_token_was_none = false;
+    // Per-attempt aggregate timings (all iters combined).
+    let mut rpc_us_total: u128 = 0;
+    let mut extract_us_total: u128 = 0;
 
     while iter < MAX_ITER {
         iter += 1;
@@ -4636,6 +4651,7 @@ async fn handle_fetch_older(
         options.from = Some(current_token.clone());
         options.filter = make_filter();
 
+        let rpc_start = std::time::Instant::now();
         let response = match room.messages(options).await {
             Ok(r) => r,
             Err(e) => {
@@ -4643,9 +4659,12 @@ async fn handle_fetch_older(
                 break;
             }
         };
+        rpc_us_total += rpc_start.elapsed().as_micros();
         let chunk_len = response.chunk.len();
         total_chunk_len += chunk_len;
+        let extract_start = std::time::Instant::now();
         let chunk_msgs = extract_messages(&room, &response.chunk, true, client.user_id()).await;
+        extract_us_total += extract_start.elapsed().as_micros();
         let next_token = response.end.map(|t| t.to_string());
 
         // Track the oldest timestamp we saw in this chunk to decide
@@ -4700,6 +4719,7 @@ async fn handle_fetch_older(
         newest_ts,
     );
 
+    let accumulated_len = accumulated.len();
     let _ = event_tx
         .send(MatrixEvent::OlderMessages {
             room_id: room_id.to_string(),
@@ -4707,6 +4727,23 @@ async fn handle_fetch_older(
             prev_batch_token: final_token,
         })
         .await;
+
+    // Diagnostic: per-pagination timings + RSS delta so we can see
+    // whether matrix-side work grows across successive attempts (the
+    // suspected accumulator).
+    let rss_after = read_rss_kb();
+    let rss_delta_kb = match (rss_before, rss_after) {
+        (Some(b), Some(a)) => a as i64 - b as i64,
+        _ => 0,
+    };
+    tracing::info!(
+        "fetch-older-time: iters={} chunk_events={} extracted={} \
+         rpc_us={} extract_us={} total_us={} rss_delta_kb={}",
+        iter, total_chunk_len, accumulated_len,
+        rpc_us_total, extract_us_total,
+        fetch_start.elapsed().as_micros(),
+        rss_delta_kb,
+    );
 }
 
 /// Send a text message to a room.

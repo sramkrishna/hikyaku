@@ -3511,9 +3511,25 @@ impl MessageView {
         };
 
         let n_prepended = objs.len();
+        let pre_n = tl.n_items();
+        let splice_start = std::time::Instant::now();
         if !objs.is_empty() {
             tl.insert(objs);
         }
+        let splice_us = splice_start.elapsed().as_micros();
+
+        // Split timing: `tl.insert` covers Timeline's own dedup + sort +
+        // per-batch splice_tracked calls. GTK's items_changed handler runs
+        // synchronously inside splice, so this us count includes GTK's
+        // internal reindex work (which scales with N in prepend patterns).
+        // If splice_us grows visibly per pagination, the accumulation
+        // hypothesis is confirmed.
+        tracing::info!(
+            "prepend-time: pre_n={} added={} splice_us={} \
+             post_n={} vadj_before={:.1} upper_before={:.1}",
+            pre_n, n_prepended, splice_us, tl.n_items(),
+            vadj_before.value(), vadj_before.upper()
+        );
 
         tracing::info!(
             "scroll-diag: prepend_messages post-insert vadj value={:.1} upper={:.1} new_n={}",
@@ -3591,34 +3607,46 @@ impl MessageView {
             );
         }
 
-        // Scroll restore — restored from the working version at ccf6eec.
-        // Simpler than my recent iterations: schedule an idle after GTK's
-        // post-splice work, check if upper actually grew (measurement
-        // caught up), use the exact delta if so, else fall back to
-        // per_row_est.
+        // Scroll restore — only run when we actually added msgs. With 0
+        // added, the layout hasn't changed and the user's current scroll
+        // position is already correct. Firing vadj.set_value(old_value)
+        // here would SNAP the user's active scroll back to where it was
+        // ~350ms ago (when we captured old_value, before the RPC
+        // completed) — the actual mechanism behind the "hesitation then
+        // jitter that escalates the more you pull" pattern reported by
+        // the user. Every zero-add pull was fighting user input.
         //
-        // Do NOT call vadj.set_upper() — GTK owns upper and re-computes it
-        // from measurements; overriding causes other paths to misbehave.
-        // Do NOT call list_view.scroll_to() — proven silently no-op in
-        // many cases (vadj 0.0 → 0.0 in log). Just set_value(target).
-        let sw = imp.scrolled_window().clone();
-        let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
-        let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
-            (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
-        } else { 60.0 };
-        glib::idle_add_local_once(move || {
-            let vadj = sw.vadjustment();
-            let delta = vadj.upper() - old_upper;
-            let target = if delta > 50.0 {
-                // Measurement caught up — shift by exact delta.
-                old_value + delta
-            } else {
-                // Fallback: estimate from per-row average.
-                old_value + (n_prepended as f64) * per_row_est
-            };
-            vadj.set_value(target);
-        });
+        // For adds > 0: schedule the shift on idle (after GTK's post-
+        // splice work). Uses exact delta when upper has caught up, else
+        // falls back to per_row_est estimate. See ccf6eec for the
+        // rationale on choosing set_value over set_upper / scroll_to.
         let _ = pre_splice_top_eid; // captured for logging; not used for scroll math anymore
+        if n_prepended > 0 {
+            let sw = imp.scrolled_window().clone();
+            let pre_splice_n = tl.n_items().saturating_sub(n_prepended as u32);
+            let per_row_est = if pre_splice_n > 0 && old_upper > 0.0 {
+                (old_upper / pre_splice_n as f64).clamp(40.0, 300.0)
+            } else { 60.0 };
+            glib::idle_add_local_once(move || {
+                let vadj = sw.vadjustment();
+                let delta = vadj.upper() - old_upper;
+                // Compensate relative to the user's CURRENT vadj, not the
+                // old_value captured before the ~350ms RPC. If the user
+                // scrolled during the RPC, old_value is stale — using
+                // old_value + delta would snap their scroll back to where
+                // they were 350ms ago. Adding delta to whatever their
+                // current position is preserves their scroll intent while
+                // compensating for the height of the prepended content.
+                let current = vadj.value();
+                let shift = if delta > 50.0 {
+                    delta
+                } else {
+                    (n_prepended as f64) * per_row_est
+                };
+                vadj.set_value(current + shift);
+            });
+        }
+        let _ = old_value; // captured for logging only; not used post-fix
 
         // Cooldown for cascade suppression. Bumped 300ms → 1500ms after a
         // user report that the shorter cooldown combined with an aggressive

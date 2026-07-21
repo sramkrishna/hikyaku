@@ -1290,6 +1290,14 @@ impl MxWindow {
 
 
         // Wire up scroll-to-top → fetch older messages.
+        //
+        // send_blocking on an unbounded async_channel returns instantly
+        // (no blocking, no allocation), so we don't need the spawn_future_local
+        // wrapper the send()+await pattern needs. Removes one allocation +
+        // one GLib main-context enqueue per scroll-top firing — testing
+        // whether the future-spawn overhead is what accumulates when
+        // pagination is triggered repeatedly (user reported: "the REQUEST
+        // itself degrades even when the response adds zero msgs").
         let cmd_tx = command_tx.clone();
         let window_weak = window.downgrade();
         let msg_view_for_scroll = imp.message_view.clone();
@@ -1299,16 +1307,43 @@ impl MxWindow {
                 .and_then(|w| w.imp().current_room_id.borrow().clone());
             let token = msg_view_for_scroll.prev_batch_token();
             let oldest_known_ts = msg_view_for_scroll.oldest_message_timestamp();
-            if let (Some(room_id), Some(from_token)) = (room_id, token) {
-                let tx = cmd_tx.clone();
-                glib::spawn_future_local(async move {
-                    let _ = tx.send(MatrixCommand::FetchOlderMessages {
-                        room_id,
-                        from_token,
+            let Some(room_id) = room_id else { return };
+            let Some(from_token) = token else { return };
+
+            // Scroll-settle debounce: wait until user stops scrolling
+            // before firing the matrix RPC. Verified 2026-07-21 that the
+            // ~350ms room.messages() work overlapping with an active
+            // scroll gesture causes visible frame oscillation, even
+            // though tokio and GTK run on separate threads (likely CPU/
+            // cache contention). Deferring the send until scroll settles
+            // eliminates the overlap without hurting UX perceptibly —
+            // user's scroll gesture typically settles in <500ms; RPC
+            // then fires and history arrives shortly after.
+            //
+            // Poll every 150ms; fire once last_user_scroll_at is > 200ms
+            // in the past. Cap at 30 polls (~4.5s) so a continuous
+            // scroll session still eventually gets its history.
+            let tx = cmd_tx.clone();
+            let view = msg_view_for_scroll.clone();
+            let mut attempts: u32 = 0;
+            glib::timeout_add_local(
+                std::time::Duration::from_millis(150),
+                move || {
+                    attempts += 1;
+                    let scroll_active = view.imp().last_user_scroll_at.get()
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(200))
+                        .unwrap_or(false);
+                    if scroll_active && attempts < 30 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let _ = tx.send_blocking(MatrixCommand::FetchOlderMessages {
+                        room_id: room_id.clone(),
+                        from_token: from_token.clone(),
                         oldest_known_ts,
-                    }).await;
-                });
-            }
+                    });
+                    glib::ControlFlow::Break
+                },
+            );
         });
 
         // Tail-refresh: user scrolled back to bottom after backpagination evicted
