@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/timeline"]
+resolver = "2"
+
 [package]
 name = "hikyaku"
 version = "0.3.0"
@@ -41,6 +45,8 @@ gtk = { package = "gtk4", version = "0.9", features = ["v4_14", "blueprint"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_6"] }
 glib = "0.20"
 gio = "0.20"
+
+hikyaku-timeline = { path = "crates/timeline" }
 
 matrix-sdk = { version = "0.10", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
