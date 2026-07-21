@@ -1332,16 +1332,14 @@ impl MessageRow {
         self.imp().on_flag_changed.borrow_mut().replace(Box::new(f));
     }
 
-    /// Re-apply the avatar image for `user_id` if this row is bound
-    /// to that sender. Called from MessageView::refresh_sender_avatar
-    /// after AvatarReady populates the window's avatar_cache.
-    pub fn refresh_sender_avatar(&self, user_id: &str, path: &str) {
+    /// Re-apply a pre-decoded avatar texture if this row is currently
+    /// bound to `user_id`. Called from MessageView::refresh_sender_avatar
+    /// after avatar_worker delivers a decoded Texture via
+    /// MatrixEvent::AvatarDecoded. Never decodes on the GTK thread.
+    pub fn refresh_sender_avatar(&self, user_id: &str, texture: &gtk::gdk::Texture) {
         let imp = self.imp();
         if *imp.sender_id_text.borrow() != user_id { return; }
-        if path.is_empty() { return; }
-        if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
-            imp.sender_avatar.set_custom_image(Some(&tex));
-        }
+        imp.sender_avatar.set_custom_image(Some(texture));
     }
 
     /// Re-render the sender_flag_label based on the current state of the
@@ -1799,13 +1797,16 @@ impl MessageRow {
                     // Cache hit — one property change, not clear+set.
                     imp.sender_avatar.set_custom_image(Some(&tex));
                 } else {
-                    // Cache miss — must decode from disk. Clear first so
-                    // the fallback text renders while decode runs, then set
-                    // once done. Texture::from_filename is synchronous and
-                    // spikes to 1.4ms+ on cold PNG; that's the biggest
-                    // per-bind blocker. A future commit can move decode to
-                    // a background thread — for now, gating on sender_changed
-                    // means we do this at most once per sender per row.
+                    // Cache miss — enqueue background decode via
+                    // avatar_worker. Row shows the initials fallback (set
+                    // via set_text above) until the worker delivers a
+                    // Texture. Texture::from_filename is a synchronous PNG
+                    // decode (~1400µs on the GTK thread — one full frame
+                    // budget lost every cold sender). Moving it off the
+                    // hot path is why historical-scroll jitter existed:
+                    // each unique historical sender surfaced a cold
+                    // decode; at 30–60/sec cold decodes = 42–84ms/sec of
+                    // straight-up frame-blocking work.
                     imp.sender_avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
                     use gtk::prelude::*;
                     let path: Option<String> = gtk::gio::Application::default()
@@ -1815,10 +1816,7 @@ impl MessageRow {
                         .and_then(|w| w.imp().avatar_cache.borrow().get(&sender_id).cloned());
                     if let Some(path) = path {
                         if !path.is_empty() {
-                            if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
-                                imp.sender_avatar.set_custom_image(Some(&tex));
-                                set_cached_avatar_texture(&sender_id, tex);
-                            }
+                            crate::avatar_worker::try_enqueue(sender_id.clone(), path);
                         }
                     }
                 }

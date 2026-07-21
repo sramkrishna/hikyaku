@@ -2199,19 +2199,30 @@ impl MxWindow {
                     }
                     MatrixEvent::AvatarReady { user_id, path } => {
                         window.imp().avatar_cache.borrow_mut().insert(user_id.clone(), path.clone());
-                        // Invalidate the decoded-texture cache so the fresh
-                        // avatar gets decoded on next bind. Without this the
-                        // MessageRow bind fast-path would keep serving the
-                        // old texture forever after avatar changes.
+                        // Invalidate the decoded-texture cache so bind's
+                        // fast-path won't keep serving the old texture.
                         crate::widgets::message_row::invalidate_avatar_texture(&user_id);
-                        // Update the visible nick-picker popover in place so
-                        // the avatar appears without requiring the user to
-                        // close and reopen the picker.
+                        // Nick picker popover still uses the sync decode
+                        // path — it's user-triggered and one-shot, not
+                        // hot. TODO: unify with avatar_worker.
                         window.imp().message_view.refresh_nick_avatar(&user_id, &path);
-                        // Update every visible message row's sender avatar
-                        // so a freshly downloaded image replaces the
-                        // initials fallback without requiring a rebind.
-                        window.imp().message_view.refresh_sender_avatar(&user_id, &path);
+                        // Enqueue background decode. Worker delivers
+                        // AvatarDecoded which does the visible-row
+                        // refresh below.
+                        if !path.is_empty() {
+                            crate::avatar_worker::try_enqueue(user_id, path);
+                        }
+                    }
+                    MatrixEvent::AvatarDecoded { user_id, texture } => {
+                        // Worker delivered a decoded Texture. Cache it,
+                        // then walk visible rows so any row currently
+                        // bound to this sender picks it up immediately
+                        // (bind's cold-cache path only enqueued; it left
+                        // the widget showing initials).
+                        crate::widgets::message_row::set_cached_avatar_texture(
+                            &user_id, texture.clone()
+                        );
+                        window.imp().message_view.refresh_sender_avatar(&user_id, &texture);
                     }
                     MatrixEvent::RoomAvatarReady { room_id, path } => {
                         room_list_view.set_room_avatar_path(&room_id, &path);

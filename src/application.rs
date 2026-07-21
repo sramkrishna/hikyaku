@@ -65,6 +65,21 @@ mod imp {
                 });
             }
 
+            // Start the background PNG-decode worker for sender avatars.
+            // AvatarDecoded is class Bulk. Every historical sender that
+            // scrolls into view triggers a decode via avatar_worker::try_enqueue
+            // from the bind path — this thread keeps that decode off the
+            // GTK main loop so cold avatars never block a frame.
+            {
+                let tx = event_tx.clone();
+                crate::avatar_worker::start(move |result| {
+                    let _ = tx.send_blocking(matrix::MatrixEvent::AvatarDecoded {
+                        user_id: result.user_id,
+                        texture: result.texture,
+                    });
+                });
+            }
+
             // Spawn the background tokio thread that runs matrix-sdk.
             // Shutdown is initiated by sending MatrixCommand::Shutdown — all
             // commands before it are guaranteed to run first (no race condition).

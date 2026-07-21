@@ -93,6 +93,7 @@ impl MatrixEvent {
             | MatrixEvent::AvatarReady { .. }
             | MatrixEvent::RoomAvatarReady { .. }
             | MatrixEvent::MarkupRendered { .. }
+            | MatrixEvent::AvatarDecoded { .. }
             | MatrixEvent::ThreadReplies { .. }
             | MatrixEvent::SearchResults { .. }
             | MatrixEvent::SearchFailed { .. }

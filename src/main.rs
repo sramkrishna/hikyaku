@@ -5,6 +5,7 @@
 // separate tokio thread spawned during `activate`.
 
 mod application;
+mod avatar_worker;
 mod bookmarks;
 mod config;
 mod directory;

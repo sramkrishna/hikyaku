@@ -427,6 +427,12 @@ pub enum MatrixEvent {
     /// and calls `set_rendered_markup`. Does not carry a GObject reference
     /// because GObjects aren't Send.
     MarkupRendered { id: u64, markup: String },
+    /// Result from the background avatar worker — a sender's cached
+    /// avatar path was decoded into a Texture off the GTK thread. GTK
+    /// side inserts into AVATAR_TEXTURES and calls refresh_sender_avatar
+    /// on visible rows for that user. Bulk-class: dropping loses one
+    /// avatar (row keeps showing initials) but never blocks the sender.
+    AvatarDecoded { user_id: String, texture: gtk::gdk::Texture },
 }
 
 /// Commands sent FROM the GTK UI TO the Matrix thread.
