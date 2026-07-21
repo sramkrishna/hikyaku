@@ -1898,6 +1898,7 @@ dependencies = [
  "gio",
  "glib",
  "gtk4",
+ "hikyaku-timeline",
  "libadwaita",
  "matrix-sdk",
  "mime",
@@ -1914,6 +1915,18 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hikyaku-timeline"
+version = "0.1.0"
+dependencies = [
+ "gio",
+ "glib",
+ "gtk4",
+ "rand 0.8.5",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

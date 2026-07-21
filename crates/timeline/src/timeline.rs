@@ -18,16 +18,35 @@
 //! multiple uncoordinated paths each implementing their own sort/dedup
 //! logic slightly differently.
 
-use crate::models::MessageObject;
+use crate::MessageObject;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-/// Wrapper around `store.splice()` that increments a per-second counter.
-/// Diagnostic aid for the row-oscillation investigation — lets us see
-/// how many items_changed signals fire per second correlated with bind
-/// rate and shepherd drain rate.
+use std::sync::OnceLock;
+
+/// Callback fired on every splice, for diagnostic instrumentation in the
+/// bin crate (per-second splice counter). Registered once at startup via
+/// [`set_splice_hook`]; None → no-op.
+///
+/// The timeline crate itself has no reason to count splices, but the
+/// hot-path row-oscillation investigation needed a way to correlate
+/// bind rate with items_changed emissions. Rather than pull the counter
+/// (which lives with the row's other rate counters) into this crate,
+/// expose a hook so the bin registers its own callback.
+static SPLICE_HOOK: OnceLock<Box<dyn Fn() + Send + Sync + 'static>> = OnceLock::new();
+
+/// Install a callback that fires every time this crate splices its
+/// list_store. Idempotent — first call wins. Intended for one-shot
+/// registration at application startup.
+pub fn set_splice_hook(hook: Box<dyn Fn() + Send + Sync + 'static>) {
+    let _ = SPLICE_HOOK.set(hook);
+}
+
+/// Wrapper around `store.splice()` that fires the registered splice hook
+/// (if any). Every mutation in this file goes through here so the counter
+/// is inclusive.
 #[inline]
 fn splice_tracked(
     store: &gio::ListStore,
@@ -35,7 +54,9 @@ fn splice_tracked(
     remove: u32,
     additions: &[MessageObject],
 ) {
-    crate::widgets::message_row::TIMELINE_SPLICE_1S.with(|c| c.set(c.get().saturating_add(1)));
+    if let Some(hook) = SPLICE_HOOK.get() {
+        hook();
+    }
     store.splice(pos, remove, additions);
 }
 
@@ -656,7 +677,7 @@ fn sorted_insert_pos(store: &gtk::gio::ListStore, ts: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::MessageObject;
+    use crate::MessageObject;
 
     fn init_gtk() {
         let _ = gtk::init();

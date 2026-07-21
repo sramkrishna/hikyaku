@@ -1,0 +1,22 @@
+[package]
+name = "hikyaku-timeline"
+version = "0.1.0"
+edition = "2021"
+description = "Per-room Matrix message timeline model. Timeline + MessageObject GObjects with sort/index invariants. No matrix, no widgets — pure gtk::gio + gtk::glib so it can be tested headlessly."
+publish = false
+
+[lib]
+name = "hikyaku_timeline"
+path = "src/lib.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+glib = "0.20"
+gio = "0.20"
+tracing = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+# For seeded randomised tests without pulling in a heavy fuzz framework.
+# StdRng with a fixed seed gives reproducible failure cases.
+rand = { version = "0.8", features = ["std_rng"] }
