@@ -23,6 +23,14 @@ template $MxMessageRow : Gtk.Box {
     orientation: vertical;
     spacing: 2;
     hexpand: true;
+    // valign: start anchors the inner content to the top of the row
+    // instead of the default FILL. Without this, when inner content
+    // grows (reply_box toggles visible, reactions_box gets pills,
+    // rendered_markup replaces the fallback text), size negotiation
+    // asks the parent (GtkListView) to reallocate — which can trigger
+    // sibling-row re-measure loops. Gemini flagged this exact anti-
+    // pattern as a common source of GTK row oscillation.
+    valign: start;
 
     // Pre-allocated "New messages" divider bar shown above the first unread
     // message.  Toggled by the is_first_unread property — no list-store
@@ -124,6 +132,7 @@ template $MxMessageRow : Gtk.Box {
     // hidden and body_box is used instead.
     Gtk.Label body_label {
       halign: start;
+      valign: start;
       wrap: true;
       wrap-mode: word_char;
       xalign: 0;

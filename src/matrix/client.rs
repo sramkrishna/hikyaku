@@ -4607,8 +4607,20 @@ async fn handle_fetch_older(
     // end token until the chunk's OLDEST event is older than what the UI
     // already has. Cap at MAX_ITER so a pathological room (sparse history,
     // pure-overlap chunks) can't spin forever.
-    const MAX_ITER: u32 = 5;
-    const PER_CALL_LIMIT: u32 = 50;
+    // Server-side pagination cap. Kept small on purpose: each returned
+    // batch becomes a single Timeline::insert → one items_changed emission,
+    // which GtkListView reconciles in a single frame. At the previous 5×50
+    // cap (up to 250 msgs per user-triggered pagination), that reconcile
+    // stalled the frame long enough to be visible as frame stutter — the
+    // "oscillation when inserting messages" the user pinned. Smaller cap
+    // = smaller per-frame layout burst; more round-trips for the same
+    // scroll distance, but each round-trip is finish-in-one-frame.
+    //
+    // If this proves too aggressive (user has to keep re-triggering
+    // pagination), the next lever is chunking the accumulated batch on
+    // the GTK side across idle callbacks instead of pulling less.
+    const MAX_ITER: u32 = 3;
+    const PER_CALL_LIMIT: u32 = 15;
 
     let mut accumulated: Vec<crate::matrix::MessageInfo> = Vec::new();
     let mut current_token = from_token.to_string();
