@@ -195,6 +195,8 @@ impl EventReceiver {
     /// which means shutdown.
     pub async fn recv(&self) -> Result<MatrixEvent, RecvError> {
         loop {
+            // Fast path: priority-order try_recv. Anything already in a
+            // channel returns in priority order.
             if let Ok(e) = self.critical.try_recv() {
                 return Ok(e);
             }
@@ -207,14 +209,32 @@ impl EventReceiver {
             if self.critical.is_closed() && self.bulk.is_closed() && self.plugin.is_closed() {
                 return Err(RecvError);
             }
+            // Slow path: await ANY channel and RETURN the winner's message.
+            //
+            // Priority is enforced by the try_recv chain above, not by the
+            // slow path: if a critical event arrives while we're awaiting a
+            // bulk, the bulk still wins THIS call (it arrived first — fair
+            // scheduling), but the next call's try_recv drains any queued
+            // critical before touching bulk/plugin.
+            //
+            // Bug that this replaces: the previous version threw away the
+            // winner's value (`let _ = select(...).await`) and looped back
+            // to try_recv, which returned Empty because the value had been
+            // consumed from the channel. Every event that arrived via the
+            // slow path was silently dropped — including OlderMessages,
+            // which is why backpagination stopped working.
             let c = self.critical.recv();
             let b = self.bulk.recv();
             let p = self.plugin.recv();
             futures_util::pin_mut!(c, b, p);
-            use futures_util::future::select;
+            use futures_util::future::{select, Either};
             let bp = select(b, p);
             futures_util::pin_mut!(bp);
-            let _ = select(c, bp).await;
+            return match select(c, bp).await {
+                Either::Left((res, _)) => res,
+                Either::Right((Either::Left((res, _)), _)) => res,
+                Either::Right((Either::Right((res, _)), _)) => res,
+            };
         }
     }
 }
