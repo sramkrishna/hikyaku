@@ -9,7 +9,8 @@
 // requires all UI work on the main thread with its own glib event loop.
 // We bridge them with async-channel, which works across both runtimes.
 
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
+use crate::matrix::EventSender;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{RoomId, UserId},
@@ -839,7 +840,7 @@ async fn cleanup_session(homeserver: &str) {
 /// `MatrixCommand::Shutdown` through the command channel — all commands
 /// queued before it are guaranteed to run first.
 pub fn spawn_matrix_thread(
-    event_tx: Sender<MatrixEvent>,
+    event_tx: EventSender,
     command_rx: Receiver<MatrixCommand>,
 ) -> super::room_cache::RoomCache {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -868,7 +869,7 @@ pub fn spawn_matrix_thread(
 }
 
 async fn matrix_task(
-    event_tx: Sender<MatrixEvent>,
+    event_tx: EventSender,
     command_rx: Receiver<MatrixCommand>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -1757,7 +1758,7 @@ pub(crate) async fn do_register(
 }
 
 async fn try_restore_session(
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
 ) -> Option<Client> {
     let mut persisted = load_session_from_keyring().await?;
 
@@ -2510,7 +2511,7 @@ async fn collect_room_info(
 
 async fn start_sync(
     client: Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     timeline_cache: super::room_cache::RoomCache,
     dirty_rooms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::matrix::MessageInfo>>>>,
@@ -3963,7 +3964,7 @@ async fn extract_messages(
 /// Returns true if the room was actually fetched, false if it was already warm.
 async fn handle_prefetch_room(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     timeline_cache: super::room_cache::RoomCache,
 ) -> bool {
@@ -4024,7 +4025,7 @@ async fn handle_prefetch_room(
 /// Runs in a spawned task so it doesn't block the command loop.
 async fn handle_select_room_bg(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     timeline_cache: super::room_cache::RoomCache,
     // Cooperative cancel flag.
@@ -4560,7 +4561,7 @@ async fn handle_select_room_bg(
 /// Fetch older messages for a room (pagination).
 async fn handle_fetch_older(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     from_token: &str,
     oldest_known_ts: Option<u64>,
@@ -4693,7 +4694,7 @@ async fn handle_fetch_older(
 /// Send a text message to a room.
 async fn handle_send_media(
     client: &Client,
-    _event_tx: &Sender<MatrixEvent>,
+    _event_tx: &EventSender,
     room_id: &str,
     file_path: &str,
 ) {
@@ -4750,7 +4751,7 @@ async fn handle_send_media(
 /// touching the media repository.
 async fn handle_set_own_avatar(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     file_path: Option<String>,
 ) {
     use std::path::Path;
@@ -4854,7 +4855,7 @@ async fn handle_set_own_avatar(
 
 async fn handle_download_media(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     mxc_url: &str,
     filename: &str,
     source_json: &str,
@@ -5035,7 +5036,7 @@ fn sniff_extension(data: &[u8]) -> Option<&'static str> {
 
 async fn handle_send_message(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     body: &str,
     formatted_body: Option<&str>,
@@ -5181,7 +5182,7 @@ async fn handle_send_reaction(client: &Client, room_id: &str, event_id: &str, em
 
 async fn handle_browse_public_rooms(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     search_term: Option<&str>,
     spaces_only: bool,
     server: Option<&str>,
@@ -5279,7 +5280,7 @@ async fn handle_browse_public_rooms(
     }
 }
 
-async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, space_id: &str) {
+async fn handle_browse_space(client: &Client, event_tx: &EventSender, space_id: &str) {
     use matrix_sdk::ruma::api::client::space::get_hierarchy;
 
     let Ok(room_id) = RoomId::parse(space_id) else {
@@ -5382,7 +5383,7 @@ async fn handle_browse_space(client: &Client, event_tx: &Sender<MatrixEvent>, sp
 
 async fn handle_join_room(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id_or_alias: &str,
     extra_via: &[String],
 ) {
@@ -5488,7 +5489,7 @@ async fn handle_join_room(
 
 async fn handle_invite_user(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     user_id: &str,
 ) {
@@ -5530,7 +5531,7 @@ async fn handle_invite_user(
 /// Sends `UserSearchResults` with up to 20 matching (display_name, user_id) pairs.
 async fn handle_search_users(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     query: &str,
 ) {
     use matrix_sdk::ruma::api::client::user_directory::search_users::v3::Request as SearchRequest;
@@ -5555,7 +5556,7 @@ async fn handle_search_users(
     }
 }
 
-async fn handle_accept_invite(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+async fn handle_accept_invite(client: &Client, event_tx: &EventSender, room_id: &str) {
     let Ok(parsed_id) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&parsed_id) else { return };
 
@@ -5629,7 +5630,7 @@ async fn handle_accept_invite(client: &Client, event_tx: &Sender<MatrixEvent>, r
     }
 }
 
-async fn handle_decline_invite(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+async fn handle_decline_invite(client: &Client, event_tx: &EventSender, room_id: &str) {
     let Ok(parsed_id) = RoomId::parse(room_id) else { return };
     let Some(room) = client.get_room(&parsed_id) else { return };
     match room.leave().await {
@@ -5649,7 +5650,7 @@ async fn handle_decline_invite(client: &Client, event_tx: &Sender<MatrixEvent>, 
 /// via kick. Returns KnockSent / KnockFailed for the UI to react.
 async fn handle_knock_room(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id_or_alias: &str,
     reason: &str,
     via_servers: &[String],
@@ -5690,7 +5691,7 @@ async fn handle_knock_room(
 /// on the server clears automatically when the invite is accepted.
 async fn handle_approve_knock(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     user_id: &str,
 ) {
@@ -5722,7 +5723,7 @@ async fn handle_approve_knock(
 /// existing SeekToEvent path which fetches context on demand.
 async fn handle_search_room(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     query: &str,
     limit: u32,
@@ -5801,7 +5802,7 @@ async fn handle_search_room(
 /// endpoint — kick is the canonical "no, you can't come in" response.
 async fn handle_decline_knock(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     user_id: &str,
     reason: &str,
@@ -5824,7 +5825,7 @@ async fn handle_decline_knock(
     }
 }
 
-async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room_id: &str) {
+async fn handle_leave_room(client: &Client, event_tx: &EventSender, room_id: &str) {
     let Ok(room_id) = RoomId::parse(room_id) else {
         let _ = event_tx
             .send(MatrixEvent::LeaveFailed {
@@ -5867,7 +5868,7 @@ async fn handle_leave_room(client: &Client, event_tx: &Sender<MatrixEvent>, room
 /// Fetch thread replies for a root event.
 async fn handle_fetch_thread(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     thread_root_id: &str,
 ) {
@@ -5956,7 +5957,7 @@ async fn handle_fetch_thread(
 /// Fetch event context for a seek-to-event jump.
 async fn handle_seek_to_event(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     event_id: &str,
 ) {
@@ -6014,7 +6015,7 @@ async fn handle_seek_to_event(
 /// Find an existing DM room with a user, or create a new one.
 async fn handle_create_dm(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     user_id: &str,
 ) {
     let Ok(target_uid) = <&matrix_sdk::ruma::UserId>::try_from(user_id) else {
@@ -6158,7 +6159,7 @@ async fn handle_mark_read(client: &Client, room_id: &str, cached_event_id: Optio
 /// Safe: reads only from the local cache, never calls room.messages().
 async fn handle_export_messages(
     _client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     path: &std::path::Path,
     timeline_cache: &super::room_cache::RoomCache,
@@ -6218,7 +6219,7 @@ async fn handle_export_messages(
 
 async fn handle_export_room_metrics(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id_str: &str,
     days: u32,
 ) {
@@ -6444,7 +6445,7 @@ fn format_unix_date(unix_secs: u64) -> String {
 /// are used as a general "what's happening" summary.
 async fn handle_fetch_room_preview(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     unread_count: u32,
     ollama_endpoint: &str,
@@ -6618,7 +6619,7 @@ async fn handle_fetch_room_preview(
 /// Skips the download if a cached file already exists.
 async fn handle_fetch_avatar(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     user_id: &str,
     mxc_url: &str,
 ) {
@@ -6676,7 +6677,7 @@ async fn handle_fetch_avatar(
 /// Skips the download if a cached file already exists.
 async fn handle_fetch_room_avatar(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     room_id: &str,
     mxc_url: &str,
 ) {
@@ -6743,7 +6744,7 @@ async fn handle_fetch_room_avatar(
 /// at all (server rejected / network error).
 async fn handle_resolve_alias_info(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     alias: &str,
 ) {
     use matrix_sdk::ruma::RoomAliasId;
@@ -6963,7 +6964,7 @@ async fn ollama_stream_to_event(
     model: &str,
     prompt: &str,
     context: &str,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
 ) {
     let client = ollama_client();
 

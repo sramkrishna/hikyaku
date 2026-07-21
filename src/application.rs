@@ -14,18 +14,11 @@ mod imp {
     use crate::matrix;
     use crate::widgets::MxWindow;
 
-    use async_channel::Receiver;
-    use std::cell::OnceCell;
-
-    pub struct MxApplication {
-        pub event_rx: OnceCell<Receiver<matrix::MatrixEvent>>,
-    }
+    pub struct MxApplication;
 
     impl Default for MxApplication {
         fn default() -> Self {
-            Self {
-                event_rx: OnceCell::new(),
-            }
+            Self
         }
     }
 
@@ -53,15 +46,18 @@ mod imp {
                 return;
             }
 
-            // Create the bidirectional async channels.
-            // Events flow: Matrix thread → GTK main loop
-            // Commands flow: GTK main loop → Matrix thread
-            let (event_tx, event_rx) = async_channel::unbounded::<matrix::MatrixEvent>();
+            // Prioritized event channels (critical / bulk / plugin) —
+            // see matrix/event_channel.rs. Replaces the previous single
+            // unbounded async_channel that would queue plugin/typing/
+            // notification traffic ahead of critical decryption or msg-state
+            // events under GTK stall. Commands stay a single unbounded
+            // channel (rate = human, unbounded is fine).
+            let (event_tx, event_rx) = matrix::channels();
             let (command_tx, command_rx) = async_channel::unbounded::<matrix::MatrixCommand>();
 
-            // Start the background HTML→Pango worker thread. Results come
-            // back through the same event channel so the GTK event loop
-            // handler can apply them uniformly with matrix events.
+            // Start the background HTML→Pango worker thread. MarkupRendered
+            // is class Bulk (see event_channel.rs) — send_blocking here
+            // backpressures the worker when the GTK loop stalls.
             {
                 let tx = event_tx.clone();
                 crate::markup_worker::start(move |id, markup| {
@@ -73,9 +69,6 @@ mod imp {
             // Shutdown is initiated by sending MatrixCommand::Shutdown — all
             // commands before it are guaranteed to run first (no race condition).
             let timeline_cache = matrix::spawn_matrix_thread(event_tx, command_rx);
-
-            // Store event channel (command_tx lives only in the window).
-            let _ = self.event_rx.set(event_rx.clone());
 
             // On app shutdown: flush pending read receipt then send Shutdown.
             // The tokio command loop processes commands in FIFO order, so

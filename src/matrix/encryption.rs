@@ -4,7 +4,7 @@
 // across client.rs.  The Matrix client calls into these functions; they
 // communicate results back via the shared MatrixEvent channel.
 
-use async_channel::Sender;
+use crate::matrix::EventSender;
 use matrix_sdk::ruma::api::client::uiaa::{AuthData, Password, UserIdentifier};
 use matrix_sdk::Client;
 
@@ -31,7 +31,7 @@ async fn yield_if_room_loading() {
 /// prompted to run "Recover Keys".
 pub(super) async fn setup_encryption(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     login_creds: Option<(String, String)>,
 ) {
     let enc = client.encryption();
@@ -136,7 +136,7 @@ pub(super) async fn setup_encryption(
 /// messages in all encrypted rooms decrypt without the user opening each one.
 pub(super) async fn handle_recover_keys(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     recovery_key: &str,
     cache: &RoomCache,
 ) {
@@ -218,7 +218,7 @@ pub(super) async fn handle_recover_keys(
 /// 3. Signals the UI to prompt the user to click Recover Keys once more.
 pub(super) async fn handle_download_from_ssss_backup(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
 ) {
     use matrix_sdk::ruma::api::client::backup::{
         delete_backup_version, get_latest_backup_info,
@@ -254,7 +254,7 @@ pub(super) async fn handle_download_from_ssss_backup(
     run_recover_and_download(client, event_tx).await;
 }
 
-async fn run_recover_and_download(client: &Client, event_tx: &Sender<MatrixEvent>) {
+async fn run_recover_and_download(client: &Client, event_tx: &EventSender) {
     // The SSSS key is already in SQLite from the first recover() call.
     // Emit StaleBackupDeleted so the UI prompts the user to click Recover Keys
     // one more time — the second attempt will succeed now that the stale
@@ -270,7 +270,7 @@ async fn run_recover_and_download(client: &Client, event_tx: &Sender<MatrixEvent
 /// Import room keys from an export file (legacy key export format).
 pub(super) async fn handle_import_room_keys(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     path: std::path::PathBuf,
     passphrase: &str,
     cache: &RoomCache,
@@ -296,7 +296,7 @@ pub(super) async fn handle_import_room_keys(
 /// notifies the UI to re-fetch affected rooms so UTD messages re-render.
 pub(super) fn spawn_keys_watcher(
     client: &Client,
-    event_tx: Sender<MatrixEvent>,
+    event_tx: EventSender,
     cache: super::room_cache::RoomCache,
 ) {
     use futures_util::StreamExt;

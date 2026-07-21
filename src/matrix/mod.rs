@@ -1,5 +1,6 @@
 mod client;
 pub mod encryption;
+pub mod event_channel;
 pub mod room_cache;
 pub mod verification;
 
@@ -9,3 +10,4 @@ pub(crate) static ROOM_LOAD_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub use client::{MatrixEvent, MatrixCommand, MediaInfo, MediaKind, MessageInfo, RoomInfo, RoomKind, RoomMeta, SpaceDirectoryRoom, spawn_matrix_thread};
+pub use event_channel::{EventReceiver, EventSender, channels};

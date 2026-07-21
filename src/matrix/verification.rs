@@ -7,7 +7,7 @@
 // 4. On confirmation, complete verification → device is now trusted
 //    and can decrypt E2EE messages
 
-use async_channel::Sender;
+use crate::matrix::EventSender;
 use matrix_sdk::encryption::verification::{
     SasState, SasVerification, Verification, VerificationRequest,
     VerificationRequestState,
@@ -41,7 +41,7 @@ pub type SharedVerificationState = Arc<Mutex<VerificationState>>;
 /// Register event handlers for incoming verification requests.
 pub fn register_verification_handlers(
     client: &Client,
-    event_tx: Sender<MatrixEvent>,
+    event_tx: EventSender,
     state: SharedVerificationState,
 ) {
     // Handle to-device verification requests (direct device-to-device).
@@ -88,7 +88,7 @@ pub fn register_verification_handlers(
 /// Accept a verification request and start SAS verification.
 pub async fn accept_verification(
     state: &SharedVerificationState,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     flow_id: &str,
 ) {
     let request = {
@@ -138,7 +138,7 @@ pub async fn accept_verification(
 /// Watch a SAS verification session for state changes and notify the UI.
 async fn watch_sas_state(
     sas: SasVerification,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     state: &SharedVerificationState,
     flow_id: &str,
 ) {
@@ -285,7 +285,7 @@ pub async fn cancel_verification(state: &SharedVerificationState, flow_id: &str)
 /// request to all our other sessions (e.g. Element on another device).
 pub async fn request_self_verification(
     client: &Client,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     state: &SharedVerificationState,
 ) {
     let enc = client.encryption();
@@ -335,7 +335,7 @@ pub async fn request_self_verification(
 /// accept the SAS and watch for emojis.
 async fn watch_request_state(
     request: VerificationRequest,
-    event_tx: &Sender<MatrixEvent>,
+    event_tx: &EventSender,
     state: &SharedVerificationState,
     flow_id: &str,
 ) {

@@ -8,10 +8,10 @@ mod imp {
     use adw::subclass::prelude::*;
     use gtk::glib;
 
-    use async_channel::{Receiver, Sender};
+    use async_channel::Sender;
     use std::cell::{Cell, OnceCell, RefCell};
 
-    use crate::matrix::{MatrixCommand, MatrixEvent};
+    use crate::matrix::MatrixCommand;
     use crate::widgets::BookmarksOverview;
     use crate::widgets::LoginPage;
     use crate::widgets::MessageView;
@@ -19,7 +19,6 @@ mod imp {
     use crate::widgets::RoomListView;
 
     pub struct MxWindow {
-        pub event_rx: OnceCell<Receiver<MatrixEvent>>,
         pub command_tx: OnceCell<Sender<MatrixCommand>>,
         /// Shared timeline cache — written by the Matrix thread, read here for
         /// instant synchronous cache hits on room selection.
@@ -190,7 +189,6 @@ mod imp {
                 .build();
 
             Self {
-                event_rx: OnceCell::new(),
                 command_tx: OnceCell::new(),
                 timeline_cache: OnceCell::new(),
                 onboarding_page: OnboardingPage::new(),
@@ -343,10 +341,10 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 
 use crate::config::AppearanceSettings;
-use crate::matrix::{MatrixCommand, MatrixEvent};
+use crate::matrix::{EventReceiver, MatrixCommand, MatrixEvent};
 
 /// Build the Ollama prompt for the metrics summary feature.
 fn build_metrics_prompt(metrics_text: &str, detect_conflict: bool, detect_coc: bool) -> String {
@@ -749,7 +747,7 @@ glib::wrapper! {
 impl MxWindow {
     pub fn new(
         app: &crate::application::MxApplication,
-        event_rx: Receiver<MatrixEvent>,
+        event_rx: EventReceiver,
         command_tx: Sender<MatrixCommand>,
         timeline_cache: crate::matrix::room_cache::RoomCache,
     ) -> Self {
@@ -758,7 +756,6 @@ impl MxWindow {
             .build();
 
         let imp = window.imp();
-        let _ = imp.event_rx.set(event_rx.clone());
         let _ = imp.command_tx.set(command_tx.clone());
         let _ = imp.timeline_cache.set(timeline_cache);
 
