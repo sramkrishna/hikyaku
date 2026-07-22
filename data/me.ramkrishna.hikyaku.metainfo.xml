@@ -46,6 +46,20 @@
   </content_rating>
 
   <releases>
+    <release version="0.4.0" date="2026-07-21">
+      <description>
+        <p>Historical-scroll oscillation fix and architectural cleanup.</p>
+        <ul>
+          <li>Fixed the long-standing "row oscillation and frame stutter when scrolling through historical messages" bug. Root cause: matrix pagination RPC (~350 ms of tokio-side work) overlapping with the user's active scroll gesture caused visible frame stutter, even though tokio and GTK run on separate threads. Fix: debounce the fetch-older RPC until scroll settles (last input quiet for 200 ms, 4.5 s cap).</li>
+          <li>Cold avatar decode moved off the GTK thread into a dedicated worker. Every historical sender's first appearance no longer costs a synchronous ~1400 µs PNG decode on the render thread.</li>
+          <li>Event delivery from the matrix thread to the GTK loop is now split into three prioritized channels (critical/bulk/plugin) so login, sync, msg-state, and decryption events cannot queue behind ephemeral typing indicators or plugin traffic under load.</li>
+          <li>Timeline extracted to its own crate (crates/timeline) with a fuzz-style invariant test harness that runs 4 000 random-op iterations plus pagination and gap-fill scenarios, verifying sort / uniqueness / index consistency / cached derived-state invariants after every mutation.</li>
+          <li>Same-position pagination gap-fills batched into a single splice per unique insert position; a pagination that used to fire 200 separate items_changed emissions now fires one per unique gap position.</li>
+          <li>Same-sender bind skip: consecutive messages from one person no longer re-run the avatar / flag / flair widget updates on every widget recycle.</li>
+          <li>Set-selectable and timestamp label writes cached across rebinds; markup shepherd applies rendered Pango markup directly to the label instead of triggering a full rebind cascade.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-07-14">
       <description>
         <p>Timeline architecture overhaul plus a swathe of jitter and reactions fixes.</p>
