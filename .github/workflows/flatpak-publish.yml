@@ -141,6 +141,16 @@ jobs:
       - name: Write CNAME
         run: echo "hikyaku.ramkrishna.me" > repo/CNAME
 
+      # Copy the .flatpakref pointer files into the published site root so
+      # `flatpak install https://hikyaku.ramkrishna.me/hikyaku.flatpakref`
+      # (and the beta counterpart) actually resolves. force_orphan: true
+      # below wipes anything not in repo/, so these have to be re-populated
+      # every deploy.
+      - name: Copy flatpakref pointers into published repo
+        run: |
+          cp hikyaku.flatpakref repo/hikyaku.flatpakref
+          cp hikyaku-beta.flatpakref repo/hikyaku-beta.flatpakref
+
       # force_orphan keeps gh-pages history lean; accumulated content is already
       # in repo/ from the restore step above, so nothing is lost.
       - name: Deploy to GitHub Pages
