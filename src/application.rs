@@ -55,15 +55,6 @@ mod imp {
             let (event_tx, event_rx) = matrix::channels();
             let (command_tx, command_rx) = async_channel::unbounded::<matrix::MatrixCommand>();
 
-            // Register the splice-tracking hook so hikyaku_timeline pings
-            // our per-second diagnostic counter every time it mutates its
-            // list_store. Idempotent — first call wins; subsequent app
-            // activations no-op.
-            hikyaku_timeline::set_splice_hook(Box::new(|| {
-                crate::widgets::message_row::TIMELINE_SPLICE_1S
-                    .with(|c| c.set(c.get().saturating_add(1)));
-            }));
-
             // Start the background HTML→Pango worker thread. MarkupRendered
             // is class Bulk (see event_channel.rs) — send_blocking here
             // backpressures the worker when the GTK loop stalls.

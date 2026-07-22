@@ -888,7 +888,6 @@ mod imp {
             // doesn't see height variance across its remeasure passes and
             // the row-oscillation feedback loop dies.
             const ROW_HEIGHT_UNIT: i32 = 48;
-            super::MEASURE_CALLS.with(|c| c.set(c.get() + 1));
             let _g = crate::perf::scope_gt("row_measure", 200);
             let (min, nat, min_bl, nat_bl) = self.parent_measure(orientation, for_size);
             if orientation == gtk::Orientation::Vertical {
@@ -911,13 +910,6 @@ use gtk::glib;
 use gtk::subclass::prelude::*;
 
 thread_local! {
-    /// Counter for MessageRow::measure() calls. Incremented on every
-    /// invocation; a 1-second timer reports the rate and resets.
-    /// GtkListView can call measure many times per row per frame during
-    /// scroll, so if this rate is thousands/sec on a plain scroll it's
-    /// a smoking gun for the micro-stutter.
-    pub(crate) static MEASURE_CALLS: std::cell::Cell<u64> = std::cell::Cell::new(0);
-
     /// Decoded avatar textures: user_id → GdkTexture. Thread-local (GTK
     /// is single-threaded), so no locking. Populated on first bind that
     /// touches a given user_id. Bind reads via a plain map lookup — no
@@ -950,86 +942,12 @@ pub fn invalidate_avatar_texture(user_id: &str) {
 }
 
 thread_local! {
-    /// event_id → (count, last-log-count) — tracks how many times each
-    /// specific msg has been bound to a MessageRow this session. A
-    /// runaway count for a single eid signals a recycle-oscillation
-    /// loop where GtkListView is repeatedly rebinding the same msg
-    /// (usually due to a height feedback loop). Rate-limited log so
-    /// long-lived scroll of unique msgs doesn't spam.
-    static BIND_COUNT_PER_MSG: std::cell::RefCell<std::collections::HashMap<String, (u32, u32)>>
-        = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-pub(crate) fn bind_rate_track(eid: &str) {
-    BIND_COUNT_PER_MSG.with(|m| {
-        let mut m = m.borrow_mut();
-        let entry = m.entry(eid.to_string()).or_insert((0, 0));
-        entry.0 += 1;
-        // Log at 10, 50, 100, 500 to catch escalating recycle loops.
-        let should_log = matches!(entry.0, 10 | 50 | 100 | 500)
-            || (entry.0 >= 1000 && entry.0 % 500 == 0);
-        if should_log && entry.0 > entry.1 {
-            entry.1 = entry.0;
-            tracing::warn!(
-                "bind-oscillation: msg eid={} bound {} times this session — recycle loop suspected",
-                eid, entry.0
-            );
-        }
-    });
-}
-
-thread_local! {
-    /// Per-second bind_message_object call count.
-    pub(crate) static BIND_CALLS_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Per-second count of binds where this SAME row widget was already
-    /// bound to this SAME event_id — a "spurious rebind" that indicates
-    /// GTK is re-firing bind on an item the row already displays. Almost
-    /// always a measure-feedback signature: GTK re-measures, the estimator
-    /// invalidates, the visible range recomputes, and rows get rebound to
-    /// the same items they already have. If BIND_CALLS_1S ≈ SPURIOUS_1S,
-    /// nearly every bind is measure-driven noise and the fix belongs in
-    /// the measure impl. If SPURIOUS_1S ≪ BIND_CALLS_1S, most binds are
-    /// legitimate recycle from actual scrolling.
-    pub(crate) static SPURIOUS_REBIND_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Per-second shepherd-drain call count (each drain applies set_markup
-    /// on 0-or-more visible rows; count = # of drain firings, not rows).
-    pub(crate) static SHEPHERD_DRAIN_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Per-second store.splice call count from Timeline. Split so we can
-    /// tell whether pagination is spiking or if something else is calling
-    /// mutation paths at rest.
-    pub(crate) static TIMELINE_SPLICE_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Install a periodic reporter for MEASURE_CALLS. Called once from the
-/// MessageView setup to start the timer.
-pub(crate) fn install_measure_rate_reporter() {
-    glib::timeout_add_local(std::time::Duration::from_secs(1), || {
-        let count = MEASURE_CALLS.with(|c| {
-            let v = c.get();
-            c.set(0);
-            v
-        });
-        let binds = BIND_CALLS_1S.with(|c| { let v = c.get(); c.set(0); v });
-        let spurious = SPURIOUS_REBIND_1S.with(|c| { let v = c.get(); c.set(0); v });
-        let drains = SHEPHERD_DRAIN_1S.with(|c| { let v = c.get(); c.set(0); v });
-        let splices = TIMELINE_SPLICE_1S.with(|c| { let v = c.get(); c.set(0); v });
-        if count > 100 {
-            tracing::info!("measure-rate: {} MessageRow::measure() calls in last 1s", count);
-        }
-        // Report the aggregate any time bind rate is above idle. 22 visible
-        // rows at ~3Hz is 66/s — well above the "user scrolling normally"
-        // baseline of a few per second. Correlating this with drains and
-        // splices tells us the trigger. spurious = binds where the row was
-        // already bound to this same event_id (measure-feedback signature).
-        if binds > 30 {
-            tracing::warn!(
-                "rate-1s: binds={} spurious={} drains={} timeline_splices={} measures={}",
-                binds, spurious, drains, splices, count
-            );
-        }
-        glib::ControlFlow::Continue
-    });
-}
+/// No-op — kept for the caller in MessageView setup. The per-second
+/// rate reporter it used to install was removed for the v0.4.0 release
+/// (was investigation-only diagnostic for the row-oscillation chase).
+pub(crate) fn install_measure_rate_reporter() {}
 
 /// Pre-render the sender label markup string for use in MessageObject.
 /// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load
@@ -1473,13 +1391,6 @@ impl MessageRow {
         // repeatedly because of a height-measurement feedback loop. Log
         // the eid on the 10th and 50th bind (rate-limited so a genuine
         // long-lived row bound once doesn't spam).
-        {
-            let new_eid = msg.event_id();
-            if !new_eid.is_empty() {
-                bind_rate_track(&new_eid);
-            }
-            BIND_CALLS_1S.with(|c| c.set(c.get().saturating_add(1)));
-        }
 
         // Defensive worker enqueue: if a msg somehow lands here with needs_markup
         // still true (a code path that skipped info_to_obj's eager enqueue), get
@@ -1616,14 +1527,6 @@ impl MessageRow {
         {
             let mut hist = imp.bind_history.borrow_mut();
             let prev_last = std::mem::replace(&mut hist[1], new_eid.clone());
-            // Spurious rebind: this row was already showing this same
-            // event_id and GTK is asking us to bind it again. Not an
-            // items_changed-driven recycle (that would put a different
-            // eid on the row). Not a first bind (prev_last would be "").
-            // Almost certainly a measure-feedback loop.
-            if !prev_last.is_empty() && !new_eid.is_empty() && prev_last == new_eid {
-                SPURIOUS_REBIND_1S.with(|c| c.set(c.get().saturating_add(1)));
-            }
             hist[0] = prev_last;
         }
 
@@ -1638,7 +1541,6 @@ impl MessageRow {
         }
 
         // Reply indicator — pre-computed in info_to_obj, no format!/scan here.
-        let _g_visibility = crate::perf::scope_gt("bind::visibility", 50);
         let reply_label = msg.reply_label();
         if !reply_to.is_empty() {
             imp.reply_label.set_label(&reply_label);
@@ -1662,10 +1564,8 @@ impl MessageRow {
         if let Some(ref btn) = *imp.dm_button.borrow() {
             btn.set_visible(!is_own && !is_dm_room);
         }
-        drop(_g_visibility);
 
         // Media attachment — all display strings pre-computed in info_to_obj.
-        let _g_media = crate::perf::scope_gt("bind::media", 50);
         if !show_media {
             imp.media_button.set_visible(false);
         } else {
@@ -1700,8 +1600,6 @@ impl MessageRow {
                 }
             }
         }
-
-        drop(_g_media);
 
         // Reactions — O(1) hash check, full rebuild only when reactions changed.
         self.rebuild_reactions_pills(msg);
@@ -1922,16 +1820,13 @@ impl MessageRow {
         }
 
         // Apply initial state for all reactive properties.
-        let _g_css = crate::perf::scope_gt("bind::css_reactive", 50);
         if msg.is_flashing() { self.add_css_class("message-flash"); }
         else { self.remove_css_class("message-flash"); }
         if msg.is_new_message() { self.add_css_class("new-message"); }
         else { self.remove_css_class("new-message"); }
         self.imp().unread_divider_box.set_visible(msg.is_first_unread());
-        drop(_g_css);
 
         // Consolidated notify handler — one connect + one disconnect per bind
-        let _g_notify = crate::perf::scope_gt("bind::notify_setup", 50);
         // instead of six. GLib signal registration overhead was measured at
         // ~600µs of the ~700µs total bind time; consolidating gets bind
         // down under 200µs on the common path.
@@ -2027,7 +1922,6 @@ impl MessageRow {
         // Store the combined handler in flash_handler's slot; clear_flash_handler
         // disconnects it. The other slots stay None (harmless — take() no-ops).
         *self.imp().flash_handler.borrow_mut() = Some((msg.clone().upcast(), combined_id));
-        drop(_g_notify);
     }
 
     /// Disconnect and clear the `notify::is-flashing` handler from the bound MessageObject.

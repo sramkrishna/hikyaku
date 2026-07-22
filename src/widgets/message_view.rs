@@ -2712,7 +2712,6 @@ impl MessageView {
                 return;
             }
             imp.pending_markup_refresh.set(false);
-            crate::widgets::message_row::SHEPHERD_DRAIN_1S.with(|c| c.set(c.get().saturating_add(1)));
             // Drain: apply pending markup updates DIRECTLY to visible row
             // labels. No full bind — that's what drove the rebind loop.
             // For each visible row whose body_hash cache is invalidated
@@ -3511,25 +3510,9 @@ impl MessageView {
         };
 
         let n_prepended = objs.len();
-        let pre_n = tl.n_items();
-        let splice_start = std::time::Instant::now();
         if !objs.is_empty() {
             tl.insert(objs);
         }
-        let splice_us = splice_start.elapsed().as_micros();
-
-        // Split timing: `tl.insert` covers Timeline's own dedup + sort +
-        // per-batch splice_tracked calls. GTK's items_changed handler runs
-        // synchronously inside splice, so this us count includes GTK's
-        // internal reindex work (which scales with N in prepend patterns).
-        // If splice_us grows visibly per pagination, the accumulation
-        // hypothesis is confirmed.
-        tracing::info!(
-            "prepend-time: pre_n={} added={} splice_us={} \
-             post_n={} vadj_before={:.1} upper_before={:.1}",
-            pre_n, n_prepended, splice_us, tl.n_items(),
-            vadj_before.value(), vadj_before.upper()
-        );
 
         tracing::info!(
             "scroll-diag: prepend_messages post-insert vadj value={:.1} upper={:.1} new_n={}",
