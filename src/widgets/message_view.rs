@@ -3857,19 +3857,29 @@ impl MessageView {
             // HTML-bodied msg: show a plain-text fallback immediately (so the
             // row has content the moment it binds) and hand the HTML off to
             // the background markup worker. The worker chews html_to_pango
-            // off the GTK thread and delivers via notify::rendered-markup;
-            // MessageView's central shepherd (see request_pending_markup_refresh)
-            // coordinates when to re-render the visible viewport so async
-            // deliveries don't fight the user's scroll.
+            // off the GTK thread and delivers via notify::rendered-markup.
             //
-            // Eager enqueue at construction is intentional. An earlier
-            // just-in-time attempt (enqueue only at row-bind) meant the user
-            // hit worker latency AS they scrolled into new content — perceived
-            // as jitter. Warming the worker at load time (bg_refresh /
-            // prepend_messages) means rendered_markup is usually ready by the
-            // time the row is bound. Timeline caps its store at ~400 rows so
-            // this doesn't unbound-grow the worker queue.
-            let escaped = gtk::glib::markup_escape_text(&body).to_string();
+            // Fallback body selection: normally the plain-text `body` is
+            // fine as the pre-worker placeholder. But some clients (variants
+            // of Element X / Cinny) send replies where `body` is empty or
+            // whitespace-only (they put the actual content only in the HTML
+            // via <mx-reply>...</mx-reply> then real reply text). Without a
+            // fallback here, the row rendered as zero-length and stayed
+            // that way if the worker's html_to_pango output was also
+            // empty (it also skips mx-reply blocks). See issue #11.
+            //
+            // When body is empty/whitespace-only, derive a placeholder by
+            // stripping the HTML via strip_html_to_text. If the strip
+            // returns non-empty, the row has visible content at first bind
+            // AND remains visible even if the worker output is empty for
+            // some reason.
+            let fallback = if body.trim().is_empty() {
+                let extracted = crate::markdown::strip_html_to_text(formatted_body);
+                if extracted.is_empty() { body.clone() } else { extracted }
+            } else {
+                body.clone()
+            };
+            let escaped = gtk::glib::markup_escape_text(&fallback).to_string();
             obj.set_rendered_markup(crate::markdown::linkify_urls(&escaped));
             crate::markup_worker::try_enqueue(&obj, formatted_body.to_string());
         }

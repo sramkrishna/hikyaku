@@ -329,6 +329,98 @@ pub(crate) fn escape_text(s: &str) -> String {
      .replace('>', "&gt;")
 }
 
+/// Cheap plain-text extractor from Matrix `formatted_body` HTML.
+///
+/// Used as an initial-render fallback for messages where the plain-text
+/// `body` field is empty/whitespace-only but `formatted_body` has real
+/// content — some Matrix clients (variants of Element X / Cinny) send
+/// replies this way, putting the actual reply text only in the HTML
+/// with `<mx-reply>...</mx-reply>` for the quoted context. Without a
+/// fallback, our row would render as zero-length until the async
+/// markup worker delivered the Pango-formatted version, and if the
+/// worker's output was empty too (worker also skips mx-reply), the row
+/// stayed blank forever. See issue #11.
+///
+/// NOT a full HTML parser. Strips `<mx-reply>...</mx-reply>` block,
+/// then removes all remaining tags, decodes named + numeric entities,
+/// collapses runs of whitespace to a single space, trims. Good enough
+/// for a first-paint placeholder; the background worker still renders
+/// the proper Pango markup and replaces this via
+/// `notify::rendered-markup`.
+pub fn strip_html_to_text(html: &str) -> String {
+    // Step 1: drop <mx-reply>...</mx-reply> block(s). Matrix spec says
+    // at most one, but be permissive.
+    let mut src = String::with_capacity(html.len());
+    let mut pos = 0;
+    while let Some(start_rel) = html[pos..].find("<mx-reply>") {
+        src.push_str(&html[pos..pos + start_rel]);
+        pos += start_rel;
+        if let Some(end_rel) = html[pos..].find("</mx-reply>") {
+            pos += end_rel + "</mx-reply>".len();
+        } else {
+            // Unclosed — drop the rest.
+            pos = html.len();
+            break;
+        }
+    }
+    src.push_str(&html[pos..]);
+
+    // Step 2: strip remaining HTML tags. Byte-based scan; text between
+    // '<' and '>' is dropped. `<br>` and `<br/>` become spaces so
+    // adjacent words don't merge.
+    let mut out = String::with_capacity(src.len());
+    let mut in_tag = false;
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'<' {
+            // Look ahead for common inline-break tags → space.
+            let rest = &src[i..];
+            if rest.starts_with("<br>") || rest.starts_with("<br/>") || rest.starts_with("<br />") {
+                out.push(' ');
+            }
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+        if c == b'>' {
+            in_tag = false;
+            i += 1;
+            continue;
+        }
+        if !in_tag {
+            // Copy the UTF-8 char in full (bytes[i] might start a multi-byte seq).
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+
+    // Step 3: decode entities, collapse whitespace runs, trim.
+    let decoded = decode_html_entities(&out);
+    let mut collapsed = String::with_capacity(decoded.len());
+    let mut prev_ws = true; // drop leading whitespace
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                collapsed.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_ws = false;
+        }
+    }
+    // trim trailing space.
+    if collapsed.ends_with(' ') {
+        collapsed.pop();
+    }
+    collapsed
+}
+
 /// Convert bare http/https URLs in already-escaped Pango markup text into
 /// `<a href="…">…</a>` links.  Input must already be XML-escaped (& → &amp;
 /// etc.) so that URL characters are intact but no literal `<`/`>` remain.
@@ -922,5 +1014,101 @@ mod tests {
         let body = "see https://matrix.to/#/%21abc:example.org/$evt123, please";
         let got = extract_first_matrix_to_event_link(body);
         assert_eq!(got, Some(("!abc:example.org".to_string(), "$evt123".to_string())));
+    }
+
+    // ── strip_html_to_text (issue #11 zero-length body fallback) ──────
+    //
+    // Reproduces the on-wire shapes we've seen produce zero-length rows.
+    // Ships with the fix per [[feedback_test_before_ship]] so the next
+    // edit either preserves the behaviour or fails.
+
+    #[test]
+    fn strip_html_plain_paragraph() {
+        assert_eq!(strip_html_to_text("<p>Hello world</p>"), "Hello world");
+    }
+
+    #[test]
+    fn strip_html_reply_with_content_after() {
+        // Common shape: mx-reply quote + real reply text.
+        let html = "<mx-reply><blockquote>>@paul: original</blockquote></mx-reply>Yes exactly";
+        assert_eq!(strip_html_to_text(html), "Yes exactly");
+    }
+
+    #[test]
+    fn strip_html_reply_only_no_text() {
+        // Edge case that produced the empty-render bug: formatted_body
+        // is ONLY the mx-reply quote, no actual reply content after.
+        // Result should be empty (caller will fall through to placeholder).
+        let html = "<mx-reply><blockquote>>@paul: original</blockquote></mx-reply>";
+        assert_eq!(strip_html_to_text(html), "");
+    }
+
+    #[test]
+    fn strip_html_reply_content_with_formatting() {
+        // Real reply with inline formatting — bold, italic, links.
+        let html = "<mx-reply><blockquote>>@paul: q</blockquote></mx-reply>\
+                    <b>Actually</b> <i>no</i>, see <a href=\"https://x\">this</a>.";
+        assert_eq!(
+            strip_html_to_text(html),
+            "Actually no, see this."
+        );
+    }
+
+    #[test]
+    fn strip_html_br_becomes_space() {
+        // <br> should separate words so "line1<br>line2" doesn't merge.
+        assert_eq!(strip_html_to_text("line1<br>line2"), "line1 line2");
+        assert_eq!(strip_html_to_text("line1<br/>line2"), "line1 line2");
+        assert_eq!(strip_html_to_text("line1<br />line2"), "line1 line2");
+    }
+
+    #[test]
+    fn strip_html_entities_decoded() {
+        assert_eq!(strip_html_to_text("&lt;tag&gt;"), "<tag>");
+        assert_eq!(strip_html_to_text("&amp;"), "&");
+        assert_eq!(strip_html_to_text("&#x2764;"), "\u{2764}"); // heart
+        // &nbsp; decodes to U+00A0 which is char::is_whitespace() → gets
+        // collapsed as leading whitespace, matching normal text-extractor
+        // semantics. If a real msg starts with a bare nbsp for
+        // presentational reasons, the worker's Pango render still keeps it;
+        // this is only the placeholder path.
+        assert_eq!(strip_html_to_text("&nbsp;a"), "a");
+        assert_eq!(strip_html_to_text("a&nbsp;b"), "a b");
+    }
+
+    #[test]
+    fn strip_html_whitespace_collapses() {
+        assert_eq!(strip_html_to_text("<p>  a   b  </p>"), "a b");
+        assert_eq!(
+            strip_html_to_text("<p>foo</p>\n\n<p>bar</p>"),
+            "foo bar"
+        );
+    }
+
+    #[test]
+    fn strip_html_unclosed_mx_reply_drops_rest() {
+        // Malformed: unclosed <mx-reply> tag. Drop everything after it
+        // rather than trying to render invalid state.
+        let html = "before<mx-reply>orphan content forever";
+        assert_eq!(strip_html_to_text(html), "before");
+    }
+
+    #[test]
+    fn strip_html_empty_input() {
+        assert_eq!(strip_html_to_text(""), "");
+    }
+
+    #[test]
+    fn strip_html_nested_tags() {
+        let html = "<p><b><i>bold-italic</i></b> plain</p>";
+        assert_eq!(strip_html_to_text(html), "bold-italic plain");
+    }
+
+    #[test]
+    fn strip_html_multiple_mx_reply_blocks() {
+        // Spec says at most one, but be permissive if a buggy sender
+        // emits multiple.
+        let html = "<mx-reply>a</mx-reply><mx-reply>b</mx-reply>real";
+        assert_eq!(strip_html_to_text(html), "real");
     }
 }
