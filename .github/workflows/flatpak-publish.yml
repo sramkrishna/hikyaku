@@ -23,16 +23,21 @@ on:
         type: choice
         options: [stable, beta]
 
-# Only one publish job runs at a time *per ref*. Grouping globally would
-# let a fresh push to main cancel a queued tag run (and vice versa) with
-# the message "Canceling since a higher priority waiting request for
-# flatpak-publish exists" — GitHub keeps at most one waiting entry per
-# group. Since stable (tags) and beta (main) produce different OSTree
-# branches, they must never cancel each other. Pushing several times to
-# main in rapid succession will still supersede older queued beta builds,
-# which is the desired behaviour for that branch alone.
+# Global group with cancel-in-progress: false serializes ALL publish
+# runs (both stable-from-tags and beta-from-main). This is required
+# because they share the gh-pages branch: two concurrent runs both
+# restore gh-pages, both build, both force-push — whichever finishes
+# LAST wipes the other's ref. This happened on v0.4.0's initial push
+# (tag ran alongside main, main finished last → stable ref vanished).
+#
+# The earlier per-ref grouping was defensive against a different bug
+# (fresh push cancelling a queued tag run). That risk is real but
+# rare — GitHub's concurrency queue holds only ONE waiting entry, so
+# rapid main pushes while a tag build is running would drop the
+# earlier queued main build. Acceptable trade-off vs. losing published
+# stable refs; missing a beta build is recoverable by another push.
 concurrency:
-  group: flatpak-publish-${{ github.ref }}
+  group: flatpak-publish
   cancel-in-progress: false
 
 jobs:
