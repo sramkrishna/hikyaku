@@ -3223,16 +3223,22 @@ impl MessageView {
 
                 // Snapshot "was near bottom before insert" — after the insert the
                 // adjustment values are stale.
-                let was_near_bottom = self.is_near_bottom();
+                let was_at_bottom = self.is_at_bottom_strict();
                 let newest_before = tl.newest_timestamp();
                 let any_at_end = !echo_patched.is_empty() || to_insert.iter().any(|o| o.timestamp() >= newest_before);
                 if !to_insert.is_empty() {
                     tl.insert(to_insert);
                 }
 
-                // Only scroll to bottom when new messages arrived at the end AND
-                // the user was already near the bottom before the insert.
-                if any_at_end && was_near_bottom {
+                // Only auto-scroll when new msgs arrived at the tail AND
+                // the user is strictly at the bottom (within 20px). If
+                // they've scrolled up even by a screenful to read/reply
+                // to an older msg, we do NOT move their viewport. Fixes
+                // #12 — previously used is_near_bottom (150px slack)
+                // which counted "reading recent context" as "pinned to
+                // tail" and snap-scrolled the user away from the msg
+                // they were composing a reply to on every new arrival.
+                if any_at_end && was_at_bottom {
                     let view_weak = self.downgrade();
                     glib::idle_add_local_once(move || {
                         let Some(view) = view_weak.upgrade() else { return };
@@ -4527,7 +4533,11 @@ impl MessageView {
         // room; memory reclaimed on room-switch via evict_room_widgets. A
         // proper lifetime cap that considers viewport distance can be
         // added later if memory becomes a real concern.
-        if self.is_near_bottom() {
+        // Only auto-scroll when user is strictly at the tail. Same
+        // rationale as the incremental-append site — anything short of
+        // "at the bottom" indicates the user is reading and we must
+        // not move their viewport. See is_at_bottom_strict docs / #12.
+        if self.is_at_bottom_strict() {
             self.scroll_to_bottom();
         }
     }
@@ -4591,6 +4601,22 @@ impl MessageView {
 
     /// True when the scroll position is within `threshold` pixels of the bottom.
     /// Used to decide whether incoming messages should auto-scroll the view.
+    /// Strict at-tail check for auto-scroll gating. 20px slack — the
+    /// user must be essentially AT the bottom, not "somewhere in the
+    /// last screenful," for an incoming msg to auto-scroll them.
+    ///
+    /// Contrast with [`is_near_bottom`] which uses a generous 150px
+    /// slack for the tail-evict refresh trigger (that trigger only
+    /// fires an idempotent background op, so being forgiving there is
+    /// fine — being forgiving for auto-scroll snaps the user's active
+    /// scroll gesture and breaks their ability to respond to older
+    /// msgs, which is what caused issue #12).
+    fn is_at_bottom_strict(&self) -> bool {
+        let sw = self.imp().scrolled_window();
+        let vadj = sw.vadjustment();
+        vadj.upper() - vadj.page_size() - vadj.value() < 20.0
+    }
+
     fn is_near_bottom(&self) -> bool {
         let sw = self.imp().scrolled_window();
         let vadj = sw.vadjustment();
@@ -4604,15 +4630,14 @@ impl MessageView {
     fn scroll_to_bottom(&self) {
         let imp = self.imp();
         if gio::prelude::ListModelExt::n_items(&imp.list_store()) == 0 { return; }
-        // User-scroll suppression: if the user has touched the scroll
-        // surface in the last 500 ms, don't programmatically jump them
-        // to the bottom. Otherwise an incoming message in a busy room
-        // snap-backs them mid-scroll and they perceive the view as
-        // "hunting for a position." 500 ms covers the GTK kinetic
-        // settle window without locking out the auto-scroll for too
-        // long after the user truly stops touching the surface.
+        // Callers are expected to gate this call on is_at_bottom_strict.
+        // Kept short kinetic-settle guard for defence-in-depth: if the
+        // user just physically scrolled (wheel/touchpad/drag) within
+        // the last 250ms, wait — GTK's kinetic gesture may still be
+        // settling and firing set_value during that window corrupts
+        // the gesture state machine.
         if let Some(t) = imp.last_user_scroll_at.get() {
-            if t.elapsed() < std::time::Duration::from_millis(500) {
+            if t.elapsed() < std::time::Duration::from_millis(250) {
                 return;
             }
         }
