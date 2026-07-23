@@ -46,6 +46,16 @@
   </content_rating>
 
   <releases>
+    <release version="0.4.1" date="2026-07-23">
+      <description>
+        <p>Follow-up fixes to v0.4.0 for scroll behaviour and message rendering in busy channels.</p>
+        <ul>
+          <li>Auto-scroll no longer fights the user reading history. Previously an incoming message could snap the viewport back to the tail even when the user had scrolled up to compose a reply to an older message; the "near bottom" heuristic used a generous 150px slack that treated "reading recent context" as "pinned to tail." Now uses a strict 20px check — only actually-at-the-tail state triggers auto-scroll on new arrivals.</li>
+          <li>Messages from clients that put reply content only in HTML (some variants of Element X / Cinny — plain-text body is only the fallback quote block) no longer render as zero-length rows. The first-paint fallback now extracts plain text from the formatted_body via a lightweight HTML stripper when the plain body is empty or whitespace-only, so the row always has visible content.</li>
+          <li>Scroll on busy public channels (GNOME OS scale — many small events per second: typing indicators, reactions, read receipts) is now smoother. The GTK-side matrix-event drainer yields to input processing after every event during active user scroll (was every 4 events); events are never dropped, they just get more scheduling breathing room so the scroll gesture is not disrupted by concurrent tokio activity.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-07-21">
       <description>
         <p>Historical-scroll oscillation fix and architectural cleanup.</p>
