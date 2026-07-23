@@ -1829,8 +1829,24 @@ impl MxWindow {
                 let Some(window) = window_weak.upgrade() else {
                     break;
                 };
+                crate::widgets::message_row::MATRIX_EVENTS_1S
+                    .with(|c| c.set(c.get().saturating_add(1)));
                 n_since_yield += 1;
-                if n_since_yield >= 4 {
+                // Yield more aggressively during active scroll. When the
+                // user is scrolling, we want to give GDK input priority
+                // over sync-event processing — otherwise a busy channel
+                // (many msgs/typing/reactions per second) causes the same
+                // "tokio-side work during scroll → frame stutter" pattern
+                // that the pagination debounce fixed for the RPC case.
+                // Yielding every event during active scroll is safe:
+                // events aren't dropped, they just get more GLib service
+                // between them so GDK never falls behind.
+                let scroll_active = window.imp()
+                    .message_view.imp().last_user_scroll_at.get()
+                    .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+                    .unwrap_or(false);
+                let yield_every = if scroll_active { 1 } else { 4 };
+                if n_since_yield >= yield_every {
                     n_since_yield = 0;
                     // Yield to GLib at DEFAULT_IDLE priority so GDK events
                     // (pointer, keyboard, focus) run before the next batch.

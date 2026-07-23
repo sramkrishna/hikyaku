@@ -942,12 +942,48 @@ pub fn invalidate_avatar_texture(user_id: &str) {
 }
 
 thread_local! {
+    /// Per-second bind_message_object call count. See install_rate_reporter
+    /// for the reporter that drains + logs this.
+    pub(crate) static BIND_CALLS_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-second Timeline splice count (from the splice_hook registered
+    /// in application.rs — pings the timeline crate through its callback
+    /// on every mutation, so this catches live-sync appends, backpagination
+    /// prepends, and gap-fills alike).
+    pub(crate) static TIMELINE_SPLICE_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Per-second MatrixEvent drain count on the GTK loop side. High
+    /// numbers here on an unencrypted busy channel (no decrypt-retry
+    /// noise) point at the fourth known oscillation source: bulk
+    /// sync-event delivery overlapping with active scroll.
+    pub(crate) static MATRIX_EVENTS_1S: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// No-op — kept for the caller in MessageView setup. The per-second
-/// rate reporter it used to install was removed for the v0.4.0 release
-/// (was investigation-only diagnostic for the row-oscillation chase).
-pub(crate) fn install_measure_rate_reporter() {}
+/// Install the per-second rate reporter. Fires once a second; logs a
+/// single-line summary when any of the tracked counters is elevated
+/// enough to be interesting (see thresholds below). Zero cost when the
+/// app is idle — every tracked counter stays at 0 and the check
+/// short-circuits.
+///
+/// Reintroduced for the v0.4.1 investigation of oscillation in busy
+/// channels (GNOME OS scale, ~1 msg/sec + typing/reactions/reads).
+/// The v0.4.0 strip left us blind; this is the minimum useful set for
+/// characterising which source of tokio-during-scroll work is firing.
+pub(crate) fn install_measure_rate_reporter() {
+    glib::timeout_add_local(std::time::Duration::from_secs(1), || {
+        let binds = BIND_CALLS_1S.with(|c| { let v = c.get(); c.set(0); v });
+        let splices = TIMELINE_SPLICE_1S.with(|c| { let v = c.get(); c.set(0); v });
+        let events = MATRIX_EVENTS_1S.with(|c| { let v = c.get(); c.set(0); v });
+        // Only log when any counter is above idle noise so the log
+        // stays quiet in normal use. Bind rate of ~30/s corresponds to
+        // fast scroll on a still viewport; matrix event rate of ~10/s
+        // is well above "occasional sync event."
+        if binds > 30 || events > 10 || splices > 0 {
+            tracing::warn!(
+                "rate-1s: binds={binds} timeline_splices={splices} matrix_events={events}"
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+}
 
 /// Pre-render the sender label markup string for use in MessageObject.
 /// Computes `<span foreground="#rrggbb">Escaped Name</span>` once at load
@@ -1383,6 +1419,7 @@ impl MessageRow {
         ctx: &crate::widgets::MessageRowContext,
     ) {
         let _g = crate::perf::scope("bind_message_object");
+        BIND_CALLS_1S.with(|c| c.set(c.get().saturating_add(1)));
         let imp = self.imp();
 
         // Diagnostic: count bind calls per-msg. If a specific msg is being

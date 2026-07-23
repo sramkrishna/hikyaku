@@ -2712,6 +2712,9 @@ impl MessageView {
                 return;
             }
             imp.pending_markup_refresh.set(false);
+            // (Shepherd drain — no counter here anymore since it was
+            // demoted to a "quiet housekeeping" path with the direct-
+            // set-markup redesign; empty branches for now.)
             // Drain: apply pending markup updates DIRECTLY to visible row
             // labels. No full bind — that's what drove the rebind loop.
             // For each visible row whose body_hash cache is invalidated
